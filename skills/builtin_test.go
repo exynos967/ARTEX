@@ -199,3 +199,56 @@ func TestRetiredDeploymentInstructionsUpgrade(t *testing.T) {
 		})
 	}
 }
+
+func TestScopeSentrySkillGatesMCPAndUpgradesBrokenPredecessor(t *testing.T) {
+	old, err := os.ReadFile("testdata/scopesentry-v0151.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := bundled.ReadFile("scopesentry/SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(want), "Cursor → Settings → MCP") {
+		t.Fatal("bundled scopesentry instructions still contain Cursor IDE setup boilerplate")
+	}
+
+	for _, edited := range []bool{false, true} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "scopesentry", "SKILL.md")
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		content := append([]byte(nil), old...)
+		if edited {
+			content = append(content, []byte("\nOperator customization\n")...)
+		}
+		if err := os.WriteFile(path, content, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := SeedDefaults(dir); err != nil {
+			t.Fatal(err)
+		}
+		expected := want
+		if edited {
+			expected = content
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != string(expected) {
+			t.Fatalf("edited=%v: unexpected scopesentry upgrade result: %v", edited, err)
+		}
+		if !edited {
+			reg, err := skill.LoadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s, ok := reg.Get("scopesentry")
+			if !ok || s.Description == "" || s.Compatibility == "" {
+				t.Fatalf("upgraded scopesentry metadata incomplete: %+v", s)
+			}
+			if len(s.MCPs) != 1 || s.MCPs[0] != "ScopeSentry" {
+				t.Fatalf("scopesentry MCPs=%v, want [ScopeSentry]", s.MCPs)
+			}
+		}
+	}
+}

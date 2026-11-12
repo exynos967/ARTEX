@@ -3,6 +3,7 @@
 package skills
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"embed"
@@ -14,10 +15,10 @@ import (
 	"sync"
 )
 
-//go:embed nuclei/SKILL.md vulnx/SKILL.md web-discovery/SKILL.md authenticated-verify/SKILL.md portable-tools/SKILL.md targeted-verify/SKILL.md protocol-check/SKILL.md ip-lookup/SKILL.md python-environment/SKILL.md resource-creator/SKILL.md tack
+//go:embed nuclei/SKILL.md vulnx/SKILL.md web-discovery/SKILL.md authenticated-verify/SKILL.md portable-tools/SKILL.md targeted-verify/SKILL.md protocol-check/SKILL.md ip-lookup/SKILL.md python-environment/SKILL.md resource-creator/SKILL.md scopesentry/SKILL.md tack
 var bundled embed.FS
 
-var builtinNames = []string{"nuclei", "vulnx", "web-discovery", "authenticated-verify", "portable-tools", "targeted-verify", "protocol-check", "ip-lookup", "python-environment", "resource-creator", "tack"}
+var builtinNames = []string{"nuclei", "vulnx", "web-discovery", "authenticated-verify", "portable-tools", "targeted-verify", "protocol-check", "ip-lookup", "python-environment", "resource-creator", "scopesentry", "tack"}
 
 // SeedDefaults publishes missing files atomically without replacing user edits.
 // Visibility is seeded separately in PostgreSQL; a disabled skill stays disabled.
@@ -95,7 +96,7 @@ func publishBundled(root *os.Root, name, path string) error {
 	upgrade := false
 	var predecessor []byte
 	if info, err := root.Lstat(path); err == nil {
-		if !info.Mode().IsRegular() || path != "SKILL.md" || (name != "resource-creator" && name != "tack") {
+		if !info.Mode().IsRegular() || path != "SKILL.md" || (name != "resource-creator" && name != "tack" && name != "scopesentry") {
 			return nil
 		}
 		predecessor, err = root.ReadFile(path)
@@ -155,12 +156,15 @@ func bundledPredecessor(name, path string, content []byte) bool {
 	if path != "SKILL.md" {
 		return false
 	}
-	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	normalized := bytes.ReplaceAll(content, []byte("\r\n"), []byte("\n"))
+	digest := fmt.Sprintf("%x", sha256.Sum256(normalized))
 	switch name {
 	case "resource-creator":
 		return digest == "02143138496b678d4fe1f7c7299b9e9cceccf87b269296b80eb4482a6cb3b8fb" || digest == "27fa331d8d71becd7ad1e1590d75a94a469bb03b92135a0e0e621734303fb3c5"
 	case "tack":
 		return digest == "1aff3e28a3a1c5cd651de3911b83d08bd837ce6f1d3ac6b32e337151585645b9"
+	case "scopesentry":
+		return digest == "d9ac4c39d3868c26d2e8bbd9a5710bbc6179426f8004e83e5cc3bd8ff2339f5b" || digest == "7653202f58317264771c46c8dd3c81d67b3aa1e0f81a8fba33380de83e8e7026"
 	}
 	return false
 }

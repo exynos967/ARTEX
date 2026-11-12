@@ -1,57 +1,43 @@
 ---
-
-## name: scopesentry-mcp
-description: 通过 ScopeSentry MCP 管理安全扫描平台（项目、任务、模板、资产、节点）。在用户提到 ScopeSentry、MCP、API Key、扫描任务、资产查询时使用。
+name: scopesentry
+description: 通过 ScopeSentry MCP 管理外部攻击面扫描平台（项目、分布式扫描任务、扫描模板、插件、节点与 13 类资产/敏感信息/漏洞线索检索）。适用于下发广度测绘任务，或在渗透过程中按需拉取存量资产、爬虫接口、目录扫描结果与扫描器线索。
+license: AGPL-3.0-only
+compatibility: 需在 ARTEX「资产同步」或「系统 - MCP」中配置并启用名为 ScopeSentry 的 HTTP MCP 服务（携带 X-API-Key）；调用本 Skill 后自动解锁其延迟加载工具。
+mcps: ScopeSentry
+---
 
 # ScopeSentry MCP 使用指南
 
-面向**已部署 ScopeSentry 实例**的用户。通过 Cursor（或其他 MCP 客户端）连接平台，无需本地源码。
+在 ARTEX 中按需调度外部 **ScopeSentry** 攻击面管理与分布式扫描平台，用于广度资产测绘任务编排及存量线索检索。
 
-## 1. 准备工作
+## 1. 工具解锁与 ARTEX 协同准则
 
-### 1.1 确认服务可访问
+### 1.1 延迟工具（Deferred MCP）解锁与调用
 
-- 默认 Web 界面：`http://<主机>`
-- MCP 端点：`http://<主机>/mcp`（若前面有反向代理或前端代理，以实际 `/mcp` 地址为准）
+1. 调用 `Skill(name="scopesentry")` 后，若平台已配置并启用名为 `ScopeSentry` 的 MCP 服务，本次工具返回末尾会附上 `<available-deferred-tools>` 列表（工具名带 `mcp__ScopeSentry__` 前缀）。
+2. 这些工具属于延迟加载工具，不在默认工具列表中：**必须先调用 `SearchExtraTools`**（如 `{"query": "select:mcp__ScopeSentry__list_projects,mcp__ScopeSentry__list_assets"}`）获取参数 Schema，**再调用 `ExecuteExtraTool`** 传入完整工具名执行。
+3. 若加载本 Skill 后未出现任何 `mcp__ScopeSentry__*` 工具，说明当前环境未启用 `ScopeSentry` MCP、凭据缺失或服务不可达；应如实告知并切换至当前 Runner 可用的本地测绘能力（如 `web-discovery`、`nuclei`），不要盲目猜测或反复重试。
 
-### 1.2 创建 API Key
+### 1.2 渗透测试协同与自主性守则
 
-1. 浏览器登录 ScopeSentry Web 界面
-2. 进入 **API Key** 管理页创建密钥（或通过管理员提供的接口创建）
-3. 保存返回的 `ssk_...` 字符串（**仅显示一次**）
-
-### 1.3 配置 Cursor MCP
-
-Cursor → Settings → MCP → 添加服务器：
-
-```json
-{
-  "mcpServers": {
-    "scopesentry": {
-      "url": "http://<你的主机>:8082/mcp",
-      "headers": {
-        "X-API-Key": "ssk_你的密钥"
-      }
-    }
-  }
-}
-```
-
-也可使用：`Authorization: Bearer ssk_你的密钥`
-
-配置完成后重启 MCP 或重载 Cursor，确认工具列表中出现 `list_projects`、`list_assets` 等。
+- **按需拉取（Pull-on-demand），控制上下文体积**：检索前优先用 `count_assets` 评估数据量，再配合 `filter.project` 与走索引的 `search` 条件（`==` 全等或 `^` 前缀）以小分页（`pageSize: 10~20`）提取高价值目标（如 `crawler`、`DirScanResult`、`SensitiveResult`、`vulnerability`、`SubdomainTakerResult`），严禁将海量扫描流水一次性倾倒进上下文。
+- **增量沉淀范围资产**：从 ScopeSentry 筛选出确认在任务范围内、且尚未同步至 ARTEX 的新子域、端口服务或关键接口时，通过当前 Agent 可用的资产工具（如 `insert_assets`）增量写入图谱，避免重复导入已同步资产。
+- **保持独立判断，严防扫描器噪音局限视野**：ScopeSentry 中的 `vulnerability` 与 `SensitiveResult` 仅代表**外部扫描器或正则规则的未验证线索**，常含静态 JS 误报或通用模板噪音：
+  1. **严禁直接采信上报**：未经当前会话真实流量独立复现与影响确认，绝不可直接调用 `report_finding`。
+  2. **拒绝隧道视野**：外部扫描器擅长已知特征与广度枚举，但无法替代对业务逻辑、角色越权（IDOR/BOLA）及多步状态流转的分析；核查完外部线索后，仍须按完整攻击面自主展开深度探索。
 
 ---
 
 ## 2. 工具一览
 
+在 ARTEX 中通过 `SearchExtraTools` / `ExecuteExtraTool` 调用时，完整工具名为 `mcp__ScopeSentry__<工具名>`（例如 `mcp__ScopeSentry__list_assets`）：
 
 | 工具                     | 用途                |
 | ---------------------- | ----------------- |
 | `list_projects`        | 按标签分组的项目树（含项目 ID） |
 | `list_projects_data`   | 分页项目列表，可按名称搜索     |
 | `get_project`          | 项目详情              |
-| `create_project`       | 新建项目              |
+| `create_project`       | 新建项目（同名项目存在时可幂等更新目标范围） |
 | `list_tasks`           | 扫描任务列表            |
 | `get_task`             | 任务详情              |
 | `list_scan_templates`  | 扫描模板列表            |
@@ -355,7 +341,7 @@ JSON 对象：同 key 多个值为 **OR**，不同 key 为 **AND**。
 
 | 现象        | 处理                                                 |
 | --------- | -------------------------------------------------- |
-| MCP 无工具   | 检查 URL、API Key、ScopeSentry 是否运行                    |
+| MCP 无工具   | 确认 ARTEX「资产同步」或「系统 - MCP」中已启用名为 `ScopeSentry` 的服务，且 `/mcp` URL、API Key 及远端实例正常 |
 | 401 / 403 | 重新创建或更换 API Key                                    |
 | 资产查不到     | 确认 `filter.project` 为 ObjectID；勿在 search 写 project |
 | 模板/任务创建失败 | `template` 必须是模板 ObjectID；`node` 填在线节点名            |
