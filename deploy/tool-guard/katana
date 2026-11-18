@@ -1,0 +1,41 @@
+#!/usr/bin/bash
+# katana 资源护栏 shim
+#
+# 作用：无论调用方（LLM 规划、脚本、人工）传入什么参数，都会在真正执行前强制：
+#   -concurrency/-c  -> 3
+#   -depth/-d        -> 2
+#   -jsluice         -> 剥离（该参数会把每个 JS 响应体留在内存中）
+#
+# 背景：katana -jsluice -d 3 -c 10 曾在 31GB 宿主上单进程占用 25.8GB RSS，
+#       导致内存耗尽、整机失去响应，只能硬断电恢复。
+#       详见同目录 README.md。
+set -u
+
+LOG="${KATANA_SHIM_LOG:-/opt/artex-shim/logs/katana.log}"
+REAL=/usr/local/bin/katana
+MAX_CONCURRENCY=3
+MAX_DEPTH=2
+
+args=()
+skip=0
+for a in "$@"; do
+  if [ "$skip" = "1" ]; then skip=0; continue; fi
+  case "$a" in
+    -c|-concurrency)      args+=("-c" "$MAX_CONCURRENCY"); skip=1 ;;
+    -d|-depth)            args+=("-d" "$MAX_DEPTH"); skip=1 ;;
+    -c=*|-concurrency=*)  args+=("-c=$MAX_CONCURRENCY") ;;
+    -d=*|-depth=*)        args+=("-d=$MAX_DEPTH") ;;
+    -jsluice|--jsluice)   ;;
+    *)                    args+=("$a") ;;
+  esac
+done
+
+if [ -n "${KATANA_SHIM_DEBUG:-}" ]; then
+  printf 'katana.shim argv:'
+  printf ' %s' "${args[@]}"
+  printf '\n'
+  exit 0
+fi
+
+{ date -u +%FT%TZ; printf '  '; printf '%s ' "${args[@]}"; printf '\n'; } >> "$LOG" 2>/dev/null || true
+exec "$REAL" "${args[@]}"
