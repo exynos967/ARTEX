@@ -50,7 +50,14 @@ func (r *Registry) Schemas() []llm.ToolSchema {
 		if p := t.Prompt(); p != "" {
 			desc += "\n\n" + p
 		}
-		out = append(out, llm.ToolSchema{Name: t.Name(), Description: desc, InputSchema: t.InputSchema()})
+		out = append(out, llm.ToolSchema{
+			Name:        t.Name(),
+			Description: desc,
+			InputSchema: t.InputSchema(),
+			// Advertised so the transport can hand a partial call to the tool that
+			// repairs it instead of ending the turn (see llm.ToolSchema.RawInput).
+			RawInput: AcceptsRawInput(t),
+		})
 	}
 	return out
 }

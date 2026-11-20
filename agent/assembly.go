@@ -81,6 +81,12 @@ func (g *guardedTool) WithExecutionRuntime(runtime actool.ExecutionRuntime) acto
 	return &guardedTool{CoreTool: actool.BindExecutionRuntime([]actool.CoreTool{g.CoreTool}, runtime)[0]}
 }
 
+// AcceptsRawInput forwards the inner tool's opt-out. Embedding a CoreTool hides
+// optional methods, and this decorator is applied LAST — without the forward,
+// every tool would look like it rejects raw input, including the one tool that
+// asked for it (noa's Compress), and every garbled call would end the turn.
+func (g *guardedTool) AcceptsRawInput() bool { return actool.AcceptsRawInput(g.CoreTool) }
+
 func (g *guardedTool) Call(ctx context.Context, in json.RawMessage, tc *actool.ToolContext) (res actool.Result, err error) {
 	defer func() {
 		if r := recover(); r != nil {

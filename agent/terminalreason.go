@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RC-CHN/ARTEX/norma/harness"
+	"github.com/RC-CHN/ARTEX/norma/llm"
 )
 
 // runTrace retains the latest tool call so an interrupted run can identify the
@@ -85,6 +86,9 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 		sum = "（模型连续未回复，终态 empty_response：恢复后仍无进展，本轮异常结束；此前工具结果和产物保留）"
 	} else if reason == harness.ReasonIncompleteResponse {
 		sum = "（模型响应不完整，终态 incomplete_response：本轮异常结束，已有结果保留；未完成的工具调用没有提交执行）"
+		if truncatedIncomplete(term.Err) {
+			sum += "；模型是撞到输出上限(max_tokens)被截断的，缩小单次产出或调大输出上限后再试"
+		}
 	} else {
 		hint := terminalReasonHint(reason)
 		sum = "（无文字总结，终态 " + terminalReasonLabel(reason) + "：" + firstLine(hint, 80) + "）"
@@ -94,7 +98,11 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	b.WriteString(sum)
 	b.WriteString("\n\n")
 	displayReason := terminalReasonLabel(reason)
-	fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", displayReason, terminalReasonHint(reason))
+	hint := terminalReasonHint(reason)
+	if truncatedIncomplete(term.Err) {
+		hint = "模型输出达到上限(max_tokens)后被截断，工具参数没有写完；已有结果保留，未提交的工具没有执行"
+	}
+	fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", displayReason, hint)
 	if aborted {
 		code, _, why, ok := AbortReason(ctx)
 		if ok {
@@ -105,6 +113,13 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	}
 	if term.Err != nil {
 		fmt.Fprintf(&b, "- **底层错误**: `%v`\n", term.Err)
+	}
+	var incomplete *llm.IncompleteResponseError
+	if errors.As(term.Err, &incomplete) && incomplete.StopReason != "" {
+		// The stop reason is what separates "the provider's answer was corrupt"
+		// from "the answer was cut off by the output cap". Without it the reader
+		// cannot tell whether to raise the cap or look at the gateway.
+		fmt.Fprintf(&b, "- **模型停止原因**: `%s`\n", incomplete.StopReason)
 	}
 	if (aborted || reason == harness.ReasonIncompleteResponse) && strings.TrimSpace(term.Text) != "" {
 		b.WriteString("- **中断前已生成的部分输出**:\n\n")
@@ -158,6 +173,13 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 		fmt.Fprintf(&b, "- **中断前最后一个工具**: `%s`（已正常返回）\n", tr.name)
 	}
 	return sum, b.String()
+}
+
+// truncatedIncomplete reports whether an incomplete response was cut off by the
+// output cap rather than corrupted, so the advice can name the right remedy.
+func truncatedIncomplete(err error) bool {
+	var incomplete *llm.IncompleteResponseError
+	return errors.As(err, &incomplete) && incomplete.StopReason == "max_tokens"
 }
 
 func terminalIsError(ctx context.Context, term *harness.Terminal) bool {

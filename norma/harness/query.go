@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -1035,24 +1036,64 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 	exec = newStreamExec(l)
 	acc := llm.NewAccumulator()
 
-	var building bool
-	var curID, curName string
-	var curInput strings.Builder
-	finalizeTool := func() bool { // false = consumer stopped
-		if !building {
+	// Tool calls are collected per call, not in one "current call" buffer:
+	// compatible gateways may interleave the argument deltas of parallel calls,
+	// and a single buffer would splice one call's fragments into another's JSON.
+	// A call is dispatched as soon as its arguments are complete JSON — the next
+	// tool_use_start is only a hint that the previous call probably ended, and
+	// anything still incomplete waits for the tool phase to finish.
+	type toolDraft struct {
+		id, name string
+		input    strings.Builder
+	}
+	var drafts []*toolDraft
+	byID := map[string]*toolDraft{}
+	lastDraft := func() *toolDraft {
+		if len(drafts) == 0 {
+			return nil
+		}
+		return drafts[len(drafts)-1]
+	}
+	// flushCalls dispatches the calls that are certainly finished, in arrival
+	// order. force=false is used when ANOTHER call starts: only a call whose
+	// arguments are already valid JSON can be closed there, because a gateway may
+	// still be streaming a parallel call's fragments into a different index.
+	// force=true is used when the tool phase itself ends (text, stop, end of
+	// stream), where nothing can arrive any more.
+	flushCalls := func(force bool) bool { // false = consumer stopped
+		n := 0
+		for n < len(drafts) {
+			raw := strings.TrimSpace(drafts[n].input.String())
+			if !force && (raw == "" || !json.Valid([]byte(raw))) {
+				// Later drafts wait too: tool results must keep arrival order.
+				break
+			}
+			n++
+		}
+		if n == 0 {
 			return true
 		}
-		building = false
-		raw := strings.TrimSpace(curInput.String())
-		curInput.Reset()
-		if raw == "" || !jsonValid(raw) {
-			raw = "{}"
+		pending := append([]*toolDraft(nil), drafts[:n]...)
+		// byID keeps pointing at flushed drafts on purpose: a late fragment for a
+		// call that already ran must land in its own dead buffer (harmless) rather
+		// than fall through to "the last draft" and corrupt a live call.
+		drafts = append([]*toolDraft(nil), drafts[n:]...)
+		for _, d := range pending {
+			raw := strings.TrimSpace(d.input.String())
+			if raw == "" {
+				// A call with no arguments is a complete call ("{}"). Incomplete
+				// bytes are NOT turned into "{}": for a raw-input tool that would
+				// throw away the fragments it repairs from, and for every other
+				// tool execOne refuses them explicitly instead of running an
+				// empty call.
+				raw = "{}"
+			}
+			block := llm.ContentBlock{Type: llm.BlockToolUse, ID: d.id, Name: d.name, Input: []byte(raw)}
+			if !l.emit(Event{Kind: KindToolUse, ToolUse: &block}) {
+				return false
+			}
+			exec.add(block)
 		}
-		block := llm.ContentBlock{Type: llm.BlockToolUse, ID: curID, Name: curName, Input: []byte(raw)}
-		if !l.emit(Event{Kind: KindToolUse, ToolUse: &block}) {
-			return false
-		}
-		exec.add(block)
 		return exec.drain()
 	}
 
@@ -1073,14 +1114,46 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			err = l.ctx.Err()
 			break
 		}
-		if ev.Type == llm.SEToolInputJSON {
-			if building {
-				curInput.WriteString(ev.Text)
+		switch ev.Type {
+		case llm.SEToolUseStart:
+			// Close the calls that are already complete before opening another
+			// one: that is what lets a finished tool run while the model keeps
+			// streaming its siblings (FR-01.4).
+			if !flushCalls(false) {
+				return asst, exec, "", nil, true, false
+			}
+			if d := byID[ev.ToolID]; d != nil {
+				// A gateway repeated the header for a call already started. Keep
+				// exactly one draft, or the same call would run twice.
+				if ev.ToolName != "" {
+					d.name = ev.ToolName
+				}
+				acc.Add(ev)
+				continue
+			}
+			d := &toolDraft{id: ev.ToolID, name: ev.ToolName}
+			drafts = append(drafts, d)
+			if ev.ToolID != "" {
+				byID[ev.ToolID] = d
+			}
+			acc.Add(ev)
+			continue
+		case llm.SEToolInputJSON:
+			// Route by call id. A host provider that does not stamp one gets the
+			// legacy behaviour: the call most recently started.
+			d := byID[ev.ToolID]
+			if d == nil {
+				d = lastDraft()
+			}
+			if d != nil {
+				d.input.WriteString(ev.Text)
 			}
 			acc.Add(ev)
 			continue
 		}
-		if !finalizeTool() {
+		// Any other event ends the tool phase: dispatch everything collected,
+		// in arrival order, before handling the event.
+		if !flushCalls(true) {
 			return asst, exec, "", nil, true, false
 		}
 		switch ev.Type {
@@ -1092,29 +1165,37 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			if ev.Text != "" && !l.emit(Event{Kind: KindThinking, Text: ev.Text}) {
 				return asst, exec, "", nil, true, false
 			}
-		case llm.SEToolUseStart:
-			curID, curName, building = ev.ToolID, ev.ToolName, true
 		}
 		acc.Add(ev)
 	}
 	if err == nil {
 		err = l.ctx.Err()
 	}
-	if err != nil && building {
-		// A stream error is not the end of a valid tool block. In particular,
-		// do not turn incomplete JSON into an empty, apparently running call.
-		l.interruptedToolInput = &llm.ContentBlock{Type: llm.BlockToolUse, ID: curID, Name: curName, Input: []byte(curInput.String())}
-	} else if err == nil && !finalizeTool() {
+	// Calls still open when the stream failed were never submitted. Report the
+	// latest one and drop ALL of them from the recorded message: an assistant
+	// tool_use without a tool_result cannot be replayed.
+	var interruptedIDs map[string]bool
+	if err != nil && len(drafts) > 0 {
+		d := lastDraft()
+		l.interruptedToolInput = &llm.ContentBlock{Type: llm.BlockToolUse, ID: d.id, Name: d.name, Input: []byte(d.input.String())}
+		interruptedIDs = make(map[string]bool, len(drafts))
+		for _, dr := range drafts {
+			if dr.id != "" {
+				interruptedIDs[dr.id] = true
+			}
+		}
+	} else if err == nil && !flushCalls(true) {
 		return asst, exec, "", nil, true, false
 	}
 	l.usage.Add(acc.Usage)
 	asst = acc.Message()
-	if pending := l.interruptedToolInput; pending != nil {
+	if len(interruptedIDs) > 0 {
 		content := asst.Content[:0:0]
 		for _, b := range asst.Content {
-			if b.Type != llm.BlockToolUse || b.ID != pending.ID {
-				content = append(content, b)
+			if b.Type == llm.BlockToolUse && interruptedIDs[b.ID] {
+				continue
 			}
+			content = append(content, b)
 		}
 		asst.Content = content
 	}
@@ -1131,6 +1212,26 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		return asst, exec, stopReason, nil, true, false
 	}
 	return asst, exec, stopReason, nil, false, ab
+}
+
+// replayableToolInput returns m with tool arguments that are not valid JSON
+// replaced by "{}". A partial call cannot be replayed to any provider, and the
+// tool result already told the model what happened to it.
+func replayableToolInput(m llm.Message) llm.Message {
+	var fixed []llm.ContentBlock
+	for i, b := range m.Content {
+		if b.Type != llm.BlockToolUse || json.Valid(b.Input) {
+			continue
+		}
+		if fixed == nil {
+			fixed = append([]llm.ContentBlock(nil), m.Content...)
+		}
+		fixed[i].Input = json.RawMessage("{}")
+	}
+	if fixed != nil {
+		m.Content = fixed
+	}
+	return m
 }
 
 // completeAndExecute is the non-streaming counterpart of streamAndExecute's body.
@@ -1160,6 +1261,10 @@ func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, 
 	}
 	asst = msg
 	stopReason = sr
+	// Dispatch below uses the bytes the model sent; the recorded message must
+	// carry arguments every wire format can replay. A raw-input tool may have
+	// executed a partial call, so its truncated bytes become {} in history only.
+	asst = replayableToolInput(asst)
 	for _, b := range msg.Content {
 		switch b.Type {
 		case llm.BlockThinking:
@@ -1187,36 +1292,4 @@ func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, 
 		return asst, exec, stopReason, nil, true, false
 	}
 	return asst, exec, stopReason, nil, false, ab
-}
-
-func jsonValid(s string) bool {
-	// minimal check used only to guard tool input assembly
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
-	}
-	depth := 0
-	inStr := false
-	esc := false
-	for _, r := range s {
-		if inStr {
-			if esc {
-				esc = false
-			} else if r == '\\' {
-				esc = true
-			} else if r == '"' {
-				inStr = false
-			}
-			continue
-		}
-		switch r {
-		case '"':
-			inStr = true
-		case '{', '[':
-			depth++
-		case '}', ']':
-			depth--
-		}
-	}
-	return depth == 0 && !inStr
 }

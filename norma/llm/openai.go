@@ -298,6 +298,9 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 			yield(StreamEvent{}, err)
 			return
 		}
+		// Tools that repair their own arguments opt out of the transport's JSON
+		// check. Everything else keeps it: a partial call must not be submitted.
+		rawTools := rawInputToolSet(req.Tools)
 		for attempt := 0; ; attempt++ {
 			resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/chat/completions", body, func(r *http.Request) {
 				r.Header.Set("content-type", "application/json")
@@ -329,12 +332,9 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 			var streamErr error
 			var upstreamCause error
 			var incomplete IncompleteResponseReason
-			var pendingTool bool
-			var toolInput strings.Builder
-			validToolInput := func() bool {
-				raw := strings.TrimSpace(toolInput.String())
-				return !pendingTool || raw == "" || json.Valid([]byte(raw))
-			}
+			// One buffer per call index: parallel calls may interleave, and a
+			// single buffer would splice one call's fragments into another's JSON.
+			calls := newStreamedToolCalls()
 			for {
 				_, data, serr := scan.next()
 				if serr == io.EOF {
@@ -378,28 +378,30 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 					break
 				}
 				for _, ev := range evs {
-					// Any non-input event would make the harness dispatch the pending
-					// tool. Reject malformed input before exposing that boundary.
-					if ev.Type != SEToolInputJSON && !validToolInput() {
+					// The end of the tool phase is what makes the harness dispatch.
+					// Validate there, not at every event: during the phase a parallel
+					// call may still be receiving fragments.
+					if !toolPhaseEvent(ev.Type) && !calls.allValid(rawTools, false) {
 						diagnostics.StreamEnd = StreamEndProtocolError
 						incomplete = IncompleteInvalidToolInput
 						break
 					}
 					switch ev.Type {
 					case SEToolUseStart:
-						pendingTool = true
-						toolInput.Reset()
+						calls.start(ev.Index, ev.ToolID, ev.ToolName)
 						committed, meaningful, observed = true, true, true
 					case SEToolInputJSON:
 						committed, observed = true, true
-						toolInput.WriteString(ev.Text)
+						// Attribute the fragment to its own call, so a gateway that
+						// interleaves parallel calls cannot corrupt either one.
+						if c := calls.append(ev.Index, ev.Text); c != nil {
+							ev.ToolID = c.id
+						}
 					case SETextDelta:
 						committed, observed = true, true
 						meaningful = meaningful || strings.TrimSpace(ev.Text) != ""
-						pendingTool = false
 					case SEThinkingDelta:
 						observed = observed || ev.Text != ""
-						pendingTool = false
 					}
 					if !yield(ev, nil) {
 						consumerStopped = true
@@ -420,7 +422,7 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 			if incomplete == "" && streamErr == nil && diagnostics.StreamEnd == StreamEndEOF && !diagnostics.FinishReasonSeen {
 				incomplete = IncompleteMissingTerminal
 			}
-			if incomplete == "" && streamErr == nil && !validToolInput() {
+			if incomplete == "" && streamErr == nil && !calls.allValid(rawTools, false) {
 				incomplete = IncompleteInvalidToolInput
 			}
 			if incomplete == "" && streamErr == nil && !meaningful && stopReason != "max_tokens" {
@@ -473,6 +475,9 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 	if err != nil {
 		return Message{}, "", Usage{}, err
 	}
+	// Same opt-out as the streaming path: a tool that repairs its own arguments
+	// receives them even when the single response carried incomplete JSON.
+	rawTools := rawInputToolSet(req.Tools)
 	var totalUsage Usage
 	var lastPartial Message
 	for attempt := 0; ; attempt++ {
@@ -492,7 +497,7 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 			}
 			return Message{}, "", totalUsage, &IncompleteResponseError{Reason: IncompleteStreamRead, Diagnostics: StreamDiagnostics{StreamEnd: StreamEndReadError}}
 		}
-		msg, stop, usage, perr := parseOpenAIResponse(raw)
+		msg, stop, usage, perr := parseOpenAIResponse(raw, rawTools)
 		totalUsage.Add(usage)
 		if ctx.Err() != nil {
 			return msg, stop, totalUsage, ctx.Err()
@@ -527,7 +532,7 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 // the neutral Message model. reasoning_content/reasoning (a reasoning model's
 // thinking) is mapped to a thinking block; content to a text block; tool_calls to
 // tool_use blocks — the same shape the streaming path accumulates.
-func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
+func parseOpenAIResponse(raw []byte, rawTools map[string]bool) (Message, string, Usage, error) {
 	var r struct {
 		Choices []struct {
 			Message struct {
@@ -588,7 +593,7 @@ func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 		if strings.TrimSpace(in) == "" {
 			in = "{}"
 		}
-		if !json.Valid([]byte(in)) {
+		if !json.Valid([]byte(in)) && !rawTools[tc.Function.Name] {
 			invalidToolInput = true
 		}
 		blocks = append(blocks, ContentBlock{Type: BlockToolUse, ID: tc.ID, Name: tc.Function.Name, Input: []byte(in)})
@@ -689,10 +694,12 @@ func parseOpenAIFrameDiagnostics(data string, started map[int]bool) (evs []Strea
 	for _, tc := range ch.Delta.ToolCalls {
 		if !started[tc.Index] && (tc.ID != "" || tc.Function.Name != "") {
 			started[tc.Index] = true
-			evs = append(evs, StreamEvent{Type: SEToolUseStart, ToolID: tc.ID, ToolName: tc.Function.Name})
+			evs = append(evs, StreamEvent{Type: SEToolUseStart, ToolID: tc.ID, ToolName: tc.Function.Name, Index: tc.Index})
 		}
 		if tc.Function.Arguments != "" {
-			evs = append(evs, StreamEvent{Type: SEToolInputJSON, Text: tc.Function.Arguments})
+			// Index, not a single shared buffer: late deltas for call 0 can arrive
+			// after call 1 started.
+			evs = append(evs, StreamEvent{Type: SEToolInputJSON, Text: tc.Function.Arguments, Index: tc.Index})
 		}
 	}
 	if ch.FinishReason != "" {

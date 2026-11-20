@@ -113,16 +113,26 @@ func TestOpenAIThinkingRetryPreservesRequestToolsAndUsage(t *testing.T) {
 
 func TestOpenAIIncompleteToolDoesNotExposeDispatchBoundary(t *testing.T) {
 	tool := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"pending\",\"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n"
-	for _, tail := range []string{
-		"data: [DONE]\n\n",
-		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
-		"data: {\"choices\":[{\"delta\":{\"content\":\"must not dispatch tool\"}}]}\n\ndata: [DONE]\n\n",
-		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"next\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+	finish := "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+	pending := []StreamEventType{SEToolUseStart, SEToolInputJSON, SEStreamDiagnostics}
+	for _, tc := range []struct {
+		name string
+		tail string
+		want []StreamEventType
+	}{
+		{"done", "data: [DONE]\n\n", pending},
+		{"finish", finish, pending},
+		{"late text", "data: {\"choices\":[{\"delta\":{\"content\":\"must not dispatch tool\"}}]}\n\ndata: [DONE]\n\n", pending},
+		// A parallel call starting does NOT close the first one: gateways may
+		// interleave their argument deltas, so the incomplete call is judged when
+		// the tool phase ends, not at the next tool_use_start.
+		{"next tool", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"next\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}}]}}]}\n\n" + finish,
+			[]StreamEventType{SEToolUseStart, SEToolInputJSON, SEToolUseStart, SEToolInputJSON, SEStreamDiagnostics}},
 	} {
-		t.Run(tail, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			var events []StreamEventType
 			var streamErr error
-			for ev, err := range fixtureProvider(t, tool+tail).Stream(t.Context(), CompletionRequest{}) {
+			for ev, err := range fixtureProvider(t, tool+tc.tail).Stream(t.Context(), CompletionRequest{}) {
 				if err != nil {
 					streamErr = err
 					break
@@ -130,8 +140,8 @@ func TestOpenAIIncompleteToolDoesNotExposeDispatchBoundary(t *testing.T) {
 				events = append(events, ev.Type)
 			}
 			assertIncomplete(t, streamErr, IncompleteInvalidToolInput)
-			if !reflect.DeepEqual(events, []StreamEventType{SEToolUseStart, SEToolInputJSON, SEStreamDiagnostics}) {
-				t.Fatalf("unexpected dispatch boundary: %v", events)
+			if !reflect.DeepEqual(events, tc.want) {
+				t.Fatalf("unexpected dispatch boundary: %v, want %v", events, tc.want)
 			}
 		})
 	}

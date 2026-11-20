@@ -83,13 +83,24 @@ func TestAnthropicToolBoundariesAndInitialInput(t *testing.T) {
 		name, input, delta, tail string
 		want                     IncompleteResponseReason
 		raw                      string
+		// types is asserted for the failing cases: it pins which events may be
+		// exposed before the turn is rejected.
+		types []StreamEventType
 	}{
 		{name: "initial_object", input: `{"path":"RESOURCE.md"}`, tail: anthropicFrame(anthropicStop), raw: `{"path":"RESOURCE.md"}`},
 		{name: "empty_initial_placeholder", input: `{ }`, delta: `{"path":"RESOURCE.md"}`, tail: anthropicFrame(anthropicStop), raw: `{"path":"RESOURCE.md"}`},
-		{name: "unfinished_at_block_stop", input: `{}`, delta: `{"path":`, tail: anthropicFrame(`{"type":"content_block_stop","index":0}`), want: IncompleteInvalidToolInput},
-		{name: "unfinished_at_next_tool", input: `{}`, delta: `{"path":`, tail: anthropicFrame(`{"type":"content_block_start","content_block":{"type":"tool_use","id":"next","name":"Read","input":{}}}`), want: IncompleteInvalidToolInput},
-		{name: "valid_json_without_terminal", input: `{"path":"RESOURCE.md"}`, want: IncompleteMissingTerminal},
-		{name: "invalid_initial_shape", input: `"not an object"`, tail: anthropicFrame(anthropicStop), want: IncompleteInvalidToolInput},
+		{name: "unfinished_at_block_stop", input: `{}`, delta: `{"path":`, tail: anthropicFrame(`{"type":"content_block_stop","index":0}`), want: IncompleteInvalidToolInput,
+			types: []StreamEventType{SEToolUseStart, SEToolInputJSON, SEStreamDiagnostics}},
+		// A second block starting does not close the first one (parallel calls may
+		// interleave); the incomplete block is judged when a block actually stops.
+		{name: "unfinished_at_next_tool", input: `{}`, delta: `{"path":`,
+			tail:  anthropicFrame(`{"type":"content_block_start","content_block":{"type":"tool_use","id":"next","name":"Read","input":{}}}`) + anthropicFrame(`{"type":"content_block_stop","index":1}`),
+			want:  IncompleteInvalidToolInput,
+			types: []StreamEventType{SEToolUseStart, SEToolInputJSON, SEToolUseStart, SEStreamDiagnostics}},
+		{name: "valid_json_without_terminal", input: `{"path":"RESOURCE.md"}`, want: IncompleteMissingTerminal,
+			types: []StreamEventType{SEToolUseStart, SEToolInputJSON, SEStreamDiagnostics}},
+		{name: "invalid_initial_shape", input: `"not an object"`, tail: anthropicFrame(anthropicStop), want: IncompleteInvalidToolInput,
+			types: []StreamEventType{SEToolUseStart, SEToolInputJSON, SEStreamDiagnostics}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := anthropicFrame(fmt.Sprintf(`{"type":"content_block_start","content_block":{"type":"tool_use","id":"pending","name":"Write","input":%s}}`, tc.input))
@@ -115,8 +126,8 @@ func TestAnthropicToolBoundariesAndInitialInput(t *testing.T) {
 			}
 			if tc.want != "" {
 				assertIncomplete(t, gotErr, tc.want)
-				if !reflect.DeepEqual(types, []StreamEventType{SEToolUseStart, SEToolInputJSON, SEStreamDiagnostics}) {
-					t.Fatalf("exposed invalid tool boundary: %v", types)
+				if !reflect.DeepEqual(types, tc.types) {
+					t.Fatalf("exposed unexpected tool events: %v, want %v", types, tc.types)
 				}
 			} else {
 				if gotErr != nil {
@@ -241,7 +252,7 @@ func TestAnthropicCompleteInvalidToolAndMalformedFrame(t *testing.T) {
 		_, _, err := parseAnthropicFrame(raw)
 		assertIncomplete(t, err, IncompleteMalformedFrame)
 	}
-	msg, stop, usage, err := parseAnthropicResponse([]byte(`{"type":"message","content":[{"type":"tool_use","id":"bad","name":"Write","input":"invalid object"}],"stop_reason":"tool_use","usage":{"input_tokens":7,"output_tokens":3}}`))
+	msg, stop, usage, err := parseAnthropicResponse([]byte(`{"type":"message","content":[{"type":"tool_use","id":"bad","name":"Write","input":"invalid object"}],"stop_reason":"tool_use","usage":{"input_tokens":7,"output_tokens":3}}`), nil)
 	assertIncomplete(t, err, IncompleteInvalidToolInput)
 	if len(msg.ToolUses()) != 1 || stop != "tool_use" || usage.InputTokens != 7 {
 		t.Fatalf("lost partial message: %+v %s %+v", msg, stop, usage)

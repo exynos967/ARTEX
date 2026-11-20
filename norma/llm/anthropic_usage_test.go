@@ -84,7 +84,7 @@ func TestAnthropicMeteringSemantics(t *testing.T) {
 				t.Fatalf("usage=%+v want=%+v", got, tc.want)
 			}
 			// The real non-streaming parser must use the same normalization.
-			_, _, got, err := parseAnthropicResponse([]byte(`{"content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":` + tc.raw + `}`))
+			_, _, got, err := parseAnthropicResponse([]byte(`{"content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":`+tc.raw+`}`), nil)
 			if err != nil || got != tc.want {
 				t.Fatalf("complete usage=%+v err=%v", got, err)
 			}

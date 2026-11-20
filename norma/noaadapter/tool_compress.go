@@ -49,12 +49,17 @@ func newCompressTool(sess *Session) tool.CoreTool {
 
 func runCompress(sess *Session, input json.RawMessage, tc *tool.ToolContext) (tool.Result, error) {
 	parsed := noa.ParseCompressArgs(input)
+	// The harness marks arguments that never became valid JSON. The cause is a
+	// call cut off mid-generation — usually the output limit, with a summary far
+	// longer than the reply budget — so the answer must be "send less", not just
+	// "expected shape".
+	truncated := tc != nil && tc.InputMalformed
 
 	// A parse failure is a real error: the model produced something unusable and
 	// must see that, so it corrects the shape rather than the content.
 	if !parsed.Diagnostics.Ok && len(parsed.Ranges) == 0 {
 		sess.recordParseFailure()
-		return errorResult(formatParseError(parsed.Diagnostics)), nil
+		return errorResult(formatParseError(parsed.Diagnostics, truncated)), nil
 	}
 	if len(parsed.Ranges) == 0 {
 		// Neither success nor failure: a valid question with a valid answer.
@@ -81,9 +86,16 @@ func runCompress(sess *Session, input json.RawMessage, tc *tool.ToolContext) (to
 	panel := noa.FormatPanel(noa.PanelInput{
 		Result: res, BeforeTokens: before, AfterTokens: max(after, 0),
 	})
-	if parsed.Diagnostics.Salvaged || parsed.Diagnostics.TailRepaired {
+	if parsed.Diagnostics.Salvaged || parsed.Diagnostics.TailRepaired || truncated {
 		panel += "\n  note: the arguments were malformed and were repaired before parsing; " +
 			"check the call shape if this recurs."
+	}
+	if truncated && parsed.Diagnostics.Kind != noa.ParseOK {
+		// Only when the parse did NOT end cleanly. A call repaired from raw
+		// newlines is also InputMalformed, and claiming "output limit" for it
+		// would send the model after the wrong cause.
+		panel += "\n  note: the reply ended mid-call (output limit). Compress in smaller batches " +
+			"with shorter summaries to stay inside one reply."
 	}
 	// A panel is not an error even when it reports nothing created — the call was
 	// well-formed. But it reclaimed nothing, so the failure ladder must still
@@ -92,8 +104,15 @@ func runCompress(sess *Session, input json.RawMessage, tc *tool.ToolContext) (to
 }
 
 // formatParseError tells the model what shape its arguments arrived in.
-func formatParseError(d noa.CompressParseDiagnostics) string {
+func formatParseError(d noa.CompressParseDiagnostics, truncated bool) string {
 	var b strings.Builder
+	if truncated {
+		// Naming the cause changes what the model does next: a shape hint alone
+		// makes it resend the same oversized summary and fail the same way.
+		b.WriteString("The arguments never became valid JSON: the reply most likely ended mid-call " +
+			"(output limit). Nothing was compressed. Resend as a smaller batch — split the ranges " +
+			"into several calls and keep each summary shorter.\n")
+	}
 	switch d.Kind {
 	case noa.ParseEmptyInput:
 		b.WriteString("Compress received no arguments.")

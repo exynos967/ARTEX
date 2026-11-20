@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,15 +11,11 @@ import (
 	"github.com/RC-CHN/ARTEX/norma/tool"
 )
 
-// rawInputTool is the optional opt-out from schema validation. Discovered by
+// acceptsRawInput is the optional opt-out from schema validation. Discovered by
 // assertion rather than declared on tool.CoreTool, so hosts implementing that
-// interface are unaffected.
-type rawInputTool interface{ AcceptsRawInput() bool }
-
-func acceptsRawInput(t tool.CoreTool) bool {
-	r, ok := t.(rawInputTool)
-	return ok && r.AcceptsRawInput()
-}
+// interface are unaffected. The same predicate decides, one layer up, whether
+// the transport may deliver a partial call at all (see llm.ToolSchema.RawInput).
+func acceptsRawInput(t tool.CoreTool) bool { return tool.AcceptsRawInput(t) }
 
 // execOne resolves, permission-checks, and runs a single tool call, returning a
 // tool_result block and any extra messages the tool injects after its result
@@ -55,6 +52,27 @@ func (l *loop) execOne(toolCtx context.Context, use llm.ContentBlock, emitProgre
 		return llm.ToolResultText(use.ID, fmt.Sprintf("Error: unknown tool %q", use.Name), true), nil
 	}
 	input := use.Input
+	rawInput := acceptsRawInput(t)
+	// Empty arguments mean "no arguments", which is a complete call — host
+	// providers may omit the field entirely. A raw-input tool decides that for
+	// itself and receives the bytes verbatim ("" is not "{}" to its parser).
+	// Arguments that are not valid JSON can only be here because the model's
+	// call was cut off or mangled and the transport let it through for a
+	// raw-input tool — or because a host-supplied provider skipped its own
+	// check. Either way they must never reach a tool that did not opt in: the
+	// call did not complete, so executing it would be executing something the
+	// model never finished saying.
+	malformed := false
+	if len(bytes.TrimSpace(input)) == 0 {
+		if !rawInput {
+			input = json.RawMessage("{}")
+		}
+	} else {
+		malformed = !json.Valid(input)
+		if malformed && !rawInput {
+			return llm.ToolResultText(use.ID, invalidInputMessage, true), nil
+		}
+	}
 
 	// Schema validation (FR-04.5).
 	//
@@ -62,7 +80,7 @@ func (l *loop) execOne(toolCtx context.Context, use llm.ContentBlock, emitProgre
 	// arguments and would rather repair a malformed call than have it rejected
 	// here, where the only possible answer is a generic error. The schema is
 	// still advertised to the model either way — see tool.Spec.RawInput.
-	if !acceptsRawInput(t) {
+	if !rawInput {
 		if err := tool.ValidateInput(t.InputSchema(), input); err != nil {
 			return llm.ToolResultText(use.ID, "Error: invalid tool input: "+err.Error(), true), nil
 		}
@@ -115,6 +133,7 @@ func (l *loop) execOne(toolCtx context.Context, use llm.ContentBlock, emitProgre
 		MaxOutputChars: l.in.MaxToolOutputChars,
 		Tasks:          l.in.Tasks,
 		Env:            l.in.BashEnv,
+		InputMalformed: malformed,
 	}
 	// toolCtx carries the run's MaxDuration deadline, so a tool that overruns the
 	// wall-clock budget is interrupted here (the turn loop then enters wrap-up). During
@@ -146,6 +165,12 @@ func (l *loop) execOne(toolCtx context.Context, use llm.ContentBlock, emitProgre
 	}
 	return llm.ContentBlock{Type: llm.BlockToolResult, ToolUseID: use.ID, Content: content, IsError: res.IsError}, res.Extra
 }
+
+// invalidInputMessage tells the model exactly what went wrong and that nothing
+// ran. Vague validation errors make it repeat the same oversized call.
+const invalidInputMessage = "Error: invalid or unfinished tool input: the arguments were not complete JSON, " +
+	"so this call was NOT executed. Re-send it with complete arguments. If the reply was cut off by the " +
+	"output limit, produce less in one call — split the work into smaller calls."
 
 // capOutput runs every text block of a tool result through the idempotent
 // output cap (tool.CaptureOnce). Non-text blocks pass through untouched. It is

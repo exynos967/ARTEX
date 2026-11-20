@@ -44,6 +44,10 @@ func (m *meteredSkill) Call(ctx context.Context, input json.RawMessage, tc *acto
 	return m.CoreTool.Call(ctx, input, tc)
 }
 
+// AcceptsRawInput forwards the skill tool's opt-out; embedding a CoreTool hides
+// optional methods.
+func (m *meteredSkill) AcceptsRawInput() bool { return actool.AcceptsRawInput(m.CoreTool) }
+
 // record appends the ledger row. Best-effort by design: a metering failure must
 // never turn into a failed skill invocation, so every error path just logs.
 func (m *meteredSkill) record(input json.RawMessage) {

@@ -98,6 +98,27 @@ func TestIncompleteResponseFeedbackPreservesPriorEffectsAndPartialText(t *testin
 	}
 }
 
+// A truncated reply and a corrupted one need different remedies: raise the
+// output cap versus look at the gateway. The terminal receipt must say which.
+func TestTruncatedIncompleteResponseNamesTheOutputCap(t *testing.T) {
+	term := &harness.Terminal{
+		Reason: harness.ReasonIncompleteResponse,
+		Err: &llm.IncompleteResponseError{
+			Reason:     llm.IncompleteInvalidToolInput,
+			StopReason: "max_tokens",
+		},
+	}
+	summary, detail := terminalText(t.Context(), term, &runTrace{})
+	if !strings.Contains(summary, "max_tokens") {
+		t.Fatalf("summary does not name the truncation: %q", summary)
+	}
+	for _, want := range []string{"模型停止原因", "max_tokens", "incomplete_response", "未提交的工具没有执行"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("missing %q in feedback: %s", want, detail)
+		}
+	}
+}
+
 func TestFailedToolResultIsNotReportedAsNormalReturn(t *testing.T) {
 	trace := &runTrace{}
 	trace.start("bash", "Bash", "test command")

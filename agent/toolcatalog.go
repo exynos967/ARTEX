@@ -138,6 +138,11 @@ func (o *overriddenTool) WithExecutionRuntime(runtime actool.ExecutionRuntime) a
 	return &copy
 }
 
+// AcceptsRawInput forwards the decorated tool's opt-out; embedding a CoreTool
+// hides optional methods, and a hidden opt-out makes the harness validate calls
+// the tool exists to repair.
+func (o *overriddenTool) AcceptsRawInput() bool { return actool.AcceptsRawInput(o.CoreTool) }
+
 func (o *overriddenTool) Call(ctx context.Context, in json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
 	return o.CoreTool.Call(ctx, injectDefaults(in, o.schema), tc)
 }

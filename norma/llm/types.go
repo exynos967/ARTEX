@@ -119,6 +119,17 @@ type ToolSchema struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"input_schema"`
+
+	// RawInput marks a tool that parses its own arguments (tool.Spec.RawInput).
+	//
+	// The transport must deliver such a call's arguments verbatim even when they
+	// are not valid JSON: repairing them is the tool's job, and a truncated or
+	// fence-wrapped call is exactly the shape it exists to handle. Every other
+	// tool keeps the fatal path — a partial call must never be submitted.
+	//
+	// Local contract between host and adapter only; never serialized onto the
+	// wire. The schema is still advertised either way.
+	RawInput bool `json:"-"`
 }
 
 // CompletionRequest is a single, provider-neutral model invocation.

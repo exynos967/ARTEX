@@ -16,6 +16,12 @@ import (
 // arguments through the same gate the harness uses, so the lenient parsing the
 // rest of the suite exercises is known to be reachable in production.
 //
+// There is a second gate above the harness: the provider adapter rejects tool
+// arguments that are not valid JSON. Compress survives it because the opt-out
+// travels with the schema (llm.ToolSchema.RawInput); compress_e2e_test.go runs
+// the whole path — real provider, harness, tool — so this comment cannot quietly
+// become false again.
+//
 // Compress opts out of that gate (tool.Spec.RawInput) because the shapes it
 // exists to repair are, by definition, not valid JSON. The opt-out is asserted
 // here rather than assumed.

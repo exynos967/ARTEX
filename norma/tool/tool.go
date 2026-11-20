@@ -43,6 +43,11 @@ type ToolContext struct {
 	// unchanged. Used e.g. to route child-command HTTP through a proxy + trust a
 	// CA, without affecting the agent's own process.
 	Env []string
+	// InputMalformed marks arguments that are not valid JSON, delivered because
+	// this tool opted into RawInput. The tool decides whether it can repair them;
+	// telling the model WHICH way they were wrong (cut off vs. malformed) is the
+	// difference between a retry that works and one that repeats the mistake.
+	InputMalformed bool
 }
 
 func (tc *ToolContext) progress(msg string) {
@@ -119,7 +124,9 @@ type Spec struct {
 	Run         func(ctx context.Context, input json.RawMessage, tc *ToolContext) (Result, error)
 
 	// RawInput hands Run whatever the model produced, skipping the schema check
-	// the harness otherwise applies first.
+	// the harness otherwise applies first. It also travels with the tool's
+	// schema (llm.ToolSchema.RawInput), so the transport delivers a partial call
+	// instead of ending the turn before the repair can run.
 	//
 	// Schema stays required and is still advertised to the model — the two are
 	// separate jobs. Schema tells the model what to send; validation decides what
@@ -149,6 +156,19 @@ func (t *builtTool) InputSchema() map[string]any { return t.spec.Schema }
 // would break every host implementing it. The harness asks for it with an
 // optional type assertion, the same way it discovers ContextView.
 func (t *builtTool) AcceptsRawInput() bool { return t.spec.RawInput }
+
+// AcceptsRawInput reports whether t opted into parsing its own arguments.
+//
+// One place to ask, because the answer now travels through three layers: the
+// registry advertises it on the tool schema so the transport delivers a partial
+// call, the harness skips its schema gate, and the executor marks the arguments
+// malformed for the tool's own diagnostics. A decorator that embeds a CoreTool
+// hides the optional method — forwarding it is a decorator's job (see
+// executionTool).
+func AcceptsRawInput(t CoreTool) bool {
+	r, ok := t.(interface{ AcceptsRawInput() bool })
+	return ok && r.AcceptsRawInput()
+}
 
 func (t *builtTool) IsReadOnly(in json.RawMessage) bool {
 	if t.spec.ReadOnly == nil {

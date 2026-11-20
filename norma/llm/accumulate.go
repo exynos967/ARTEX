@@ -13,6 +13,10 @@ import (
 type Accumulator struct {
 	blocks     []ContentBlock
 	toolInputs []*strings.Builder
+	// byID routes argument fragments to their own call. Parallel calls may
+	// interleave, and appending to "the last started call" would splice their
+	// JSON together.
+	byID       map[string]*strings.Builder
 	textBuf    *strings.Builder
 	thinkBuf   *strings.Builder
 	thinkSig   string // signature for the current thinking block
@@ -55,10 +59,29 @@ func (a *Accumulator) Add(ev StreamEvent) {
 	case SEToolUseStart:
 		a.flushText()
 		a.flushThinking()
+		if ev.ToolID != "" {
+			if _, seen := a.byID[ev.ToolID]; seen {
+				// A gateway repeated the header for a call already started. One
+				// block, one buffer: a duplicate id would make the message
+				// un-replayable.
+				return
+			}
+		}
 		a.blocks = append(a.blocks, ContentBlock{Type: BlockToolUse, ID: ev.ToolID, Name: ev.ToolName})
-		a.toolInputs = append(a.toolInputs, &strings.Builder{})
+		buf := &strings.Builder{}
+		a.toolInputs = append(a.toolInputs, buf)
+		if ev.ToolID != "" {
+			if a.byID == nil {
+				a.byID = map[string]*strings.Builder{}
+			}
+			a.byID[ev.ToolID] = buf
+		}
 	case SEToolInputJSON:
-		if n := len(a.toolInputs); n > 0 {
+		if buf := a.byID[ev.ToolID]; buf != nil {
+			buf.WriteString(ev.Text)
+		} else if n := len(a.toolInputs); n > 0 {
+			// Host providers may not stamp ToolID; the last started call is the
+			// only attribution available.
 			a.toolInputs[n-1].WriteString(ev.Text)
 		}
 	case SEMessageDelta:

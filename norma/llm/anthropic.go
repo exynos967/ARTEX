@@ -114,6 +114,9 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 			yield(StreamEvent{}, err)
 			return
 		}
+		// Tools that repair their own arguments opt out of the transport's JSON
+		// check; every other call with partial arguments stays fatal.
+		rawTools := rawInputToolSet(req.Tools)
 		for attempt := 0; ; attempt++ {
 			resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/v1/messages", body, func(r *http.Request) {
 				r.Header.Set("content-type", "application/json")
@@ -139,12 +142,9 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 			messageStartSeen := false
 			var meter anthropicMeter
 			var initialUsage Usage
-			pendingTool := false
-			var toolInput strings.Builder
-			validToolInput := func() bool {
-				raw := strings.TrimSpace(toolInput.String())
-				return !pendingTool || raw == "" || strings.HasPrefix(raw, "{") && json.Valid([]byte(raw))
-			}
+			// One buffer per content-block index: a parallel call's fragments are
+			// attributed to its own block, never spliced into a neighbour's JSON.
+			calls := newStreamedToolCalls()
 			for {
 				_, data, serr := scan.next()
 				if serr == io.EOF {
@@ -173,7 +173,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 					}
 					break
 				}
-				if kind == "content_block_stop" && !validToolInput() {
+				if kind == "content_block_stop" && !calls.allValid(rawTools, true) {
 					diagnostics.StreamEnd = StreamEndProtocolError
 					incomplete = IncompleteInvalidToolInput
 					break
@@ -218,20 +218,22 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 					diagnostics.StreamEnd = StreamEndDone
 					break
 				}
-				if ev.Type != SEToolInputJSON && !validToolInput() {
+				if !toolPhaseEvent(ev.Type) && !calls.allValid(rawTools, true) {
 					diagnostics.StreamEnd = StreamEndProtocolError
 					incomplete = IncompleteInvalidToolInput
 					break
 				}
 				switch ev.Type {
 				case SEToolUseStart:
-					pendingTool = true
-					toolInput.Reset()
+					calls.start(ev.Index, ev.ToolID, ev.ToolName)
 					committed, meaningful, observed = true, true, true
 				case SEToolInputJSON:
 					committed, observed = true, true
-					toolInput.WriteString(ev.Text)
-					if !pendingTool {
+					if c := calls.append(ev.Index, ev.Text); c != nil {
+						ev.ToolID = c.id
+					} else {
+						// Fragments for a block that never started: the stream is
+						// out of order in a way no repair is possible for.
 						diagnostics.StreamEnd = StreamEndProtocolError
 						incomplete = IncompleteInvalidToolInput
 					}
@@ -239,10 +241,8 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 					committed = committed || ev.Text != ""
 					observed = observed || ev.Text != ""
 					meaningful = meaningful || strings.TrimSpace(ev.Text) != ""
-					pendingTool = false
 				case SEThinkingDelta, SEThinkingSignature:
 					observed = observed || ev.Text != ""
-					pendingTool = false
 				}
 				initialInput := ""
 				if ev.Type == SEToolUseStart {
@@ -255,8 +255,10 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 					break
 				}
 				if initialInput != "" {
-					toolInput.WriteString(initialInput)
-					if !yield(StreamEvent{Type: SEToolInputJSON, Text: initialInput}, nil) {
+					// Attribute the start-frame input to its own block before it is
+					// exposed as a delta, so validation sees one consistent buffer.
+					calls.append(ev.Index, initialInput)
+					if !yield(StreamEvent{Type: SEToolInputJSON, Text: initialInput, Index: ev.Index, ToolID: ev.ToolID}, nil) {
 						consumerStopped = true
 						break
 					}
@@ -272,7 +274,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 			if incomplete == "" && streamErr == nil {
 				if diagnostics.StreamEnd == StreamEndEOF && !diagnostics.FinishReasonSeen {
 					incomplete = IncompleteMissingTerminal
-				} else if !validToolInput() {
+				} else if !calls.allValid(rawTools, true) {
 					incomplete = IncompleteInvalidToolInput
 				} else if !meaningful && stopReason != "max_tokens" {
 					incomplete = IncompleteEmptyOutput
@@ -347,7 +349,7 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 			}
 			return lastPartial, "", totalUsage, &IncompleteResponseError{Reason: IncompleteStreamRead, Diagnostics: StreamDiagnostics{StreamEnd: StreamEndReadError}}
 		}
-		msg, stop, usage, perr := parseAnthropicResponse(raw)
+		msg, stop, usage, perr := parseAnthropicResponse(raw, rawInputToolSet(req.Tools))
 		totalUsage.Add(usage)
 		if ctx.Err() != nil {
 			return msg, stop, totalUsage, ctx.Err()
@@ -377,7 +379,7 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 // parseAnthropicResponse decodes a non-streaming Messages API response into the
 // neutral Message model. Anthropic already speaks the content-block shape, so
 // text/thinking/tool_use blocks map across directly.
-func parseAnthropicResponse(raw []byte) (Message, string, Usage, error) {
+func parseAnthropicResponse(raw []byte, rawTools map[string]bool) (Message, string, Usage, error) {
 	var r struct {
 		Type    string `json:"type"`
 		Content []struct {
@@ -425,7 +427,7 @@ func parseAnthropicResponse(raw []byte) (Message, string, Usage, error) {
 			if len(in) == 0 {
 				in = json.RawMessage("{}")
 			}
-			if raw := strings.TrimSpace(string(in)); !json.Valid(in) || !strings.HasPrefix(raw, "{") {
+			if raw := strings.TrimSpace(string(in)); (!json.Valid(in) || !strings.HasPrefix(raw, "{")) && !rawTools[b.Name] {
 				invalidToolInput = true
 			}
 			blocks = append(blocks, ContentBlock{Type: BlockToolUse, ID: b.ID, Name: b.Name, Input: in})
@@ -445,7 +447,10 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 
 func parseAnthropicFrameKind(data string) (ev StreamEvent, ok bool, err error, kind string, usage *anthropicUsage) {
 	var f struct {
-		Type         string `json:"type"`
+		Type string `json:"type"`
+		// Index is the content block's position in the message. Argument deltas
+		// carry only this, so it is what attributes them to the right tool call.
+		Index        int `json:"index"`
 		ContentBlock struct {
 			Type     string          `json:"type"`
 			ID       string          `json:"id"`
@@ -494,7 +499,7 @@ func parseAnthropicFrameKind(data string) (ev StreamEvent, ok bool, err error, k
 			}
 			// Text is internal to this parser until Stream emits the start and
 			// its initial input as separate normalized events.
-			return StreamEvent{Type: SEToolUseStart, ToolID: f.ContentBlock.ID, ToolName: f.ContentBlock.Name, Text: initial}, true, nil, f.Type, nil
+			return StreamEvent{Type: SEToolUseStart, ToolID: f.ContentBlock.ID, ToolName: f.ContentBlock.Name, Text: initial, Index: f.Index}, true, nil, f.Type, nil
 		}
 		if f.ContentBlock.Type == "text" && f.ContentBlock.Text != "" {
 			return StreamEvent{Type: SETextDelta, Text: f.ContentBlock.Text}, true, nil, f.Type, nil
@@ -511,7 +516,7 @@ func parseAnthropicFrameKind(data string) (ev StreamEvent, ok bool, err error, k
 		case "signature_delta":
 			return StreamEvent{Type: SEThinkingSignature, Text: f.Delta.Signature}, true, nil, f.Type, nil
 		case "input_json_delta":
-			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta.PartialJSON}, true, nil, f.Type, nil
+			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta.PartialJSON, Index: f.Index}, true, nil, f.Type, nil
 		}
 	case "message_delta":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: f.Delta.StopReason}

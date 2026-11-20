@@ -86,7 +86,7 @@ func TestOpenAIStreamVLLMReasoningReplay(t *testing.T) {
 }
 
 func TestOpenAIResponseReasoningAlias(t *testing.T) {
-	msg, stop, _, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":"","reasoning":"let me think"},"finish_reason":"stop"}]}`))
+	msg, stop, _, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":"","reasoning":"let me think"},"finish_reason":"stop"}]}`), nil)
 	if err != nil {
 		t.Fatalf("parse err: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestOpenAIResponseReasoningAlias(t *testing.T) {
 // A refused turn carries content:null and the reason in `refusal`; it must not
 // decode to an empty assistant message.
 func TestOpenAIRefusalBecomesText(t *testing.T) {
-	msg, _, _, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":null,"refusal":"I can't help with that."},"finish_reason":"stop"}]}`))
+	msg, _, _, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":null,"refusal":"I can't help with that."},"finish_reason":"stop"}]}`), nil)
 	if err != nil {
 		t.Fatalf("parse err: %v", err)
 	}

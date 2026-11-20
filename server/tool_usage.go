@@ -39,6 +39,10 @@ func (m *meteredTool) WithExecutionRuntime(runtime actool.ExecutionRuntime) acto
 	return &copy
 }
 
+// AcceptsRawInput forwards the metered tool's opt-out; embedding a CoreTool
+// hides optional methods.
+func (m *meteredTool) AcceptsRawInput() bool { return actool.AcceptsRawInput(m.CoreTool) }
+
 func (m *meteredTool) Call(ctx context.Context, input json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
 	if err := m.recorder.InsertToolUsage(&db.ToolUsage{
 		ToolKey:       m.toolKey,

@@ -58,10 +58,18 @@ type StreamDiagnostics struct {
 
 // StreamEvent is one normalized model-level streaming event (FR-03.5).
 type StreamEvent struct {
-	Type        StreamEventType
-	Text        string             // text/thinking/tool_input JSON fragment
-	ToolID      string             // tool_use_start
-	ToolName    string             // tool_use_start
+	Type StreamEventType
+	Text string // text/thinking/tool_input JSON fragment
+	// ToolID identifies the tool call a tool_use_start announces, and the call
+	// a tool_input_delta belongs to. Adapters stamp it on input deltas so a
+	// consumer can attribute interleaved parallel calls without knowing the wire
+	// index. Empty means "the call most recently started" (legacy behaviour).
+	ToolID   string
+	ToolName string // tool_use_start
+	// Index is the wire position of the tool call / content block inside one
+	// message (OpenAI tool_calls[].index, Anthropic content block index). It is
+	// routing state for adapters; consumers route by ToolID.
+	Index       int
 	StopReason  string             // message_delta / stream_diagnostics
 	Usage       Usage              // additive accounting; may correct an earlier estimate with a signed delta
 	Diagnostics *StreamDiagnostics // stream_diagnostics; nil for other events
