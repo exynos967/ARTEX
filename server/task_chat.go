@@ -3,9 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -13,6 +16,41 @@ import (
 	"github.com/RC-CHN/ARTEX/db"
 	"github.com/RC-CHN/ARTEX/intercept"
 )
+
+func taskConsultKey(taskID string) string {
+	return taskID + ":consult"
+}
+
+// taskChatKey returns the per-lane busy/cancel key for a task's main-agent
+// executions. Segment 0 keeps the bare taskID key for compatibility; extra
+// human segments use "<taskID>:seg:<seg>", and automatic worker consultations
+// use "<taskID>:consult".
+func taskChatKey(taskID string, seg int) string {
+	if seg == db.MainSegConsultation {
+		return taskConsultKey(taskID)
+	}
+	if seg <= 0 {
+		return taskID
+	}
+	return taskID + ":seg:" + strconv.Itoa(seg)
+}
+
+func parseTaskChatKey(taskID, key string) (int, bool) {
+	if key == taskID {
+		return 0, true
+	}
+	if key == taskConsultKey(taskID) {
+		return db.MainSegConsultation, true
+	}
+	prefix := taskID + ":seg:"
+	if strings.HasPrefix(key, prefix) {
+		seg, err := strconv.Atoi(strings.TrimPrefix(key, prefix))
+		if err == nil && seg > 0 {
+			return seg, true
+		}
+	}
+	return 0, false
+}
 
 // mainSessions lists the task's main-agent conversation segments (newest-first) and
 // the current one. The frontend renders these as switchable sessions under 主 Agent.
@@ -27,11 +65,16 @@ func (s *Server) mainSessions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	hasConsultation, _ := t.Store.HasMainConsultationActivity()
 	current := 0
 	if len(list) > 0 {
 		current = list[0].Seq // newest-first
 	}
-	writeJSON(w, 200, map[string]any{"sessions": list, "current": current})
+	writeJSON(w, 200, map[string]any{
+		"sessions":         list,
+		"current":          current,
+		"has_consultation": hasConsultation,
+	})
 }
 
 // newMainSession starts a fresh main-agent conversation segment. Only the segment
@@ -80,37 +123,30 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Admission is serialized with deletion's chat cancellation. Mark every chat
-	// turn busy before its first activity/file write, including rule-mode turns.
-	// If deletion wins the race, the second barrier check rejects this request.
-	s.chatMu.Lock()
-	if s.engine.IsDeleting(t.ID) {
-		s.chatMu.Unlock()
-		writeErr(w, 409, "任务正在删除，无法发送新消息")
+	if req.Seg != nil && *req.Seg < 0 {
+		writeErr(w, 400, "协作请示会话为只读，请在人类主会话发消息或使用人工接答")
 		return
 	}
-	if s.chatBusy[t.ID] {
-		s.chatMu.Unlock()
-		writeErr(w, 409, "主 Agent 正在处理上一条消息，请稍候")
-		return
-	}
-	ctx, cancel := context.WithCancelCause(s.ctx)
-	ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: req.Message})
-	s.chatBusy[t.ID] = true
-	s.chatCancel[t.ID] = cancel
-	s.chatMu.Unlock()
-
 	// The turn belongs to whichever main-agent segment the user is chatting in (any
 	// segment is interactive, like the top-level chat conversations). Stamp every
 	// mainagent row with it so this turn's transcript + activity land in that segment.
 	// Missing seg (older clients) falls back to the newest segment.
 	mainSeg := 0
-	if req.Seg != nil && *req.Seg >= 0 {
+	if req.Seg != nil {
 		mainSeg = *req.Seg
 	} else {
 		mainSeg, _ = t.Store.CurrentMainSeg()
 	}
 	segPtr := &mainSeg
+
+	// Admission is serialized per (task, segment) lane and with deletion's chat
+	// cancellation, so each main-agent segment (and the background worker
+	// consultation lane) stays independent without corrupting shared transcripts.
+	busyKey, ctx, cancel, errStatus, errMsg := s.admitTaskChatLane(t.ID, mainSeg, req.Message)
+	if errStatus != 0 {
+		writeErr(w, errStatus, errMsg)
+		return
+	}
 
 	// Persist + broadcast the human turn so the 主 Agent 编排会话 survives page
 	// reloads and updates live: the conversation lives in the activity stream as
@@ -132,7 +168,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// handler returns immediately and the browser never needs to hold the request.
 		if !s.background(func() {
 			defer func() {
-				s.finishTaskChat(t.ID, cancel)
+				s.finishTaskChatLane(busyKey, cancel)
 			}()
 			// emit every step (thinking/tool_use/tool_result/text/result) so the main
 			// agent session shows its work live, like worker/planner. The final answer
@@ -154,22 +190,48 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})
 			}
 		}) {
-			s.finishTaskChat(t.ID, cancel)
+			s.finishTaskChatLane(busyKey, cancel)
 			writeErr(w, 503, "server is shutting down")
 			return
 		}
-		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm"})
+		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm", "seg": mainSeg})
 		return
 	}
 	reply := s.fallbackChat(t, req.Message)
 	s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: reply, MainSeg: segPtr})
-	s.finishTaskChat(t.ID, cancel)
-	writeJSON(w, 200, map[string]any{"reply": reply, "mode": "rule"})
+	s.finishTaskChatLane(busyKey, cancel)
+	writeJSON(w, 200, map[string]any{"reply": reply, "mode": "rule", "seg": mainSeg})
 }
 
-func (s *Server) cancelTaskChat(taskID string, cause error) bool {
+func (s *Server) admitTaskChatLane(taskID string, seg int, reviewMessage string) (string, context.Context, context.CancelCauseFunc, int, string) {
+	busyKey := taskChatKey(taskID, seg)
 	s.chatMu.Lock()
-	cancel := s.chatCancel[taskID]
+	if s.engine.IsDeleting(taskID) {
+		s.chatMu.Unlock()
+		return "", nil, nil, http.StatusConflict, "任务正在删除，无法发送新消息"
+	}
+	if seg == db.MainSegConsultation && s.engine.IsPaused(taskID) {
+		s.chatMu.Unlock()
+		return "", nil, nil, http.StatusConflict, "任务已暂停，暂不处理自动请示"
+	}
+	if s.chatBusy[busyKey] {
+		s.chatMu.Unlock()
+		return "", nil, nil, http.StatusConflict, "主 Agent 正在处理当前会话的上一条消息，请稍候"
+	}
+	ctx, cancel := context.WithCancelCause(s.ctx)
+	if seg != db.MainSegConsultation {
+		ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: reviewMessage})
+	}
+	s.chatBusy[busyKey] = true
+	s.chatCancel[busyKey] = cancel
+	s.chatMu.Unlock()
+	return busyKey, ctx, cancel, 0, ""
+}
+
+func (s *Server) cancelTaskChatSeg(taskID string, seg int, cause error) bool {
+	busyKey := taskChatKey(taskID, seg)
+	s.chatMu.Lock()
+	cancel := s.chatCancel[busyKey]
 	if cancel != nil {
 		cancel(cause)
 	}
@@ -177,15 +239,75 @@ func (s *Server) cancelTaskChat(taskID string, cause error) bool {
 	return cancel != nil
 }
 
+func (s *Server) cancelTaskChat(taskID string, cause error) bool {
+	s.chatMu.Lock()
+	var cancels []context.CancelCauseFunc
+	for key, cancel := range s.chatCancel {
+		if cancel == nil {
+			continue
+		}
+		if _, ok := parseTaskChatKey(taskID, key); ok {
+			cancels = append(cancels, cancel)
+		}
+	}
+	s.chatMu.Unlock()
+	for _, cancel := range cancels {
+		cancel(cause)
+	}
+	return len(cancels) > 0
+}
+
 func (s *Server) finishTaskChat(taskID string, cancel context.CancelCauseFunc) {
+	s.finishTaskChatLane(taskID, cancel)
+}
+
+func (s *Server) finishTaskChatLane(busyKey string, cancel context.CancelCauseFunc) {
 	cancel(agent.AbortChatTurnFinished)
 	s.chatMu.Lock()
-	delete(s.chatBusy, taskID)
-	delete(s.chatCancel, taskID)
+	delete(s.chatBusy, busyKey)
+	delete(s.chatCancel, busyKey)
 	s.chatMu.Unlock()
 }
 
-// taskChatStatus reports the authoritative state of the task's main-agent turn.
+func (s *Server) hasActiveTaskChat(taskID string) bool {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	for key, busy := range s.chatBusy {
+		if !busy {
+			continue
+		}
+		if _, ok := parseTaskChatKey(taskID, key); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) taskChatActivityState(taskID string) ([]int, bool) {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	runningSegs := []int{}
+	consultRunning := false
+	for key, busy := range s.chatBusy {
+		if !busy {
+			continue
+		}
+		seg, ok := parseTaskChatKey(taskID, key)
+		if !ok {
+			continue
+		}
+		if seg == db.MainSegConsultation {
+			consultRunning = true
+		} else {
+			runningSegs = append(runningSegs, seg)
+		}
+	}
+	sort.Ints(runningSegs)
+	return runningSegs, consultRunning
+}
+
+// taskChatStatus reports the authoritative state of the task's main-agent lanes
+// (per human conversation segment plus the dedicated worker consultation lane).
 // Activity timestamps are not a reliable proxy because a tool or LLM call may run
 // for minutes without emitting an intermediate frame.
 func (s *Server) taskChatStatus(w http.ResponseWriter, r *http.Request) {
@@ -194,22 +316,51 @@ func (s *Server) taskChatStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
-	s.chatMu.Lock()
-	running := s.chatBusy[t.ID]
-	s.chatMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]bool{"running": running})
+	runningSegs, consultRunning := s.taskChatActivityState(t.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"running":              len(runningSegs) > 0 || consultRunning,
+		"running_segs":         runningSegs,
+		"consultation_running": consultRunning,
+	})
 }
 
-// stopChat aborts the in-flight main-agent turn for a task (manual stop button).
-// Mirrors pgStopConversation: cancels only the current turn; planner/workers are
-// unaffected and continue running. The user can send a new message immediately.
+// stopChat aborts an in-flight main-agent turn for a task (manual stop button).
+// When seg is provided (in JSON body or query), only that segment (or -1 for the
+// automatic consultation lane) is cancelled; omitting seg cancels all active
+// main-agent lanes for the task for backwards compatibility.
 func (s *Server) stopChat(w http.ResponseWriter, r *http.Request) {
 	t := s.m.ResolveTask(r.PathValue("id"))
 	if t == nil {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	if !s.cancelTaskChat(t.ID, agent.AbortChatStoppedByUser) {
+	var req struct {
+		Seg *int `json:"seg,omitempty"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
+	if req.Seg == nil {
+		if raw := strings.TrimSpace(r.URL.Query().Get("seg")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				req.Seg = &parsed
+			}
+		}
+	}
+	var stopped bool
+	if req.Seg != nil {
+		if *req.Seg < 0 && *req.Seg != db.MainSegConsultation {
+			writeErr(w, 400, "invalid session segment")
+			return
+		}
+		stopped = s.cancelTaskChatSeg(t.ID, *req.Seg, agent.AbortChatStoppedByUser)
+	} else {
+		stopped = s.cancelTaskChat(t.ID, agent.AbortChatStoppedByUser)
+	}
+	if !stopped {
 		writeJSON(w, 200, map[string]any{"status": "idle"})
 		return
 	}

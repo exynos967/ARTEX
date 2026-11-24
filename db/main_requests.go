@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// MainSegConsultation is the dedicated main_seg lane for asynchronous worker
+// consultations so automatic turns never intrude on human chat segments (seq >= 0).
+const MainSegConsultation = -1
+
 // MainRequest is a durable consultation, scoped to a single local intent. A
 // terminal intent/task cancels it in the same database transaction (see schema).
 type MainRequest struct {
@@ -94,7 +98,7 @@ func (s *ExplorationStore) CreateMainRequest(ctx context.Context, intentID int64
 		return nil, fmt.Errorf("本任务已有 32 条未完成请示，请先处理已有请求")
 	}
 	r, err = scanMainRequest(tx.QueryRowContext(ctx, `INSERT INTO main_requests(exploration_id,intent_id,call_id,question,context,main_seg)
-VALUES($1,$2,$3,$4,$5,COALESCE((SELECT max(seq) FROM main_sessions WHERE exploration_id=$1),0)) RETURNING `+mainRequestColumns, s.expID, intentID, callID, utf8Clean(question), utf8Clean(evidence)))
+VALUES($1,$2,$3,$4,$5,$6) RETURNING `+mainRequestColumns, s.expID, intentID, callID, utf8Clean(question), utf8Clean(evidence), MainSegConsultation))
 	if err != nil {
 		return nil, err
 	}

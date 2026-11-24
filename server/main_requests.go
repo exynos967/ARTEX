@@ -13,9 +13,10 @@ import (
 	"github.com/RC-CHN/ARTEX/db"
 )
 
-// mainRequestLoop dispatches a durable inbox. Each task shares the human chat's
-// admission mutex/transcript; the global bound prevents a burst of requests from
-// opening an unbounded number of main-agent executions.
+// mainRequestLoop dispatches a durable inbox. Automatic worker consultations run
+// on a dedicated per-task consultation lane (separate from human chat segments)
+// so background triage never interrupts or locks out human main-agent sessions;
+// the global bound prevents a burst of requests from opening unbounded runs.
 func (s *Server) mainRequestLoop() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -57,23 +58,18 @@ func (s *Server) startMainRequest(t *Task, done func()) bool {
 	if life.Paused || life.Queued || isTerminalStatus(life.Status) || s.engine.IsDeleting(t.ID) || !s.taskRuntimeAvailable(t, "mainagent") {
 		return false
 	}
-	s.chatMu.Lock()
-	if s.chatBusy[t.ID] || s.engine.IsDeleting(t.ID) || s.engine.IsPaused(t.ID) {
-		s.chatMu.Unlock()
+	busyKey, ctx, cancel, errStatus, _ := s.admitTaskChatLane(t.ID, db.MainSegConsultation, "")
+	if errStatus != 0 {
 		return false
 	}
-	ctx, cancel := context.WithCancelCause(s.ctx)
-	s.chatBusy[t.ID] = true
-	s.chatCancel[t.ID] = cancel
-	s.chatMu.Unlock()
 	if !s.engine.beginTaskOperation(t.ID) {
-		s.finishTaskChat(t.ID, cancel)
+		s.finishTaskChatLane(busyKey, cancel)
 		return false
 	}
 	if !s.background(func() {
 		defer done()
 		defer s.engine.decInflight(t.ID)
-		defer s.finishTaskChat(t.ID, cancel)
+		defer s.finishTaskChatLane(busyKey, cancel)
 		r, err := t.Store.ClaimMainRequest(ctx)
 		if err != nil {
 			log.Printf("[main requests] claim: %v", err)
@@ -85,7 +81,7 @@ func (s *Server) startMainRequest(t *Task, done func()) bool {
 		s.runMainRequest(ctx, t, r)
 	}) {
 		s.engine.decInflight(t.ID)
-		s.finishTaskChat(t.ID, cancel)
+		s.finishTaskChatLane(busyKey, cancel)
 		return false
 	}
 	return true

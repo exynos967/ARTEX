@@ -1796,6 +1796,14 @@ RETURNING seq, created_at`, s.expID).Scan(&m.Seq, &m.CreatedAt)
 	return m, err
 }
 
+// HasMainConsultationActivity reports whether the dedicated consultation lane
+// (main_seg = MainSegConsultation) has any persisted activity rows.
+func (s *ExplorationStore) HasMainConsultationActivity() (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM activity WHERE exploration_id=$1 AND worker='mainagent' AND main_seg=$2)`, s.expID, MainSegConsultation).Scan(&exists)
+	return exists, err
+}
+
 // ActivityDetail lazily returns the full detail blob for one step.
 func (s *ExplorationStore) ActivityDetail(id int64) (string, error) {
 	var d sql.NullString

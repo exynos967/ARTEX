@@ -337,35 +337,46 @@ func newMainRequestFixture(t *testing.T) (*Server, *Task, *mainRequestTestProvid
 	return s, task, p, id
 }
 
-func TestMainRequestDispatchSerializesHumanChatAndPreservesWorker(t *testing.T) {
+func TestMainRequestDispatchIsolatesHumanChatAndPreservesWorker(t *testing.T) {
 	s, task, p, id := newMainRequestFixture(t)
 	r, _ := task.Store.MainRequest(p.requestID)
-	s.chatBusy[task.ID] = true
-	if s.startMainRequest(task, func() {}) {
-		t.Fatal("automatic turn entered occupied human chat")
+	if r.MainSeg != db.MainSegConsultation {
+		t.Fatalf("consultation landed in human segment: got %d want %d", r.MainSeg, db.MainSegConsultation)
 	}
-	still, _ := task.Store.MainRequest(r.ID)
-	if still.State != "pending" {
-		t.Fatal("busy chat consumed queued request")
-	}
-	delete(s.chatBusy, task.ID)
+	// An active human chat on seg 0 must NOT block automatic consultation dispatch.
+	s.chatMu.Lock()
+	s.chatBusy[taskChatKey(task.ID, 0)] = true
+	s.chatMu.Unlock()
 	done := make(chan struct{})
 	if !s.startMainRequest(task, func() { close(done) }) {
-		t.Fatal("request was not admitted")
+		t.Fatal("automatic consultation was blocked by human seg 0")
 	}
 	select {
 	case <-p.entered:
 	case <-time.After(3 * time.Second):
 		t.Fatal("automatic main did not start")
 	}
+	// A second concurrent automatic consultation on the same task still serializes.
 	if s.startMainRequest(task, func() {}) {
-		t.Fatal("concurrent main turn admitted")
+		t.Fatal("concurrent automatic consultation admitted")
 	}
-	req := httptest.NewRequest("POST", "/api/exploration/chat?task="+task.ID, bytes.NewBufferString(`{"message":"human turn"}`))
+	// Meanwhile, a newly opened human segment (seg 1) must be accepted without 409.
+	seg1, err := task.Store.NewMainSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/api/exploration/chat?task="+task.ID, bytes.NewBufferString(`{"message":"human turn","seg":`+strconv.Itoa(seg1.Seq)+`}`))
 	resp := httptest.NewRecorder()
 	s.chat(resp, req)
+	if resp.Code != 202 && resp.Code != 200 {
+		t.Fatalf("human seg %d blocked during automatic consultation: %d %s", seg1.Seq, resp.Code, resp.Body.String())
+	}
+	// Same occupied seg 0 still rejects overlapping human messages with 409.
+	req = httptest.NewRequest("POST", "/api/exploration/chat?task="+task.ID, bytes.NewBufferString(`{"message":"overlap seg 0","seg":0}`))
+	resp = httptest.NewRecorder()
+	s.chat(resp, req)
 	if resp.Code != 409 {
-		t.Fatalf("human overlapped automatic transcript: %d %s", resp.Code, resp.Body.String())
+		t.Fatalf("overlapping human seg 0 accepted: %d %s", resp.Code, resp.Body.String())
 	}
 	n, _ := task.Store.GetNode(id)
 	if n.State != "running" {
@@ -382,10 +393,17 @@ func TestMainRequestDispatchSerializesHumanChatAndPreservesWorker(t *testing.T) 
 		t.Fatalf("not replied: %+v", got)
 	}
 	s.chatMu.Lock()
-	busy := s.chatBusy[task.ID]
+	consultBusy := s.chatBusy[taskConsultKey(task.ID)]
+	delete(s.chatBusy, taskChatKey(task.ID, 0))
 	s.chatMu.Unlock()
-	if busy {
-		t.Fatal("main admission not released")
+	if consultBusy {
+		t.Fatal("consultation admission not released")
+	}
+	// Wait for the concurrent human seg 1 goroutine to drain before checking counters.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer waitCancel()
+	if err := s.waitTaskQuiescent(waitCtx, task.ID); err != nil {
+		t.Fatalf("human seg 1 did not settle: %v", err)
 	}
 	if s.engine.inflightCount(task.ID) != 0 || s.engine.ActiveLLMCalls(task.ID) != 0 {
 		t.Fatal("automatic run leaked activity/admission")

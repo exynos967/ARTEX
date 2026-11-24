@@ -52,17 +52,20 @@ type Server struct {
 	llmOn     bool
 	llmProf   string // active LLM profile name (for llmrec tagging)
 
-	// chatBusy guards the per-task main-agent run: the chat handler launches the
-	// agent on the server's background ctx (not the request ctx) and returns
-	// immediately, so a page reload / proxy timeout can't abort a live run. This
-	// map serializes turns per task — one main-agent run at a time per task, so
-	// concurrent messages don't corrupt the shared exp<id>-main transcript.
+	// chatBusy guards in-flight chat and consultation runs: the chat handler
+	// launches the agent on the server's background ctx (not the request ctx) and
+	// returns immediately, so a page reload / proxy timeout can't abort a live run.
+	// Keys serialize per conversation/lane (convBusyKey for standalone chats,
+	// taskChatKey(taskID, seg) for each task main-agent segment, and
+	// taskConsultKey(taskID) for automatic worker consultations) so distinct
+	// sessions and worker consultations run independently without corrupting
+	// shared transcripts.
 	chatMu   sync.Mutex
 	chatBusy map[string]bool
-	// chatCancel holds the cancel func for each in-flight conversation run (keyed by
-	// convBusyKey), so a manual stop can abort JUST that session's agent run. Set/
-	// cleared alongside chatBusy under chatMu. Aborting a run does NOT touch the P3
-	// trigger queue — the drain goroutine simply proceeds to the next queued fire.
+	// chatCancel holds the cancel func for each in-flight conversation/lane run,
+	// so a manual stop can abort JUST that lane's agent run. Set/cleared alongside
+	// chatBusy under chatMu. Aborting a run does NOT touch the P3 trigger queue —
+	// the drain goroutine simply proceeds to the next queued fire.
 	chatCancel map[string]context.CancelCauseFunc
 
 	// triggerQ buffers P3 trigger fires PER AGENT. A per-agent "pump" launches runs up

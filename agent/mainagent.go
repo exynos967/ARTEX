@@ -113,7 +113,21 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	return m.chat(ctx, taskID, mainSeg, as, ts, goal, message, emit, notify, resume, notifyGoal, notifyHint, nil)
 }
 
-// Consult runs a complete main-agent turn over the same visible transcript,
+// mainSessionTranscriptID returns the transcript / noa session identifier for a
+// main-agent turn. Human segments use "exp<id>-main" (seg 0) or "exp<id>-main-s<seg>"
+// (seg > 0). Automatic worker consultations always use a request-scoped identifier
+// so background processing never shares or pollutes any human conversation context.
+func mainSessionTranscriptID(expID int64, mainSeg int, request *db.MainRequest) string {
+	if request != nil {
+		return fmt.Sprintf("exp%d-main-consult-%d", expID, request.ID)
+	}
+	if mainSeg > 0 {
+		return fmt.Sprintf("exp%d-main-s%d", expID, mainSeg)
+	}
+	return fmt.Sprintf("exp%d-main", expID)
+}
+
+// Consult runs an automatic main-agent turn on its isolated consultation transcript,
 // with an internal origin and no human task-revival callbacks.
 func (m *MainAgent) Consult(ctx context.Context, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, goal string, request *db.MainRequest, emit func(db.Activity), notify func()) (string, error) {
 	message := fmt.Sprintf("【Worker 异步请示 #%d，意图 #%d】\n%s\n\n上下文：\n%s\n\n请查证并调用 reply_to_worker 回答。", request.ID, request.IntentID, request.Question, request.Context)
@@ -209,23 +223,18 @@ func (m *MainAgent) chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	if automatic && (opts.MaxTurns == 0 || opts.MaxTurns > 24) {
 		opts.MaxTurns = 24
 	}
-	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
+	sessionID := mainSessionTranscriptID(ts.ID(), mainSeg, request)
+	if m.tx != nil { // persist raw conversation; isolated per human segment or consultation request
 		opts.Transcript = m.tx
-		// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
-		// load; each new session (seg>=1) gets its own file for a clean context.
-		opts.SessionID = fmt.Sprintf("exp%d-main", ts.ID())
-		if mainSeg > 0 {
-			opts.SessionID = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
-		}
+		opts.SessionID = sessionID
 	}
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
-	// session id 与 transcript 同规则(分段感知),使归档与恢复对齐。
-	noaSession := fmt.Sprintf("exp%d-main", ts.ID())
-	if mainSeg > 0 {
-		noaSession = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
+	// session id 与 transcript 同规则(分段/请示隔离),使归档与恢复对齐。
+	enableNoa(&opts, m.noaEnabledFn, m.workDir, sessionID, noaWarn(sessionID))
+	// Background worker consultations must not overwrite the human's /btw side-question snapshot.
+	if !automatic {
+		ctx = attachSideCapture(ctx, &opts)
 	}
-	enableNoa(&opts, m.noaEnabledFn, m.workDir, noaSession, noaWarn(noaSession))
-	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close()
 	// reload the prior conversation from the transcript so the agent has context

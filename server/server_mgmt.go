@@ -203,10 +203,7 @@ func (s *Server) waitTaskQuiescent(ctx context.Context, taskID string) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		s.chatMu.Lock()
-		chatBusy := s.chatBusy[taskID]
-		s.chatMu.Unlock()
-		if s.engine.inflightCount(taskID) == 0 && !chatBusy {
+		if s.engine.inflightCount(taskID) == 0 && !s.hasActiveTaskChat(taskID) {
 			return nil
 		}
 		select {

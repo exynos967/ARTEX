@@ -55,7 +55,7 @@ func parseActivitySession(sess string) (db.ActivitySessionFilter, bool) {
 		return db.ActivitySessionFilter{Main: true}, true
 	case strings.HasPrefix(sess, "main:"):
 		seg, err := strconv.Atoi(strings.TrimPrefix(sess, "main:"))
-		if err != nil || seg < 0 {
+		if err != nil || (seg < 0 && seg != db.MainSegConsultation) {
 			return db.ActivitySessionFilter{}, false
 		}
 		return db.ActivitySessionFilter{Main: true, MainSeg: &seg}, true
