@@ -33,7 +33,7 @@ const stateView = {
     label: "正在处理",
     icon: Loader2,
     tone: "text-blue-600 dark:text-blue-400",
-    hint: "主 Agent 正在查证或协调，过程会显示在主会话。",
+    hint: "主 Agent 正在「协作请示」独立通道查证或协调，不阻塞你的主会话。",
   },
   answered: {
     label: "已回复 · 待确认送达",
@@ -60,7 +60,15 @@ const canReply = (r: MainRequest) => r.state === "pending" || r.state === "proce
 const sourceLabel = (r: MainRequest) =>
   r.answer_source === "human" ? "人工回复" : r.answer_source === "system" ? "系统回执" : "主 Agent 回复";
 
-export function MainRequests({ taskId, onOpenWorker }: { taskId: string; onOpenWorker: (id: number) => void }) {
+export function MainRequests({
+  taskId,
+  onOpenWorker,
+  onOpenConsultation,
+}: {
+  taskId: string;
+  onOpenWorker: (id: number) => void;
+  onOpenConsultation?: () => void;
+}) {
   const [items, setItems] = React.useState<MainRequest[]>([]);
   const [open, setOpen] = React.useState(false);
   const [history, setHistory] = React.useState(false);
@@ -158,7 +166,7 @@ export function MainRequests({ taskId, onOpenWorker }: { taskId: string; onOpenW
             </SheetTitle>
             <SheetDescription>Worker 提问后继续执行。主 Agent 查证、协调后，答复会送回原会话。</SheetDescription>
           </SheetHeader>
-          <div className="flex shrink-0 gap-1 border-b px-4 py-2" role="group" aria-label="请示筛选">
+          <div className="flex shrink-0 items-center gap-1 border-b px-4 py-2" role="group" aria-label="请示筛选">
             <Button
               size="sm"
               variant={history ? "ghost" : "secondary"}
@@ -175,13 +183,27 @@ export function MainRequests({ taskId, onOpenWorker }: { taskId: string; onOpenW
             >
               已处理 <span className="ml-1 tabular-nums">{archived.length}</span>
             </Button>
+            {onOpenConsultation && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="ml-auto gap-1 text-xs text-primary"
+                onClick={() => {
+                  setOpen(false);
+                  onOpenConsultation();
+                }}
+              >
+                查看处理过程
+                <ArrowUpRight className="size-3" />
+              </Button>
+            )}
           </div>
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
             {!visible.length && (
               <div className="flex flex-col items-center gap-2 py-12 text-center text-sm text-muted-foreground">
                 <CheckCheck className="size-7 opacity-50" />
                 <p>{history ? "还没有历史请示" : "当前没有待处理的请示"}</p>
-                <p className="text-xs">提问、查证和回复会保留在主会话中。</p>
+                <p className="text-xs">提问、自动查证和回复会记录在「协作请示」独立会话中。</p>
               </div>
             )}
             {visible.map((r) => {

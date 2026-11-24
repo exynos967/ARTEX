@@ -54,6 +54,16 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { api, sseUrl } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
+import {
+  MAIN_CONSULTATION_SEG,
+  type MainRunningSnapshot,
+  applyMainActivityToStatus,
+  emptyMainRunningSnapshot,
+  isMainComposerBusy,
+  isMainSegmentLive,
+  normalizeMainChatStatus,
+  withMainSegmentRunning,
+} from "@/lib/main-sessions";
 import { MOCK } from "@/lib/mock/enabled";
 import { isBtwCommand } from "@/lib/side-questions";
 import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
@@ -249,16 +259,18 @@ const roleMeta = {
 // original session; "新建会话" creates further segments (seq 1,2,…) so the agent
 // starts on a clean transcript while the task's graph/assets/goal stay shared. Each
 // segment is a switchable UI session; only the current (highest) one is writable.
-const mainSessionId = (seg: number) => `s-main-${seg}`;
+const MAIN_CONSULTATION_ID = "s-main-consult";
+const mainSessionId = (seg: number) => (seg === MAIN_CONSULTATION_SEG ? MAIN_CONSULTATION_ID : `s-main-${seg}`);
 const mainSessionKey = (seg: number) => `main:${seg}`;
-const mainSessionTitle = (seg: number) => `主 Agent · 会话 #${seg + 1}`;
+const mainSessionTitle = (seg: number) =>
+  seg === MAIN_CONSULTATION_SEG ? "主 Agent · 协作请示" : `主 Agent · 会话 #${seg + 1}`;
 const MAIN_ID = mainSessionId(0);
 const MAIN_SESSION: Session = {
   id: MAIN_ID,
   role: "mainagent",
   title: mainSessionTitle(0),
   status: "running",
-  live: true,
+  live: false,
   last_activity: "",
   seg: 0,
 };
@@ -512,9 +524,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   }, [taskId, focusSession]);
   const retainedSession = locatedSession?.taskId === taskId ? locatedSession.session : undefined;
   const activeId = focusSession?.id ?? selectedSessionId;
-  // Main-agent conversation segments (newest-first); currentSeg is the writable one.
+  // Main-agent conversation segments (newest-first); currentSeg is the newest human one.
   const [mainSegs, setMainSegs] = React.useState<{ seq: number; created_at: string }[]>([{ seq: 0, created_at: "" }]);
   const [currentSeg, setCurrentSeg] = React.useState(0);
+  const [hasConsultation, setHasConsultation] = React.useState(false);
   const [creatingMain, setCreatingMain] = React.useState(false);
   const [confirmNewMain, setConfirmNewMain] = React.useState(false);
   // 手机端（<lg）会话列表默认折叠：屏幕高度本就紧张，列表若固定占掉 10~15rem，
@@ -532,9 +545,9 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [hasLoadedOlderIntentsPage, setHasLoadedOlderIntentsPage] = React.useState(false);
   const [loadingOlderIntents, setLoadingOlderIntents] = React.useState(false);
   const [input, setInput] = React.useState("");
-  const [sending, setSending] = React.useState(false);
-  const [stopping, setStopping] = React.useState(false);
-  const [mainChatRunning, setMainChatRunning] = React.useState<boolean | null>(null);
+  const [sendingSegs, setSendingSegs] = React.useState<Set<number>>(() => new Set());
+  const [stoppingSeg, setStoppingSeg] = React.useState<number | null>(null);
+  const [mainStatus, setMainStatus] = React.useState<MainRunningSnapshot>(() => emptyMainRunningSnapshot());
   const [controllingIntent, setControllingIntent] = React.useState<string | null>(null);
   const [cancelIntent, setCancelIntent] = React.useState<Session | null>(null);
   const [cancelReason, setCancelReason] = React.useState("");
@@ -734,6 +747,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               hasMore: r.hasMore,
               earliestSeq: items.length ? items[0].seq : 0,
               unread: 0,
+              lastTs: items.length ? items[items.length - 1].ts : s.lastTs,
               error: undefined,
             };
           });
@@ -804,13 +818,17 @@ export function SessionsTab({ taskId }: { taskId: string }) {
 
   React.useEffect(() => {
     let alive = true;
-    setMainChatRunning(null);
+    setMainStatus(emptyMainRunningSnapshot());
+    setSendingSegs(new Set());
+    setStoppingSeg(null);
     const load = () => {
       const request = ++chatStatusRequestRef.current;
       return api
         .chatStatus(taskId)
-        .then(({ running }) => {
-          if (alive && chatStatusRequestRef.current === request) setMainChatRunning(running);
+        .then((status) => {
+          if (alive && chatStatusRequestRef.current === request) {
+            setMainStatus(normalizeMainChatStatus(status));
+          }
         })
         .catch(() => {
           // Keep the last authoritative value. Before the first success, recent
@@ -888,6 +906,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     setActiveId(MAIN_ID); // a stale worker id from the previous task must not leak in
     setMainSegs([{ seq: 0, created_at: "" }]);
     setCurrentSeg(0);
+    setHasConsultation(false);
     snapshotRef.current = 0;
     llmToastSeqRef.current = new Set();
     reqTokenRef.current = {};
@@ -944,6 +963,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         const segs = ms.sessions.length ? ms.sessions : [{ seq: 0, created_at: "" }];
         setMainSegs(segs);
         setCurrentSeg(ms.current);
+        setHasConsultation(ms.hasConsultation);
         bootKey = mainSessionKey(ms.current);
         if (bootKey !== mainSessionKey(0)) loadingKeysRef.current.delete(mainSessionKey(0));
         loadingKeysRef.current.add(bootKey);
@@ -964,6 +984,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             hasMore: r.hasMore,
             earliestSeq: items.length ? items[0].seq : 0,
             unread: 0,
+            lastTs: items.length ? items[items.length - 1].ts : s.lastTs,
           };
         });
         // Open the single task SSE from the snapshot cursor.
@@ -985,7 +1006,21 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           }
           // Transcript text is already applied below. Refresh other resources only
           // for state-bearing events, coalesced centrally across streaming bursts.
-          if (a.kind === "consultation" || a.kind === "consultation_reply") notifyApiEvent([`/tasks/${taskId}/main-requests`]);
+          if (a.kind === "consultation" || a.kind === "consultation_reply") {
+            notifyApiEvent([`/tasks/${taskId}/main-requests`]);
+          }
+          if (a.worker === "mainagent") {
+            if ((a.main_seg ?? 0) === MAIN_CONSULTATION_SEG) setHasConsultation(true);
+            const isTerminal = a.kind === "result" || (a.kind === "text" && a.is_error);
+            const isConsultStart =
+              (a.main_seg ?? 0) === MAIN_CONSULTATION_SEG &&
+              (a.kind === "round" || a.kind === "thinking" || a.kind === "tool_use");
+            if (isTerminal || isConsultStart) {
+              chatStatusRequestRef.current++;
+              setMainStatus((prev) => applyMainActivityToStatus(prev, a));
+              notifyApiEvent([`/tasks/${taskId}/chat`]);
+            }
+          }
           if (a.kind === "usage") notifyApiEvent(["/exploration/tokens", "/tokens"]);
           else if (a.kind === "llm_switch" || a.kind === "llm_failover") notifyApiEvent(["/llm", "/tasks", "/stats"]);
           else if (a.kind === "intercept_request") notifyApiEvent(["/intercept", "/stats"]);
@@ -1202,46 +1237,43 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   );
   const currentMainKey = mainSessionKey(currentSeg);
   const plannerLive = recentLive("plan");
+  const consultKey = mainSessionKey(MAIN_CONSULTATION_SEG);
+  const consultState = store[consultKey];
+  const showConsultationSession =
+    hasConsultation ||
+    mainStatus.consultationRunning ||
+    (consultState?.items.length ?? 0) > 0 ||
+    (consultState?.unread ?? 0) > 0 ||
+    activeId === MAIN_CONSULTATION_ID;
 
-  // Which main segment is streaming RIGHT NOW. A main turn is serialized per task, so at
-  // most one segment is live. Gate on the real running flag (sending / mainChatRunning)
-  // rather than "recent activity", and drop it the moment the turn's terminal record
-  // (kind='result', or an error) lands — otherwise the badge lingers for STREAM_WINDOW_MS
-  // after the agent already finished. null = nothing running.
-  const liveMainSeg = React.useMemo<number | null>(() => {
-    if (!(sending || mainChatRunning)) return null;
-    // the streaming segment is the one with the freshest activity (incl. the just-sent turn)
-    let seg = currentSeg;
-    let bestTs = -1;
-    for (const m of mainSegs) {
-      const raw = store[mainSessionKey(m.seq)]?.lastTs;
-      const ts = raw ? Date.parse(raw) : -1;
-      if (ts > bestTs) {
-        bestTs = ts;
-        seg = m.seq;
-      }
-    }
-    const items = store[mainSessionKey(seg)]?.items ?? [];
-    const last = items[items.length - 1];
-    if (last && (last.kind === "result" || (last.kind === "text" && last.is_error))) return null;
-    return seg;
-  }, [sending, mainChatRunning, mainSegs, store, currentSeg]);
-
-  // Every main-agent segment is an independent, interactive session (like the top-level
-  // chat conversations) — you can talk in any of them, newest-first.
-  const mainSessions = React.useMemo<Session[]>(
-    () =>
-      mainSegs.map((m) => ({
-        id: mainSessionId(m.seq),
+  // Every human main-agent segment is an independent, interactive session (each with
+  // its own backend lock & transcript). Background worker consultations run on the
+  // dedicated read-only consultation lane (seg = -1) so they never hijack human turns
+  // or attach a false "实时" badge to a newly created session.
+  const mainSessions = React.useMemo<Session[]>(() => {
+    const human: Session[] = mainSegs.map((m) => ({
+      id: mainSessionId(m.seq),
+      role: "mainagent",
+      title: mainSessionTitle(m.seq),
+      status: "running",
+      live: isMainSegmentLive(m.seq, mainStatus, sendingSegs),
+      last_activity: m.created_at,
+      seg: m.seq,
+    }));
+    if (!showConsultationSession) return human;
+    return [
+      ...human,
+      {
+        id: MAIN_CONSULTATION_ID,
         role: "mainagent",
-        title: mainSessionTitle(m.seq),
+        title: mainSessionTitle(MAIN_CONSULTATION_SEG),
         status: "running",
-        live: m.seq === liveMainSeg,
-        last_activity: m.created_at,
-        seg: m.seq,
-      })),
-    [mainSegs, liveMainSeg],
-  );
+        live: isMainSegmentLive(MAIN_CONSULTATION_SEG, mainStatus, sendingSegs),
+        last_activity: consultState?.lastTs ?? "",
+        seg: MAIN_CONSULTATION_SEG,
+      },
+    ];
+  }, [mainSegs, mainStatus, sendingSegs, showConsultationSession, consultState?.lastTs]);
 
   const sessions = React.useMemo(() => {
     const items = [...mainSessions, { ...PLANNER_SESSION, live: plannerLive }, ...workerSessions, SYSTEM_SESSION];
@@ -1258,27 +1290,31 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   };
 
   const active = sessions.find((s) => s.id === activeId) ?? MAIN_SESSION;
+  const isMain = active.role === "mainagent";
+  const activeSeg = active.seg ?? 0;
+  const isConsultation = isMain && activeSeg === MAIN_CONSULTATION_SEG;
+  const isInteractiveMain = isMain && !isConsultation;
   const side = useSideQuestions(
-    active.role === "mainagent"
+    isInteractiveMain
       ? `/api/tasks/${taskId}/chat`
       : active.role === "worker" && !active.inherited && active.intent_id
         ? `/api/tasks/${taskId}/intents/${active.intent_id}`
         : null,
   );
-  const isMain = active.role === "mainagent";
   const isPlanner = active.role === "planner";
   const isSystem = active.role === "system";
   const activeKey = keyForSession(active);
   const activeState = store[activeKey];
-  // A main turn is serialized per task (chat lock), so "busy" is task-wide: while any
-  // main segment is mid-turn the active composer is disabled. An older segment's
-  // terminal record must not override a positive authoritative running flag: an
-  // automatic consultation may be using a different segment in the background.
+  // Each main-agent segment is serialized independently on the backend (and isolated
+  // from automatic worker consultations), so composer busyness strictly tracks the
+  // active segment.
   const activeItems = activeState?.items ?? [];
   const activeLast = activeItems[activeItems.length - 1];
   const activeSettled =
     !!activeLast && (activeLast.kind === "result" || (activeLast.kind === "text" && activeLast.is_error));
-  const mainBusy = isMain && (sending || (mainChatRunning ?? (!activeSettled && recentLive(activeKey))));
+  const sendingCurrent = isInteractiveMain && sendingSegs.has(activeSeg);
+  const mainBusy =
+    isInteractiveMain && isMainComposerBusy(activeSeg, mainStatus, sendingSegs, !activeSettled && recentLive(activeKey));
   // 折叠态（手机端）标题栏要替代整张列表：显示当前会话名 + 其它会话的未读合计，
   // 否则收起后既不知道自己在看哪个会话，也看不到别处有新消息。
   const activeDisplayTitle = (active.role === "worker" ? sessionMeta.get(active.id)?.title : "") || active.title;
@@ -1484,37 +1520,58 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     return () => ro.disconnect();
   }, [activeId, viewport, approvalFocus.state]);
 
-  function stop() {
-    if (stopping) return;
-    setStopping(true);
-    void api.stopChat(taskId).finally(() => setStopping(false));
+  function stop(targetSeg = activeSeg) {
+    if (stoppingSeg !== null) return;
+    setStoppingSeg(targetSeg);
+    void api
+      .stopChat(taskId, targetSeg)
+      .catch((e) => {
+        toast.error(`停止失败：${(e as Error).message || "请稍后重试"}`);
+      })
+      .finally(() => {
+        setStoppingSeg(null);
+        notifyApiEvent([`/tasks/${taskId}/chat`]);
+      });
   }
 
   function send() {
+    if (!isInteractiveMain) return;
+    const targetSeg = activeSeg;
     const text = input.trim();
     const atts = attachments;
     if (side.handleCommand(text, () => setInput(""))) return;
-    if ((!text && atts.length === 0) || sending || mainBusy) return;
+    if ((!text && atts.length === 0) || sendingSegs.has(targetSeg) || mainBusy) return;
     // No optimistic echo: the backend persists+broadcasts the human turn before it
     // returns, so it streams back over SSE (worker="mainagent") with its real DB
     // seq — the transcript renders it from server data like every other step. Clear
     // the composer eagerly for responsiveness; restore it if the send fails.
     setInput("");
     setAttachments([]);
-    setSending(true);
+    setSendingSegs((prev) => {
+      const next = new Set(prev);
+      next.add(targetSeg);
+      return next;
+    });
     chatStatusRequestRef.current++;
     api
-      .chat(text, taskId, atts.length > 0 ? atts : undefined, active.seg ?? 0)
+      .chat(text, taskId, atts.length > 0 ? atts : undefined, targetSeg)
       .then(({ mode }) => {
         chatStatusRequestRef.current++;
-        setMainChatRunning(mode === "llm");
+        setMainStatus((prev) => withMainSegmentRunning(prev, targetSeg, mode === "llm"));
       })
       .catch((e) => {
         setInput(text); // restore so the user doesn't lose their text / attachments
         setAttachments(atts);
         toast.error(`发送失败：${(e as Error).message || "请稍后重试"}`);
       })
-      .finally(() => setSending(false));
+      .finally(() => {
+        setSendingSegs((prev) => {
+          if (!prev.has(targetSeg)) return prev;
+          const next = new Set(prev);
+          next.delete(targetSeg);
+          return next;
+        });
+      });
   }
 
   function sendWorkerChat() {
@@ -1828,7 +1885,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     {fmtDuration(runDuration)}
                   </span>
                 )}
-                {isMain && <span>可交互</span>}
+                {isConsultation ? <span>自动协作</span> : isMain ? <span>可交互</span> : null}
               </div>
             </div>
             {(() => {
@@ -1852,7 +1909,25 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                 </div>
               );
             })()}
-            {isMain && <MainRequests key={taskId} taskId={taskId} onOpenWorker={(id) => { approvalFocus.close(); setActiveId(String(id)); }} />}
+            {isMain && (
+              <MainRequests
+                key={taskId}
+                taskId={taskId}
+                onOpenWorker={(id) => {
+                  approvalFocus.close();
+                  setActiveId(String(id));
+                }}
+                onOpenConsultation={
+                  isConsultation
+                    ? undefined
+                    : () => {
+                        approvalFocus.close();
+                        setHasConsultation(true);
+                        setActiveId(MAIN_CONSULTATION_ID);
+                      }
+                }
+              />
+            )}
             <ApprovalExecutionFocus
               focus={{
                 ...approvalFocus,
@@ -1903,12 +1978,16 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                   />
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">
-                    {isMain ? "还没有对话。在下方给主 Agent 发消息，引导探索方向或介入流程。" : "暂无活动记录。"}
+                    {isConsultation
+                      ? "还没有 Worker 异步请示记录。Worker 发起请示后，提问、自动查证和回复会单独记录在这里，不打断你的主会话。"
+                      : isMain
+                        ? "还没有对话。在下方给主 Agent 发消息，引导探索方向或介入流程。"
+                        : "暂无活动记录。"}
                   </div>
                 )}
               </div>
             </ScrollArea>
-            {isMain ? (
+            {isInteractiveMain ? (
               <div className="border-t p-3">
                 {attachments.length > 0 && (
                   <div className="mb-2 flex flex-wrap gap-1.5">
@@ -1949,7 +2028,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                       mainBusy ? "主 Agent 正在运行，可输入 /btw 提问…" : "给主 Agent 发消息，@ 引用漏洞、资产等…"
                     }
                     value={input}
-                    disabled={sending}
+                    disabled={sendingCurrent}
                     onValueChange={setInput}
                     onKeyDown={(e) => {
                       if (!shouldSubmitOnKey(e, sendMode)) return;
@@ -1979,12 +2058,12 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                         className="ml-auto"
                         size="icon-xs"
                         variant="destructive"
-                        onClick={stop}
-                        disabled={stopping}
-                        title="停止当前执行"
-                        aria-label="停止当前执行"
+                        onClick={() => stop(activeSeg)}
+                        disabled={stoppingSeg === activeSeg}
+                        title="停止当前会话执行"
+                        aria-label="停止当前会话执行"
                       >
-                        {stopping ? <Loader2Icon className="animate-spin" /> : <SquareIcon />}
+                        {stoppingSeg === activeSeg ? <Loader2Icon className="animate-spin" /> : <SquareIcon />}
                       </InputGroupButton>
                     ) : (
                       <InputGroupButton
@@ -1992,15 +2071,46 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                         size="icon-xs"
                         variant="default"
                         onClick={send}
-                        disabled={(!input.trim() && attachments.length === 0) || sending}
+                        disabled={(!input.trim() && attachments.length === 0) || sendingCurrent}
                         title="发送消息"
                         aria-label="发送消息"
                       >
-                        {sending ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
+                        {sendingCurrent ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
                       </InputGroupButton>
                     )}
                   </InputGroupAddon>
                 </InputGroup>
+              </div>
+            ) : isConsultation ? (
+              <div className="flex items-center justify-between gap-3 border-t px-4 py-2 text-xs text-muted-foreground">
+                <div className="flex min-w-0 items-center gap-2">
+                  <TodoPopover
+                    seq={latestTodoSeq}
+                    fetchDetail={(seq) => api.activityDetail(seq, taskId).then((r) => r.detail ?? "")}
+                  />
+                  <span className="truncate">
+                    {mainStatus.consultationRunning
+                      ? "主 Agent 正在独立通道自动处理 Worker 请示，不阻塞你的主会话对话。"
+                      : "Worker 异步请示与自动查证过程独立记录于此；可在上方「协作请示」抽屉人工接答。"}
+                  </span>
+                </div>
+                {mainStatus.consultationRunning && (
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="destructive"
+                    onClick={() => stop(MAIN_CONSULTATION_SEG)}
+                    disabled={stoppingSeg === MAIN_CONSULTATION_SEG}
+                    className="shrink-0 gap-1"
+                  >
+                    {stoppingSeg === MAIN_CONSULTATION_SEG ? (
+                      <Loader2Icon className="size-3 animate-spin" />
+                    ) : (
+                      <SquareIcon className="size-3" />
+                    )}
+                    停止当前请示
+                  </Button>
+                )}
               </div>
             ) : active.role === "worker" &&
               !active.inherited &&

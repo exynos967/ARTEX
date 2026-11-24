@@ -4,6 +4,7 @@
 // are passed through and formatted at the call site.
 
 import type { ChatMention } from "@/lib/chat-mentions";
+import type { MainChatStatus } from "@/lib/main-sessions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
 import { apiCache, clearApiCache, invalidateApiData, syncApiSession } from "@/lib/api-refresh";
@@ -787,9 +788,13 @@ export const api = {
   // Main-agent conversation segments of a task. Each segment is a resettable session
   // (clean transcript/context) over the same task; `current` is the writable one.
   mainSessions: (task: string) =>
-    get<{ sessions: { seq: number; created_at: string }[]; current: number }>(
+    get<{ sessions: { seq: number; created_at: string }[]; current: number; has_consultation?: boolean }>(
       `/exploration/main-sessions${tq(task)}`,
-    ).then((r) => ({ sessions: arr(r.sessions), current: r.current ?? 0 })),
+    ).then((r) => ({
+      sessions: arr(r.sessions),
+      current: r.current ?? 0,
+      hasConsultation: Boolean(r.has_consultation),
+    })),
   // Start a fresh main-agent session segment (does not touch the task's graph/assets/goal).
   newMainSession: (task: string) =>
     post<{ seq: number; created_at: string; current: number }>(`/exploration/main-session/new${tq(task)}`),
@@ -900,8 +905,12 @@ export const api = {
       { signal },
     ),
   chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number) =>
-    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg }),
-  chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
+    post<{ reply?: string; status?: string; mode: string; seg?: number }>(`/chat${tq(task)}`, {
+      message,
+      attachments,
+      seg,
+    }),
+  chatStatus: (taskId: string) => http<MainChatStatus>(`/tasks/${taskId}/chat/status`, { cache: "no-store" }),
   // 方式1 文件上传:落到会话/任务工作目录 uploads/，返回可供 agent Read 的相对路径。
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {
     if (MOCK)
@@ -925,7 +934,8 @@ export const api = {
     invalidateApiData(["/workspace", "/tasks", "/chat"]);
     return r.json() as Promise<{ attachments: ChatAttachment[] }>;
   },
-  stopChat: (taskId: string) => post<{ status: string }>(`/tasks/${taskId}/chat/stop`, {}),
+  stopChat: (taskId: string, seg?: number) =>
+    post<{ status: string }>(`/tasks/${taskId}/chat/stop`, seg === undefined ? {} : { seg }),
   gc: (ttl = 86400) => post<{ removed: number }>(`/gc?ttl=${ttl}`, {}),
 
   // ---- LLM ----
