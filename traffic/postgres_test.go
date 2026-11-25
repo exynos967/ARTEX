@@ -58,7 +58,7 @@ func TestPostgresCaptureSearchEvidenceAndArchive(t *testing.T) {
 	if tr.Backend() != "postgres" {
 		t.Fatal("unexpected backend")
 	}
-	body := []byte(strings.Repeat("searchable payload 中文正文 ", 18000) + "Deep-Marker 100%_literal\\path")
+	body := []byte(strings.Repeat("searchable payload 中文正文 ", 1200) + "Deep-Marker 100%_literal\\path")
 	flow := newFlow("api.example.com:8443", "POST", "/v1/login", []byte(`{"password":"P@ssw0rd"}`), body)
 	// Raw headers can contain non-UTF-8 octets; bytea must preserve them exactly.
 	flow.Request.Header.Set("X-Legacy", string([]byte{0xff, 0xfe}))
@@ -178,7 +178,7 @@ func TestPostgresMigrationPreservesIDsBodiesBlobsAndLegacyPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := old.recordFlow(newFlow("old.example", "POST", "/capture", []byte("password=old"), []byte(strings.Repeat("long body ", 30000)+"Tail-Migration-Marker"))); err != nil {
+	if err := old.recordFlow(newFlow("old.example", "POST", "/capture", []byte("password=old"), []byte(strings.Repeat("long body ", 3500)+"Tail-Migration-Marker"))); err != nil {
 		t.Fatal(err)
 	}
 	id := onlyExchangeID(t, old)

@@ -40,16 +40,16 @@ func TestNewIndexEnablesIncrementalVacuum(t *testing.T) {
 func TestDeleteReclaimsIndexSpace(t *testing.T) {
 	tr, _ := openTraffic(t)
 	const host = "bulk.example.com"
-	// 30 × 200KB stays under maxInlineBody, so every body lands in the database
-	// itself rather than the blob store — that is where the growth was invisible.
-	bulkRecord(tr, host, 30, 200*1024)
+	// 400 × 15KB stays under maxInlineBody (16KiB), so every body lands in the
+	// database itself rather than the blob store — that is where the growth was invisible.
+	bulkRecord(tr, host, 400, 15*1024)
 	grown := tr.indexBytes()
 	if grown < 5<<20 {
 		t.Fatalf("索引只有 %d 字节，样本不足以验证回收", grown)
 	}
 
-	if n, err := tr.DeleteHostsExact([]string{host}); err != nil || n != 30 {
-		t.Fatalf("DeleteHostsExact=(%d,%v)，应为 (30,nil)", n, err)
+	if n, err := tr.DeleteHostsExact([]string{host}); err != nil || n != 400 {
+		t.Fatalf("DeleteHostsExact=(%d,%v)，应为 (400,nil)", n, err)
 	}
 	tr.reaping.Wait() // 回收在后台分块进行
 
@@ -138,9 +138,9 @@ func TestReclaimOnLegacyIndexIsHarmless(t *testing.T) {
 	}
 
 	const host = "legacy.example.com"
-	bulkRecord(tr, host, 8, 200*1024)
-	if n, err := tr.DeleteHostsExact([]string{host}); err != nil || n != 8 {
-		t.Fatalf("DeleteHostsExact=(%d,%v)，应为 (8,nil)", n, err)
+	bulkRecord(tr, host, 100, 15*1024)
+	if n, err := tr.DeleteHostsExact([]string{host}); err != nil || n != 100 {
+		t.Fatalf("DeleteHostsExact=(%d,%v)，应为 (100,nil)", n, err)
 	}
 	tr.reaping.Wait() // 必须收敛，不能卡在预算里
 
@@ -161,8 +161,8 @@ func TestReclaimOnLegacyIndexIsHarmless(t *testing.T) {
 // the one moment a full rewrite is cheap.
 func TestDeleteAllPurgesAndCompacts(t *testing.T) {
 	tr, dir := openTraffic(t)
-	bulkRecord(tr, "a.example.com", 10, 200*1024)
-	bulkRecord(tr, "b.example.com", 10, 200*1024)
+	bulkRecord(tr, "a.example.com", 200, 15*1024)
+	bulkRecord(tr, "b.example.com", 200, 15*1024)
 	// A text body so the full-text index has real content, and a spilled one so a
 	// blob exists to collect.
 	tr.record(newFlow("c.example.com", "GET", "/page", nil, []byte(strings.Repeat("secret-token ", 500))))
@@ -183,8 +183,8 @@ func TestDeleteAllPurgesAndCompacts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteAll: %v", err)
 	}
-	if deleted != 22 {
-		t.Fatalf("deleted=%d，应为 22", deleted)
+	if deleted != 402 {
+		t.Fatalf("deleted=%d，应为 402", deleted)
 	}
 	tr.reaping.Wait()
 
@@ -236,7 +236,7 @@ func TestDeleteAllConvertsLegacyIndex(t *testing.T) {
 		t.Fatal("旧库不应报告已启用增量回收")
 	}
 
-	bulkRecord(tr, "legacy.example.com", 10, 200*1024)
+	bulkRecord(tr, "legacy.example.com", 120, 15*1024)
 	if _, _, err := tr.DeleteAll(); err != nil {
 		t.Fatalf("DeleteAll: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestDeleteAllConvertsLegacyIndex(t *testing.T) {
 	}
 
 	// The converted database now reclaims on an ordinary host deletion.
-	bulkRecord(tr, "again.example.com", 10, 200*1024)
+	bulkRecord(tr, "again.example.com", 120, 15*1024)
 	grown := tr.indexBytes()
 	if _, err := tr.DeleteHostsExact([]string{"again.example.com"}); err != nil {
 		t.Fatal(err)

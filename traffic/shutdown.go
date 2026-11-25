@@ -3,11 +3,8 @@ package traffic
 import (
 	"context"
 	"errors"
-	"net"
 	"net/http"
 	"time"
-
-	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
 )
 
 var ErrClosed = errors.New("traffic recorder is closed")
@@ -31,6 +28,9 @@ func (t *Traffic) Start() error {
 	done := t.startDone
 	t.lifecycleMu.Unlock()
 	defer close(done)
+	if t.proxy == nil {
+		return ErrClosed
+	}
 	err := t.proxy.Start()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -38,11 +38,26 @@ func (t *Traffic) Start() error {
 	return err
 }
 
-// Close stops accepting proxy traffic and gives HTTP requests a bounded grace
-// period to finish recording. After that no callback may start a file/DB write;
-// admitted recordings and reclamation finish before the database is closed.
-// Other application operations (archive/delete/read) must be drained by the
-// owner before Close, just like HTTP API handlers before Manager.Close.
+// Shutdown gracefully stops the recording proxy using ctx's deadline (or
+// proxyShutdownGrace when ctx has no deadline), flushes queued exchanges, and
+// closes the database.
+func (t *Traffic) Shutdown(ctx context.Context) error {
+	grace := proxyShutdownGrace
+	if ctx != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			grace = time.Until(deadline)
+			if grace < 0 {
+				grace = 0
+			}
+		}
+	}
+	return t.closeWithTimeout(grace)
+}
+
+// Close stops accepting proxy traffic and gives active HTTP/HTTPS requests a
+// bounded grace period to finish. Buffered recordings are flushed cleanly,
+// background workers (reclamation, legacy reaping, retention) exit, and then
+// the database is closed.
 func (t *Traffic) Close() error { return t.closeWithTimeout(proxyShutdownGrace) }
 
 func (t *Traffic) closeWithTimeout(grace time.Duration) error {
@@ -55,7 +70,7 @@ func (t *Traffic) closeWithTimeout(grace time.Duration) error {
 		done := t.startDone
 		t.lifecycleMu.Unlock()
 
-		if done != nil {
+		if done != nil && t.proxy != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), grace)
 			err := t.proxy.Shutdown(ctx)
 			cancel()
@@ -63,23 +78,21 @@ func (t *Traffic) closeWithTimeout(grace time.Duration) error {
 				t.closeErr = errors.Join(err, t.proxy.Close())
 			}
 			<-done
+		} else if t.proxy != nil {
+			_ = t.proxy.Close()
 		}
 
-		// Shutdown does not join go-mitmproxy's internal MITM server or hijacked
-		// CONNECT handlers. Close their sockets and refuse any late Response hook
-		// before draining admitted callbacks, so they cannot recreate blob files.
+		// Stop accepting new async ingest items and flush everything already queued
+		// before refusing late recordings and closing the database.
+		t.stopIngest()
+
 		t.lifecycleMu.Lock()
 		t.recordsClosed = true
-		clients := make([]net.Conn, 0, len(t.clients))
-		for _, conn := range t.clients {
-			clients = append(clients, conn)
-		}
 		t.lifecycleMu.Unlock()
-		for _, conn := range clients {
-			_ = conn.Close()
-		}
+
 		t.recording.Wait()
 		t.reaping.Wait()
+		t.retentionWG.Wait()
 		if t.db != nil {
 			t.closeErr = errors.Join(t.closeErr, t.db.Close())
 		}
@@ -105,24 +118,4 @@ func (t *Traffic) startReaper(run func()) bool {
 	}
 	t.reaping.Go(run)
 	return true
-}
-
-func (s *sink) ClientConnected(client *mproxy.ClientConn) {
-	s.t.lifecycleMu.Lock()
-	if s.t.closing {
-		s.t.lifecycleMu.Unlock()
-		_ = client.Conn.Close()
-		return
-	}
-	if s.t.clients == nil {
-		s.t.clients = make(map[*mproxy.ClientConn]net.Conn)
-	}
-	s.t.clients[client] = client.Conn
-	s.t.lifecycleMu.Unlock()
-}
-
-func (s *sink) ClientDisconnected(client *mproxy.ClientConn) {
-	s.t.lifecycleMu.Lock()
-	delete(s.t.clients, client)
-	s.t.lifecycleMu.Unlock()
 }

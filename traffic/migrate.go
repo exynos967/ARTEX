@@ -1,6 +1,7 @@
 package traffic
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -11,13 +12,32 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"time"
+
+	"github.com/RC-CHN/ARTEX/db"
 )
+
+// sqliteReadOnlyURI converts a local filesystem path (including Windows drive
+// paths like C:\dir\index.sqlite) into a portable SQLite read-only file: URI.
+func sqliteReadOnlyURI(p string) string {
+	slashed := filepath.ToSlash(p)
+	if len(slashed) >= 2 && slashed[1] == ':' &&
+		((slashed[0] >= 'A' && slashed[0] <= 'Z') || (slashed[0] >= 'a' && slashed[0] <= 'z')) {
+		slashed = "/" + slashed
+	}
+	u := &url.URL{Scheme: "file", Path: slashed}
+	return u.String() + "?mode=ro"
+}
 
 // migrateSQLite runs before the proxy starts. The old process must be stopped:
 // source files are copied (including committed WAL pages), never opened in place.
 // Import + verification + completion marker commit together. Failure leaves the
 // old index untouched and PostgreSQL empty, so restarting safely retries it.
-func (t *Traffic) migrateSQLite() error {
+func (t *Traffic) migrateSQLite(timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Minute
+	}
 	var complete bool
 	if err := t.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM migrations WHERE name='sqlite-v1')`).Scan(&complete); err != nil {
 		return err
@@ -34,28 +54,10 @@ func (t *Traffic) migrateSQLite() error {
 	if st, err := os.Stat(source + "-journal"); err == nil && st.Size() > 0 {
 		return errors.New("legacy SQLite has a rollback journal; cleanly stop/recover the old instance before migration")
 	}
-	tx, err := t.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(7337741004)`); err != nil {
-		return err
-	}
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM migrations WHERE name='sqlite-v1')`).Scan(&complete); err != nil {
-		return err
-	}
-	if complete {
-		return nil
-	}
-	var existing int64
-	if err := tx.QueryRow(`SELECT count(*) FROM exchanges`).Scan(&existing); err != nil {
-		return err
-	}
-	if existing != 0 {
-		return errors.New("refusing to merge legacy SQLite into a non-empty PostgreSQL traffic index")
-	}
 
+	// Copy and validate the legacy SQLite snapshot BEFORE opening the PostgreSQL
+	// write transaction so disk I/O and PRAGMA quick_check never sit idle inside a
+	// PG transaction or trip idle_in_transaction_session_timeout.
 	scratch, err := os.MkdirTemp("", "artex-traffic-migration-")
 	if err != nil {
 		return err
@@ -66,8 +68,7 @@ func (t *Traffic) migrateSQLite() error {
 	if err != nil {
 		return err
 	}
-	u := &url.URL{Scheme: "file", Path: copyPath}
-	legacy, err := sql.Open("sqlite", u.String()+"?mode=ro")
+	legacy, err := sql.Open("sqlite", sqliteReadOnlyURI(copyPath))
 	if err != nil {
 		return err
 	}
@@ -98,6 +99,42 @@ func (t *Traffic) migrateSQLite() error {
 			return err
 		}
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Lift per-statement, lock, and idle-in-transaction timeouts locally to this
+	// migration transaction so large historical SQLite imports honor migrationTimeout.
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('statement_timeout',$1,true)`, strconv.FormatInt(timeout.Milliseconds(), 10)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('lock_timeout','0',true)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('idle_in_transaction_session_timeout','0',true)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, db.LockTrafficSQLiteMigrate); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM migrations WHERE name='sqlite-v1')`).Scan(&complete); err != nil {
+		return err
+	}
+	if complete {
+		return nil
+	}
+	var existing int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM exchanges`).Scan(&existing); err != nil {
+		return err
+	}
+	if existing != 0 {
+		return errors.New("refusing to merge legacy SQLite into a non-empty PostgreSQL traffic index")
+	}
+
 	verifiedBlobs := map[string]bool{}
 	verifyBlob := func(hash string) error {
 		if hash == "" || verifiedBlobs[hash] {
@@ -115,7 +152,7 @@ func (t *Traffic) migrateSQLite() error {
 	} else {
 		query += `false,'',NULL,'','',NULL,'' FROM exchanges e ORDER BY e.id`
 	}
-	rows, err := legacy.Query(query)
+	rows, err := legacy.QueryContext(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -169,7 +206,7 @@ func (t *Traffic) migrateSQLite() error {
 		}
 		args := exchangeArgs(item, path, content)
 		args[18] = hasBody
-		if _, err := tx.Exec(postgresInsertExchange, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, postgresInsertExchange, args...); err != nil {
 			return fmt.Errorf("import exchange %s: %w", item.ID, err)
 		}
 		exchanges++
@@ -187,7 +224,7 @@ func (t *Traffic) migrateSQLite() error {
 	// Copy all source references, including historical references not represented
 	// in inline body columns. Re-checking references protects later blob GC.
 	if hasRefs {
-		refs, err := legacy.Query(`SELECT hash,exchange_id FROM blob_refs ORDER BY hash,exchange_id`)
+		refs, err := legacy.QueryContext(ctx, `SELECT hash,exchange_id FROM blob_refs ORDER BY hash,exchange_id`)
 		if err != nil {
 			return err
 		}
@@ -201,7 +238,7 @@ func (t *Traffic) migrateSQLite() error {
 				refs.Close()
 				return err
 			}
-			if _, err := tx.Exec(`INSERT INTO blob_refs(hash,exchange_id) VALUES(?,?) ON CONFLICT DO NOTHING`, hash, id); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO blob_refs(hash,exchange_id) VALUES(?,?) ON CONFLICT DO NOTHING`, hash, id); err != nil {
 				refs.Close()
 				return err
 			}
@@ -213,13 +250,13 @@ func (t *Traffic) migrateSQLite() error {
 		}
 	}
 	var gotExchanges, gotBodies, gotSearch, gotRefs int64
-	if err := tx.QueryRow(`SELECT (SELECT count(*) FROM exchanges),(SELECT count(*) FROM exchange_bodies),(SELECT count(*) FROM ex_fts),(SELECT count(*) FROM blob_refs)`).Scan(&gotExchanges, &gotBodies, &gotSearch, &gotRefs); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM exchanges),(SELECT count(*) FROM exchange_bodies),(SELECT count(*) FROM ex_fts),(SELECT count(*) FROM blob_refs)`).Scan(&gotExchanges, &gotBodies, &gotSearch, &gotRefs); err != nil {
 		return err
 	}
 	if gotExchanges != exchanges || gotBodies != bodies || gotSearch != exchanges || exchanges != sourceExchanges || bodies != sourceBodies {
 		return fmt.Errorf("traffic migration count mismatch: exchanges=%d/%d bodies=%d/%d search=%d", gotExchanges, exchanges, gotBodies, bodies, gotSearch)
 	}
-	if _, err := tx.Exec(`INSERT INTO migrations(name,source_sha256,exchanges,bodies,blob_refs) VALUES('sqlite-v1',?,?,?,?)`, fingerprint, exchanges, bodies, gotRefs); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO migrations(name,source_sha256,exchanges,bodies,blob_refs) VALUES('sqlite-v1',?,?,?,?)`, fingerprint, exchanges, bodies, gotRefs); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

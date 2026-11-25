@@ -1,7 +1,7 @@
 // Package traffic implements the request-recording subsystem (docs §10): an
-// embedded go-mitmproxy proxy whose addon writes every target HTTP exchange into
-// PostgreSQL index with content-addressed files for large bodies.
-// Full capture, plaintext (no redaction), target HTTP only.
+// embedded pooled HTTP/HTTPS MITM proxy that asynchronously records target HTTP
+// exchanges into PostgreSQL (or legacy SQLite) with content-addressed files for
+// large bodies. Full capture, plaintext (no redaction), target HTTP only.
 package traffic
 
 import (
@@ -17,9 +17,9 @@ import (
 	"io/fs"
 	"log"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -34,7 +34,6 @@ import (
 	"github.com/RC-CHN/ARTEX/norma/permission"
 	actool "github.com/RC-CHN/ARTEX/norma/tool"
 	"github.com/google/uuid"
-	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
 	_ "modernc.org/sqlite"
 )
 
@@ -89,14 +88,24 @@ const ftsSchema = `CREATE VIRTUAL TABLE IF NOT EXISTS ex_fts USING fts5(
 
 const (
 	// maxInlineBody is the cutoff between a body stored inline (database column) and
-	// one spilled to the content-addressed blob store.
-	maxInlineBody = 256 * 1024
+	// one spilled to the content-addressed blob store (16 KiB).
+	maxInlineBody = 16 * 1024
 	// blobPreview is how much of a spilled body stays inline so readers can tell
 	// what it is (JSON shape, SQL dump header, ZIP magic) without fetching it.
 	blobPreview = 8 * 1024
-	// maxIndexBody caps a single body's contribution to the full-text index. Text
-	// is indexed in full below this; binary never reaches the index at all.
-	maxIndexBody = 4 * 1024 * 1024
+	// maxIndexBody caps a single body's contribution to the full-text index (64 KiB).
+	// Text is indexed up to this cap; static assets and binary bodies are skipped.
+	maxIndexBody = 64 * 1024
+	// ingestQueueCap bounds the async recording queue between the proxy response
+	// path and the background persistence worker so slow DB/GC ops never stall HTTP.
+	ingestQueueCap = 1024
+	// ingestBatchSize bounds how many queued exchanges are persisted per DB transaction.
+	ingestBatchSize = 32
+	// defaultRetentionInterval, defaultRetentionMaxAge, and defaultRetentionMaxRows
+	// configure the background retention pruner.
+	defaultRetentionInterval = time.Hour
+	defaultRetentionMaxAge   = 7 * 24 * time.Hour
+	defaultRetentionMaxRows  = 100000
 	// minTrigram is the shortest term the trigram tokenizer can match; shorter
 	// queries fall back to metadata LIKE.
 	minTrigram = 3
@@ -106,9 +115,8 @@ const (
 	// autoVacuumIncremental is SQLite's numeric value for auto_vacuum=incremental.
 	autoVacuumIncremental = 2
 	// reclaimChunkPages bounds how much index space one locked step returns to the
-	// filesystem (pages are 4KiB, so ~32MB). Reclamation holds the write lock, and
-	// record() runs before go-mitmproxy replies to the client, so an unbounded
-	// pass would stall the very requests being recorded.
+	// filesystem (pages are 4KiB, so ~32MB). Reclamation holds the write lock, so
+	// bounded chunks keep background persistence responsive.
 	reclaimChunkPages = 8192
 	// reclaimMergePages bounds the full-text merge done alongside each chunk.
 	// Deleting from a contentless_delete index only writes tombstones; merging is
@@ -139,15 +147,18 @@ type Traffic struct {
 	dir   string
 	addr  string
 	db    *indexDB
-	wmu   sync.Mutex // serializes record() vs DeleteHost (incl. blob GC)
-	proxy *mproxy.Proxy
+	wmu   sync.Mutex // serializes DB/GC mutations (recordBatch DB commit, DeleteHost, DeleteAll, PruneExchanges)
+	proxy *mitmProxy
 	// fts reports whether the full-text index is available. False on a driver
 	// build without FTS5: recording and metadata search still work, body search
 	// degrades to unsupported rather than erroring.
 	fts bool
-	// reaping tracks background reclamation of legacy trees and index space, so
-	// shutdown and tests can wait for it instead of racing it.
+	// reaping tracks finite background reclamation of legacy trees and index space,
+	// so shutdown and tests can wait for it via reaping.Wait() before Close.
 	reaping sync.WaitGroup
+	// retentionWG tracks the long-lived periodic retention pruner goroutine,
+	// stopped cleanly by Close() closing t.closed.
+	retentionWG sync.WaitGroup
 	// incrementalVacuum reports whether the index can return freed pages to the
 	// filesystem on its own. False on a database created before this was the
 	// default: PRAGMA incremental_vacuum is a silent no-op there, so deletions
@@ -156,9 +167,9 @@ type Traffic struct {
 	// reclaiming keeps a single background reclamation in flight. Concurrent ones
 	// would only contend for wmu, never finish sooner.
 	reclaiming atomic.Bool
-	// closed is shut by Close so a reclamation abandons its remaining budget
-	// instead of holding shutdown open for minutes. Nil on the zero value, which
-	// stopping() treats as "not closing".
+	// closed is shut by Close so background workers abandon remaining budgets
+	// instead of holding shutdown open. Nil on the zero value, which stopping()
+	// treats as "not closing".
 	closed    chan struct{}
 	closeOnce sync.Once
 	closeErr  error
@@ -169,15 +180,33 @@ type Traffic struct {
 	started       bool
 	startDone     chan struct{}
 	recording     sync.WaitGroup
-	clients       map[*mproxy.ClientConn]net.Conn
-	// pass is the set of hosts whose MITM interception failed for a proxy/protocol
-	// reason; connections to them are tunneled transparently (fail-open) so the
-	// request still reaches the target — unrecorded — instead of being killed.
-	pass sync.Map // hostname(string) -> struct{}
+	// Async bounded ingestion queue decoupling HTTP proxy responses from wmu/DB/GC.
+	ingestMu     sync.Mutex
+	ingestCh     chan *capturedFlow
+	ingestDone   chan struct{}
+	ingestClosed bool
+	ingestSeq    atomic.Int64
+	droppedFlows atomic.Int64
+	flushMu      sync.Mutex
+	flushedSeq   int64
+	flushNotify  chan struct{}
+	// inflightBlobs pins hashes currently being spilled outside wmu so concurrent
+	// gcBlobs cannot remove a freshly written blob before its blob_refs row lands.
+	inflightMu    sync.Mutex
+	inflightBlobs map[string]int
+	gcGen         atomic.Uint64
+	// exportMu coordinates active streaming ExportHosts readers with gcBlobs so
+	// blobs queried on a page can never be unlinked before exportBlobFile opens them.
+	exportMu        sync.Mutex
+	exportsInFlight int
+	gcDeferred      bool
+	// pass is the bounded LRU set of hosts whose MITM interception failed for a
+	// proxy/protocol reason; connections to them are tunneled transparently.
+	pass hostLRU
 	// upstream is the global egress proxy every captured request is forwarded
 	// through (nil = dial targets directly). Both the intercepted and the
-	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
-	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
+	// transparent-passthrough paths honor it, so no host escapes it.
+	// Hot-swappable at runtime via SetUpstreamProxy.
 	upstream atomic.Pointer[url.URL]
 }
 
@@ -215,33 +244,21 @@ func Open(dir, addr string) (*Traffic, error) {
 }
 
 func (t *Traffic) startProxy() (*Traffic, error) {
-	p, err := mproxy.NewProxy(&mproxy.Options{
-		Addr:        t.addr,
-		SslInsecure: true,
-		CaRootPath:  filepath.Join(t.dir, "_ca"),
+	p, err := newMITMProxy(mitmProxyConfig{
+		Addr:            t.addr,
+		CADir:           filepath.Join(t.dir, "_ca"),
+		UpstreamFn:      func() *url.URL { return t.upstream.Load() },
+		IsPassthroughFn: t.isPassthrough,
+		OnRecordFn:      func(f *capturedFlow) { t.enqueueFlow(f) },
+		OnErrorFn:       t.maybePassthroughHost,
 	})
 	if err != nil {
 		t.db.Close()
 		return nil, err
 	}
-	// Upstream selection. By default (no global egress proxy set) targets are
-	// dialed DIRECTLY: go-mitmproxy's own default upstream uses
-	// http.ProxyFromEnvironment, so an HTTP_PROXY/HTTPS_PROXY in the environment
-	// (a VPN/system proxy) would make it forward target requests through that
-	// external proxy — which can't reach the target → 502. Returning nil forces
-	// a direct dial. When a global egress proxy IS configured (SetUpstreamProxy),
-	// every captured request — intercepted AND transparently tunneled — is
-	// forwarded through it instead, so no host leaks the real source IP.
-	p.SetUpstreamProxy(func(*http.Request) (*url.URL, error) { return t.upstream.Load(), nil })
-	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
-	// can't intercept without breaking (see maybePassthrough). Those are tunneled
-	// transparently so the request still reaches the target instead of being killed.
-	p.SetShouldInterceptRule(func(req *http.Request) bool {
-		_, tunnel := t.pass.Load(hostOnly(req.Host))
-		return !tunnel
-	})
-	p.AddAddon(&sink{t: t})
 	t.proxy = p
+	t.startIngest()
+	t.startRetention(defaultRetentionInterval, defaultRetentionMaxAge, defaultRetentionMaxRows)
 	return t, nil
 }
 
@@ -314,57 +331,231 @@ func hostOnly(hostport string) string {
 	return hostport
 }
 
+// effectiveListenAddr returns the actual bound TCP address once the proxy has
+// started listening, falling back to the configured t.addr.
+func (t *Traffic) effectiveListenAddr() string {
+	if t == nil {
+		return ""
+	}
+	if t.proxy != nil {
+		if a := strings.TrimSpace(t.proxy.ListenAddr()); a != "" {
+			return a
+		}
+	}
+	return strings.TrimSpace(t.addr)
+}
+
 // ProxyAddr returns the address workers should set as HTTP(S)_PROXY. A bare
 // ":port" means "bind all interfaces" (legacy default), so map it to loopback.
 func (t *Traffic) ProxyAddr() string {
-	if strings.HasPrefix(t.addr, ":") {
-		return "http://127.0.0.1" + t.addr
+	addr := t.effectiveListenAddr()
+	if strings.HasPrefix(addr, ":") {
+		return "http://127.0.0.1" + addr
 	}
-	return "http://" + t.addr
+	return "http://" + addr
 }
 
 // SetUpstreamProxy points every captured request at a global egress proxy
 // (http/https/socks5, optional user:pass in the URL). An empty raw string clears
 // it, restoring direct dialing. The change is atomic and takes effect on the next
-// connection — no restart, no proxy rebuild. go-mitmproxy dials all three schemes
-// itself, so socks5 works uniformly here regardless of the target tool.
+// connection — no restart, no proxy rebuild. Self-looping URLs targeting this
+// proxy's own listening address are rejected.
 func (t *Traffic) SetUpstreamProxy(raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		t.upstream.Store(nil)
+		if t.proxy != nil {
+			t.proxy.CloseIdleConnections()
+		}
 		return nil
 	}
-	u, err := ValidateProxyURL(raw)
+	u, err := ValidateProxyURLForSelf(raw, t.effectiveListenAddr())
 	if err != nil {
 		return err
 	}
 	t.upstream.Store(u)
+	if t.proxy != nil {
+		t.proxy.CloseIdleConnections()
+	}
 	return nil
 }
 
-// ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
-// user:pass), returning the parsed URL. Exposed so callers can validate a global
-// proxy before persisting it even when the traffic proxy itself is disabled.
+// ValidateProxyURL parses and checks a proxy URL (http/https/socks5/socks5h,
+// optional user:pass), returning the parsed URL. Exposed so callers can validate
+// a global proxy before persisting it even when the traffic proxy itself is disabled.
 func ValidateProxyURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
+	safe := redactRawProxyURL(raw)
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("解析代理地址 %q: %w", raw, err)
+		var uerr *url.Error
+		if errors.As(err, &uerr) && uerr.Err != nil {
+			return nil, fmt.Errorf("解析代理地址 %q: %w", safe, uerr.Err)
+		}
+		return nil, fmt.Errorf("解析代理地址 %q: 格式无效", safe)
 	}
 	switch u.Scheme {
-	case "http", "https", "socks5":
+	case "http", "https", "socks5", "socks5h":
 	case "":
-		return nil, fmt.Errorf("代理 %q 缺少协议(用 http://、https:// 或 socks5://)", raw)
+		return nil, fmt.Errorf("代理 %q 缺少协议(用 http://、https://、socks5:// 或 socks5h://)", safe)
 	default:
-		return nil, fmt.Errorf("不支持的代理协议 %q(用 http、https 或 socks5)", u.Scheme)
+		return nil, fmt.Errorf("不支持的代理协议 %q(用 http、https、socks5 或 socks5h)", u.Scheme)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("代理 %q 缺少主机地址", raw)
+		return nil, fmt.Errorf("代理 %q 缺少主机地址", safe)
 	}
 	return u, nil
 }
 
+// redactRawProxyURL strips userinfo credentials from a raw proxy string before
+// it is interpolated into error messages (even when url.Parse rejects the input).
+func redactRawProxyURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if u, err := url.Parse(s); err == nil && u.Scheme != "" && u.Host != "" {
+		return u.Redacted()
+	}
+	prefix := ""
+	rest := s
+	if idx := strings.Index(s, "://"); idx >= 0 {
+		prefix = s[:idx+3]
+		rest = s[idx+3:]
+	}
+	auth := rest
+	suffix := ""
+	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+		auth = rest[:end]
+		suffix = rest[end:]
+	}
+	if at := strings.LastIndex(auth, "@"); at >= 0 {
+		return prefix + "***@" + auth[at+1:] + suffix
+	}
+	return s
+}
+
+// ValidateProxyURLForSelf validates raw as a proxy URL and additionally rejects
+// addresses that point back at selfAddr (the recording proxy's own listen
+// address), preventing infinite self-loop forwarding.
+func ValidateProxyURLForSelf(raw, selfAddr string) (*url.URL, error) {
+	u, err := ValidateProxyURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	if isSelfProxyLoop(u, selfAddr) {
+		return nil, fmt.Errorf("上游代理地址 %q 指向录制代理自身监听地址 %s，会造成代理自环", u.Redacted(), selfAddr)
+	}
+	return u, nil
+}
+
+func isSelfProxyLoop(u *url.URL, selfAddr string) bool {
+	selfHost, selfPort, ok := splitListenHostPort(selfAddr)
+	if !ok || selfPort == "" || selfPort == "0" {
+		return false
+	}
+	targetPort := u.Port()
+	if targetPort == "" {
+		switch u.Scheme {
+		case "http":
+			targetPort = "80"
+		case "https":
+			targetPort = "443"
+		case "socks5", "socks5h":
+			targetPort = "1080"
+		}
+	}
+	if targetPort != selfPort {
+		return false
+	}
+	targetHost := normalizeAddrHost(u.Hostname())
+	selfHost = normalizeAddrHost(selfHost)
+	if targetHost == "" {
+		return false
+	}
+	if targetHost == selfHost {
+		return true
+	}
+	if tip, sip := net.ParseIP(targetHost), net.ParseIP(selfHost); tip != nil && sip != nil && tip.Equal(sip) {
+		return true
+	}
+	targetLoopOrAny := isLoopbackOrWildcardHost(targetHost)
+	selfWildcard := isWildcardHost(selfHost)
+	if selfWildcard && (targetLoopOrAny || isLocalInterfaceHost(targetHost)) {
+		return true
+	}
+	if isLoopbackOrWildcardHost(selfHost) && targetLoopOrAny {
+		return true
+	}
+	return false
+}
+
+func splitListenHostPort(addr string) (host, port string, ok bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", "", false
+	}
+	if strings.Contains(addr, "://") {
+		if u, err := url.Parse(addr); err == nil && u.Host != "" {
+			return u.Hostname(), u.Port(), true
+		}
+		return "", "", false
+	}
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", "", false
+	}
+	return h, p, true
+}
+
+func normalizeAddrHost(h string) string {
+	h = strings.ToLower(strings.TrimSpace(h))
+	h = strings.Trim(h, "[]")
+	return strings.TrimSuffix(h, ".")
+}
+
+func isWildcardHost(h string) bool {
+	if h == "" || h == "0.0.0.0" || h == "::" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsUnspecified() {
+		return true
+	}
+	return false
+}
+
+func isLoopbackOrWildcardHost(h string) bool {
+	if isWildcardHost(h) || h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+func isLocalInterfaceHost(h string) bool {
+	ip := net.ParseIP(h)
+	if ip == nil {
+		return false
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		var ifaceIP net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ifaceIP = v.IP
+		case *net.IPAddr:
+			ifaceIP = v.IP
+		}
+		if ifaceIP != nil && ifaceIP.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // CACertPath returns the PEM CA cert clients must trust to verify HTTPS through
-// the MITM proxy (go-mitmproxy writes it here on first start).
+// the MITM proxy.
 func (t *Traffic) CACertPath() string {
 	return filepath.Join(t.dir, "_ca", "mitmproxy-ca-cert.pem")
 }
@@ -389,39 +580,32 @@ func (t *Traffic) Backend() string {
 	return "sqlite"
 }
 
-// sink is the go-mitmproxy addon that records completed exchanges.
-type sink struct {
-	mproxy.BaseAddon
-	t *Traffic
+// isPassthrough reports whether host has been flagged for transparent tunneling.
+func (t *Traffic) isPassthrough(host string) bool {
+	return t.pass.Has(host)
 }
 
-func (s *sink) Response(f *mproxy.Flow) {
-	if f.Request == nil || f.Response == nil {
-		return
-	}
-	s.t.record(f)
-}
-
-// RequestError fires when a request through an established MITM tunnel fails. If
-// the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol
-// errors) — not a plain target-unreachable error — we flag the host for
-// transparent passthrough so future requests to it succeed instead of dying.
-func (s *sink) RequestError(f *mproxy.Flow, err error) { s.t.maybePassthrough(f, err) }
-
-// maybePassthrough marks a host to be tunneled transparently on the next
+// maybePassthroughHost marks a host to be tunneled transparently on the next
 // connection, but only for errors the proxy itself caused — a target that is
 // simply down/filtered would fail without us too, and must stay MITM'd+recorded.
-func (t *Traffic) maybePassthrough(f *mproxy.Flow, err error) {
-	if err == nil || f == nil || f.Request == nil || f.Request.URL == nil || !proxyCausedErr(err) {
+func (t *Traffic) maybePassthroughHost(host string, err error) {
+	if err == nil || !proxyCausedErr(err) {
 		return
 	}
-	host := f.Request.URL.Hostname()
+	host = hostOnly(strings.TrimSpace(host))
 	if host == "" {
 		return
 	}
-	if _, loaded := t.pass.LoadOrStore(host, struct{}{}); !loaded {
+	if t.pass.Add(host) {
 		log.Printf("[traffic] 与 %s 的 MITM 出错，改为透传（该 host 后续直连目标、不再记录，但请求照常）：%v", host, err)
 	}
+}
+
+func (t *Traffic) maybePassthrough(f *capturedFlow, err error) {
+	if err == nil || f == nil || f.Request == nil || f.Request.URL == nil {
+		return
+	}
+	t.maybePassthroughHost(f.Request.URL.Hostname(), err)
 }
 
 // proxyCausedErr reports whether err indicates the interception layer (not the
@@ -436,37 +620,240 @@ func proxyCausedErr(err error) bool {
 	return false
 }
 
-// record is the proxy callback. recordFlow exposes errors to migration and benchmarks.
-func (t *Traffic) record(f *mproxy.Flow) {
+// startIngest launches the background ingestion goroutine that drains batches
+// from ingestCh and persists them without blocking proxy response delivery.
+func (t *Traffic) startIngest() {
+	t.ingestMu.Lock()
+	if t.ingestCh != nil {
+		t.ingestMu.Unlock()
+		return
+	}
+	ch := make(chan *capturedFlow, ingestQueueCap)
+	done := make(chan struct{})
+	t.ingestCh = ch
+	t.ingestDone = done
+	t.flushMu.Lock()
+	t.flushNotify = make(chan struct{})
+	t.flushMu.Unlock()
+	t.ingestMu.Unlock()
+
+	go t.ingestLoop(ch, done)
+}
+
+// enqueueFlow pushes f into the bounded async ingestion queue without blocking.
+// If the queue is full or traffic is closing, droppedFlows is incremented and
+// false is returned immediately so HTTP responses never stall on DB/GC/wmu.
+func (t *Traffic) enqueueFlow(f *capturedFlow) bool {
+	if f == nil || f.Request == nil || f.Response == nil || f.Request.URL == nil {
+		return false
+	}
+	t.ingestMu.Lock()
+	if t.ingestClosed || t.ingestCh == nil {
+		t.ingestMu.Unlock()
+		t.droppedFlows.Add(1)
+		return false
+	}
+	select {
+	case t.ingestCh <- f:
+		t.ingestSeq.Add(1)
+		t.ingestMu.Unlock()
+		return true
+	default:
+		t.ingestMu.Unlock()
+		t.droppedFlows.Add(1)
+		return false
+	}
+}
+
+// DroppedFlows returns the count of captured exchanges dropped because the
+// async ingestion queue was full or shutting down.
+func (t *Traffic) DroppedFlows() int64 {
+	if t == nil {
+		return 0
+	}
+	return t.droppedFlows.Load()
+}
+
+// Flush blocks until all flows enqueued prior to this call have been persisted
+// (or ctx is canceled / ingestLoop exits).
+func (t *Traffic) Flush(ctx context.Context) error {
+	if t == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	target := t.ingestSeq.Load()
+	for {
+		t.flushMu.Lock()
+		if t.flushedSeq >= target {
+			t.flushMu.Unlock()
+			return nil
+		}
+		notify := t.flushNotify
+		t.flushMu.Unlock()
+
+		t.ingestMu.Lock()
+		done := t.ingestDone
+		t.ingestMu.Unlock()
+		if done == nil {
+			return nil
+		}
+		select {
+		case <-notify:
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (t *Traffic) stopIngest() {
+	t.ingestMu.Lock()
+	if !t.ingestClosed {
+		t.ingestClosed = true
+		if t.ingestCh != nil {
+			close(t.ingestCh)
+		}
+	}
+	done := t.ingestDone
+	t.ingestMu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+func (t *Traffic) ingestLoop(ch <-chan *capturedFlow, done chan struct{}) {
+	defer close(done)
+	batch := make([]*capturedFlow, 0, ingestBatchSize)
+	for first := range ch {
+		batch = append(batch[:0], first)
+	drain:
+		for len(batch) < ingestBatchSize {
+			select {
+			case next, ok := <-ch:
+				if !ok {
+					break drain
+				}
+				batch = append(batch, next)
+			default:
+				break drain
+			}
+		}
+		if err := t.recordBatch(batch); err != nil && !errors.Is(err, ErrClosed) {
+			log.Printf("[traffic] 批量记录流量(%d条)失败: %v", len(batch), err)
+		}
+		t.flushMu.Lock()
+		t.flushedSeq += int64(len(batch))
+		close(t.flushNotify)
+		t.flushNotify = make(chan struct{})
+		t.flushMu.Unlock()
+	}
+}
+
+// record is a synchronous test/internal helper that logs errors from recordFlow.
+func (t *Traffic) record(f *capturedFlow) {
 	if err := t.recordFlow(f); err != nil {
 		log.Printf("[traffic] 记录流量失败: %v", err)
 	}
 }
 
-// recordFlow persists metadata, inline bodies and search text atomically. Large
-// bodies are spilled before the database write; the writer lock excludes blob GC.
-func (t *Traffic) recordFlow(f *mproxy.Flow) error {
+// recordFlow persists a single exchange synchronously, exposing errors to tests,
+// migration, and benchmarks.
+func (t *Traffic) recordFlow(f *capturedFlow) error {
+	if f == nil || f.Request == nil || f.Response == nil || f.Request.URL == nil {
+		return nil
+	}
+	return t.recordBatch([]*capturedFlow{f})
+}
+
+type preparedExchange struct {
+	item     ArchiveExchange
+	content  string
+	reqRaw   []byte
+	respRaw  []byte
+	reqHash  string
+	respHash string
+}
+
+// recordBatch spills large content-addressed blobs outside t.wmu (pinned against
+// concurrent blob GC) and commits all metadata, inline bodies, blob_refs, and
+// search documents in one short database transaction under t.wmu.
+func (t *Traffic) recordBatch(flows []*capturedFlow) error {
+	if len(flows) == 0 {
+		return nil
+	}
 	if !t.beginRecording() {
 		return ErrClosed
 	}
 	defer t.recording.Done()
+
+	gcGenBefore := t.gcGen.Load()
+	prepared := make([]preparedExchange, 0, len(flows))
+	pinned := make([]string, 0, len(flows))
+	defer func() {
+		if len(pinned) > 0 {
+			t.unpinBlobs(pinned)
+		}
+	}()
+
+	now := time.Now().Unix()
+	for _, f := range flows {
+		if f == nil || f.Request == nil || f.Response == nil || f.Request.URL == nil {
+			continue
+		}
+		reqCT := f.Request.Header.Get("Content-Type")
+		respCT := f.Response.Header.Get("Content-Type")
+		reqB := t.spillOutsideLock(f.Request.Body, reqCT, false, &pinned)
+		skipRespIdx := shouldSkipRespBodyIndex(f.Request.URL.Path, respCT)
+		respB := t.spillOutsideLock(f.Response.Body, respCT, skipRespIdx, &pinned)
+
+		proto := f.Request.Proto
+		if proto == "" {
+			proto = "HTTP/1.1"
+		}
+		item := ArchiveExchange{
+			ID: uuid.NewString(), TS: now, Host: strings.ToLower(f.Request.URL.Hostname()),
+			Method: f.Request.Method, URLTemplate: db.TemplatePath(f.Request.URL.EscapedPath()),
+			URL: f.Request.URL.String(), Status: f.Response.StatusCode, ContentType: respCT,
+			ReqLen: len(f.Request.Body), RespLen: len(f.Response.Body),
+			ReqHead:  fmt.Sprintf("%s %s %s\n%s", f.Request.Method, f.Request.URL.RequestURI(), proto, requestHeaderLines(f.Request)),
+			RespHead: fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header)),
+			ReqBody:  reqB.inline, RespBody: respB.inline, ReqBlob: reqB.hash, RespBlob: respB.hash,
+		}
+		content := buildSearchDocument(item.URL, item.ReqHead, reqB.index, item.RespHead, respB.index)
+		prepared = append(prepared, preparedExchange{
+			item:     item,
+			content:  content,
+			reqRaw:   f.Request.Body,
+			respRaw:  f.Response.Body,
+			reqHash:  reqB.hash,
+			respHash: respB.hash,
+		})
+	}
+	if len(prepared) == 0 {
+		return nil
+	}
+
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
-	ct := f.Response.Header.Get("Content-Type")
-	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
-	respB := t.spill(f.Response.Body, ct)
-	item := ArchiveExchange{
-		ID: uuid.NewString(), TS: time.Now().Unix(), Host: f.Request.URL.Hostname(),
-		Method: f.Request.Method, URLTemplate: db.TemplatePath(f.Request.URL.EscapedPath()),
-		URL: f.Request.URL.String(), Status: f.Response.StatusCode, ContentType: ct,
-		ReqLen: len(f.Request.Body), RespLen: len(f.Response.Body),
-		ReqHead:  fmt.Sprintf("%s %s %s\n%s", f.Request.Method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request)),
-		RespHead: fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header)),
-		ReqBody:  reqB.inline, RespBody: respB.inline, ReqBlob: reqB.hash, RespBlob: respB.hash,
+
+	// If gcBlobs ran concurrently while we were spilling outside wmu, verify that
+	// every referenced blob file still exists on disk before inserting blob_refs.
+	if t.gcGen.Load() != gcGenBefore {
+		for _, p := range prepared {
+			if p.reqHash != "" {
+				_ = t.ensureBlobFile(p.reqHash, p.reqRaw)
+			}
+			if p.respHash != "" {
+				_ = t.ensureBlobFile(p.respHash, p.respRaw)
+			}
+		}
 	}
-	content := strings.Join([]string{item.URL, item.ReqHead, reqB.index, item.RespHead, respB.index}, "\n")
-	if t.db.postgres {
-		_, err := t.db.Exec(postgresInsertExchange, exchangeArgs(item, "", content)...)
+
+	if t.db.postgres && len(prepared) == 1 {
+		_, err := t.db.Exec(postgresInsertExchange, exchangeArgs(prepared[0].item, "", prepared[0].content)...)
 		return err
 	}
 	tx, err := t.db.Begin()
@@ -474,10 +861,36 @@ func (t *Traffic) recordFlow(f *mproxy.Flow) error {
 		return err
 	}
 	defer tx.Rollback()
-	if err := t.insertExchange(tx, item, "", content); err != nil {
-		return err
+	for _, p := range prepared {
+		if t.db.postgres {
+			if _, err := tx.Exec(postgresInsertExchange, exchangeArgs(p.item, "", p.content)...); err != nil {
+				return err
+			}
+		} else {
+			if err := t.insertExchange(tx, p.item, "", p.content); err != nil {
+				return err
+			}
+		}
 	}
 	return tx.Commit()
+}
+
+// buildSearchDocument joins URL, headers, and indexable body slices in a single
+// builder allocation and normalizes NUL / invalid UTF-8 in one pass.
+func buildSearchDocument(rawURL, reqHead, reqBodyIdx, respHead, respBodyIdx string) string {
+	total := len(rawURL) + len(reqHead) + len(reqBodyIdx) + len(respHead) + len(respBodyIdx) + 4
+	var b strings.Builder
+	b.Grow(total)
+	b.WriteString(rawURL)
+	b.WriteByte('\n')
+	b.WriteString(reqHead)
+	b.WriteByte('\n')
+	b.WriteString(reqBodyIdx)
+	b.WriteByte('\n')
+	b.WriteString(respHead)
+	b.WriteByte('\n')
+	b.WriteString(respBodyIdx)
+	return cleanIndexText(b.String())
 }
 
 // insertExchange writes the SQLite reference backend used by tests and benchmarks.
@@ -501,35 +914,106 @@ VALUES(?,?,?,?,?,?,?)`, item.ID, t.headerValue(item.ReqHead), item.ReqBody, null
 		}
 	}
 	if t.fts {
-		_, err = tx.Exec(`INSERT INTO ex_fts(rowid,content) VALUES(?,?)`, rowid, searchText(content))
+		_, err = tx.Exec(`INSERT INTO ex_fts(rowid,content) VALUES(?,?)`, rowid, cleanIndexText(content))
 	}
 	return err
 }
 
+func (t *Traffic) pinBlob(hash string) {
+	t.inflightMu.Lock()
+	if t.inflightBlobs == nil {
+		t.inflightBlobs = make(map[string]int)
+	}
+	t.inflightBlobs[hash]++
+	t.inflightMu.Unlock()
+}
+
+func (t *Traffic) unpinBlobs(hashes []string) {
+	t.inflightMu.Lock()
+	for _, h := range hashes {
+		if n := t.inflightBlobs[h]; n <= 1 {
+			delete(t.inflightBlobs, h)
+		} else {
+			t.inflightBlobs[h] = n - 1
+		}
+	}
+	t.inflightMu.Unlock()
+}
+
+func (t *Traffic) isBlobPinned(hash string) bool {
+	t.inflightMu.Lock()
+	n := t.inflightBlobs[hash]
+	t.inflightMu.Unlock()
+	return n > 0
+}
+
+func (t *Traffic) snapshotPinnedBlobs(dst map[string]struct{}) {
+	t.inflightMu.Lock()
+	for h := range t.inflightBlobs {
+		dst[h] = struct{}{}
+	}
+	t.inflightMu.Unlock()
+}
+
 // storedBody is one body after the inline/spill decision: inline is what goes in
 // the database column (the whole body, or a preview when spilled), hash names the
-// blob when it spilled, and index is the text handed to FTS (empty for binary).
+// blob when it spilled, and index is the text handed to FTS (empty for binary or
+// skipped static assets).
 type storedBody struct {
 	inline []byte
 	hash   string
 	index  string
 }
 
-// spill decides where one body lives. Small bodies stay inline. Large ones are
-// written to the content-addressed store and keep a readable preview inline so a
-// reader can identify them without fetching the blob. Either way, text bodies
-// are handed to the full-text index in full (up to maxIndexBody) — indexing is
-// independent of where the bytes end up.
-func (t *Traffic) spill(body []byte, contentType string) storedBody {
+func (t *Traffic) ensureBlobFile(h string, body []byte) error {
+	blobDir := filepath.Join(t.dir, "_blobs", "sha256", h[:2])
+	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+		return err
+	}
+	blobPath := filepath.Join(blobDir, h+".bin")
+	if _, err := os.Stat(blobPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	tmp, err := os.CreateTemp(blobDir, ".blob-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	_ = os.Chmod(tmpName, 0o644)
+	if err := os.Rename(tmpName, blobPath); err != nil {
+		_ = os.Remove(tmpName)
+		if _, statErr := os.Stat(blobPath); statErr == nil {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// spillOutsideLock decides whether body stays inline or spills to the
+// content-addressed blob store. Blobs are pinned before writing so concurrent
+// blob GC cannot reap them before the DB transaction inserts blob_refs.
+func (t *Traffic) spillOutsideLock(body []byte, contentType string, skipIndex bool, pinned *[]string) storedBody {
 	if len(body) == 0 {
 		return storedBody{}
 	}
 	text := !isBinaryBody(contentType, body)
 	indexText := func() string {
-		if !text {
+		if !text || skipIndex {
 			return ""
 		}
-		return string(clipBytes(body, maxIndexBody))
+		return truncateUTF8(body, maxIndexBody)
 	}
 	if len(body) <= maxInlineBody {
 		return storedBody{inline: body, index: indexText()}
@@ -537,19 +1021,11 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 
 	sum := sha256.Sum256(body)
 	h := hex.EncodeToString(sum[:])
-	// One bucket level (256 buckets) is enough to keep any single directory small;
-	// the store only ever holds bodies above maxInlineBody, deduplicated by hash.
-	blobDir := filepath.Join(t.dir, "_blobs", "sha256", h[:2])
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
-		log.Printf("[traffic] 创建 blob 目录失败：%v", err)
+	t.pinBlob(h)
+	*pinned = append(*pinned, h)
+	if err := t.ensureBlobFile(h, body); err != nil {
+		log.Printf("[traffic] 写 blob %s 失败：%v", h, err)
 		return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
-	}
-	blobPath := filepath.Join(blobDir, h+".bin")
-	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-		if err := os.WriteFile(blobPath, body, 0o644); err != nil {
-			log.Printf("[traffic] 写 blob %s 失败：%v", h, err)
-			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
-		}
 	}
 	sb := storedBody{hash: h, index: indexText()}
 	if text {
@@ -558,6 +1034,54 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 		sb.inline = []byte(binaryTag(contentType, body))
 	}
 	return sb
+}
+
+// staticAssetExts lists static asset extensions whose response bodies bloat
+// trigram full-text indexes without adding search value (URL + headers remain indexed).
+var staticAssetExts = map[string]struct{}{
+	".js":    {},
+	".css":   {},
+	".png":   {},
+	".jpg":   {},
+	".jpeg":  {},
+	".gif":   {},
+	".webp":  {},
+	".svg":   {},
+	".woff":  {},
+	".woff2": {},
+	".ttf":   {},
+	".ico":   {},
+	".map":   {},
+}
+
+// skipIndexContentTypes lists binary content-type prefixes skipped from ex_fts body indexing.
+var skipIndexContentTypes = []string{
+	"image/", "font/", "audio/", "video/",
+	"application/octet-stream", "application/wasm",
+}
+
+// shouldSkipRespBodyIndex reports whether a response body should be omitted from
+// ex_fts full-text indexing (URL and HTTP headers are still indexed).
+func shouldSkipRespBodyIndex(urlOrPath, contentType string) bool {
+	p := urlOrPath
+	if idx := strings.IndexAny(p, "?#"); idx >= 0 {
+		p = p[:idx]
+	}
+	if ext := strings.ToLower(path.Ext(p)); ext != "" {
+		if _, ok := staticAssetExts[ext]; ok {
+			return true
+		}
+	}
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	for _, prefix := range skipIndexContentTypes {
+		if strings.HasPrefix(ct, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // binaryTypes are content-type prefixes whose bodies are never worth indexing or
@@ -647,12 +1171,15 @@ func headerLines(h map[string][]string) string {
 // requestHeaderLines restores the HTTP Host header, which net/http stores on
 // Request.Host rather than in Header. Keeping it in request.http makes the raw
 // capture complete and directly replayable.
-func requestHeaderLines(req *mproxy.Request) string {
+func requestHeaderLines(req *capturedRequest) string {
 	headers := req.Header.Clone()
 	headers.Del("Host")
-	host := req.URL.Host
-	if raw := req.Raw(); raw != nil && strings.TrimSpace(raw.Host) != "" {
-		host = raw.Host
+	host := ""
+	if req.URL != nil {
+		host = req.URL.Host
+	}
+	if strings.TrimSpace(req.Host) != "" {
+		host = req.Host
 	}
 	var b strings.Builder
 	if host = strings.TrimSpace(host); host != "" {
@@ -768,7 +1295,7 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	args := []any{}
 	if host != "" {
 		q += ` WHERE host=?`
-		args = append(args, host)
+		args = append(args, strings.ToLower(strings.TrimSpace(host)))
 	}
 	q += ` ORDER BY ts DESC LIMIT ? OFFSET ?`
 	args = append(args, size, page*size)
@@ -1442,6 +1969,10 @@ func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64)
 	unique := make([]string, 0, len(hosts))
 	seen := make(map[string]struct{}, len(hosts))
 	for _, host := range hosts {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host == "" {
+			continue
+		}
 		if _, ok := seen[host]; ok {
 			continue
 		}
@@ -1703,8 +2234,7 @@ func (t *Traffic) indexBytes() int64 {
 //
 // The work is done in the background, in bounded steps that drop the write lock
 // between them, because it is proportional to what was deleted — freeing several
-// gigabytes under one lock would stall record(), which go-mitmproxy calls before
-// it replies to the client, and so would stall the requests being recorded.
+// gigabytes under one lock would stall background persistence batches.
 // Safe to call with wmu held: the background pass simply waits for it.
 //
 // Best-effort throughout. Failing to reclaim costs disk space, never
@@ -1806,14 +2336,48 @@ func (t *Traffic) reclaimChunk(ctx context.Context, conn *sql.Conn, merges *int)
 	return progressed || after < before, nil
 }
 
+func (t *Traffic) beginExport() {
+	t.exportMu.Lock()
+	t.exportsInFlight++
+	t.exportMu.Unlock()
+}
+
+func (t *Traffic) endExport() {
+	t.exportMu.Lock()
+	t.exportsInFlight--
+	runGC := t.exportsInFlight == 0 && t.gcDeferred
+	if runGC {
+		t.gcDeferred = false
+	}
+	t.exportMu.Unlock()
+	if runGC {
+		t.startReaper(func() {
+			t.wmu.Lock()
+			defer t.wmu.Unlock()
+			_ = t.gcBlobs()
+		})
+	}
+}
+
+func (t *Traffic) deferGCIfExporting() bool {
+	t.exportMu.Lock()
+	defer t.exportMu.Unlock()
+	if t.exportsInFlight > 0 {
+		t.gcDeferred = true
+		return true
+	}
+	return false
+}
+
 // gcBlobs removes blobs that no remaining exchange references. Live references
-// come from blob_refs, so collection is one query plus a sweep of the blob
-// directory — no exchange body is ever read. Emptied bucket directories are
-// removed as well; the previous file-scanning collector deleted only files and
-// left the buckets behind permanently. Best-effort: walk errors only skip the
-// affected entries. Callers must hold wmu so this never races a concurrent
-// record() writing a fresh blob + reference.
+// come from blob_refs plus any blobs currently pinned by an in-flight batch
+// spilling outside wmu. Emptied bucket directories are removed as well.
+// Best-effort: walk errors only skip the affected entries. Callers must hold wmu.
 func (t *Traffic) gcBlobs() error {
+	if t.deferGCIfExporting() {
+		return nil
+	}
+	t.gcGen.Add(1)
 	refs := make(map[string]struct{})
 	rows, err := t.db.Query(`SELECT DISTINCT hash FROM blob_refs`)
 	if err != nil {
@@ -1834,6 +2398,7 @@ func (t *Traffic) gcBlobs() error {
 	if err := t.legacyBlobRefs(refs); err != nil {
 		return err
 	}
+	t.snapshotPinnedBlobs(refs)
 
 	root := filepath.Join(t.dir, "_blobs", "sha256")
 	var buckets []string
@@ -1847,8 +2412,15 @@ func (t *Traffic) gcBlobs() error {
 			}
 			return nil
 		}
-		h := strings.TrimSuffix(d.Name(), ".bin")
-		if _, ok := refs[h]; !ok {
+		name := d.Name()
+		if strings.HasPrefix(name, ".blob-") || !strings.HasSuffix(name, ".bin") {
+			return nil
+		}
+		h := strings.TrimSuffix(name, ".bin")
+		if _, ok := refs[h]; !ok && !t.isBlobPinned(h) {
+			if t.deferGCIfExporting() {
+				return filepath.SkipAll
+			}
 			os.Remove(p)
 		}
 		return nil
@@ -1863,6 +2435,210 @@ func (t *Traffic) gcBlobs() error {
 		os.Remove(b)
 	}
 	return nil
+}
+
+// deleteWhereContext mirrors deleteWhere while honoring ctx cancellation.
+func (t *Traffic) deleteWhereContext(ctx context.Context, tx *indexTx, where string, args ...any) (int64, error) {
+	if t.fts {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM ex_fts WHERE rowid IN (SELECT rowid FROM exchanges WHERE `+where+`)`, args...); err != nil {
+			return 0, fmt.Errorf("删除全文索引: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM exchange_bodies WHERE id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("删除正文: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("删除 blob 引用: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM exchanges WHERE `+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("删除索引行: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// protectedExchangeNotInClause returns a SQL predicate that evaluates true only
+// for exchanges NOT referenced by finding evidence bindings.
+func (t *Traffic) protectedExchangeNotInClause(ctx context.Context, tx *indexTx) (string, error) {
+	var clauses []string
+	if t.db.postgres {
+		var hasEvidence bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT to_regclass('public.finding_traffic_bindings') IS NOT NULL AND to_regclass('public.traffic_evidence_snapshots') IS NOT NULL`,
+		).Scan(&hasEvidence); err != nil {
+			return "", err
+		}
+		if hasEvidence {
+			clauses = append(clauses, `id NOT IN (SELECT s.source_traffic_id FROM public.traffic_evidence_snapshots s JOIN public.finding_traffic_bindings b ON b.snapshot_id = s.id WHERE s.source_traffic_id IS NOT NULL)`)
+		}
+		var ftCol string
+		err := tx.QueryRowContext(ctx,
+			`SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='finding_traffic' AND column_name IN ('exchange_id','traffic_id') ORDER BY column_name LIMIT 1`,
+		).Scan(&ftCol)
+		if err == nil && (ftCol == "exchange_id" || ftCol == "traffic_id") {
+			clauses = append(clauses, `id NOT IN (SELECT `+ftCol+` FROM public.finding_traffic WHERE `+ftCol+` IS NOT NULL)`)
+		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	} else {
+		var count int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('finding_traffic_bindings','traffic_evidence_snapshots')`,
+		).Scan(&count); err != nil {
+			return "", err
+		}
+		if count == 2 {
+			clauses = append(clauses, `id NOT IN (SELECT s.source_traffic_id FROM traffic_evidence_snapshots s JOIN finding_traffic_bindings b ON b.snapshot_id = s.id WHERE s.source_traffic_id IS NOT NULL)`)
+		}
+		var hasFT int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='finding_traffic'`,
+		).Scan(&hasFT); err != nil {
+			return "", err
+		}
+		if hasFT == 1 {
+			rows, err := tx.Tx.QueryContext(ctx, `PRAGMA table_info(finding_traffic)`)
+			if err != nil {
+				return "", err
+			}
+			var ftCol string
+			for rows.Next() {
+				var cid int
+				var name, ctype string
+				var notnull, pk int
+				var dflt any
+				if scanErr := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); scanErr == nil {
+					if name == "exchange_id" || name == "traffic_id" {
+						ftCol = name
+						break
+					}
+				}
+			}
+			_ = rows.Close()
+			if ftCol != "" {
+				clauses = append(clauses, `id NOT IN (SELECT `+ftCol+` FROM finding_traffic WHERE `+ftCol+` IS NOT NULL)`)
+			}
+		}
+	}
+	if len(clauses) == 0 {
+		return "1=1", nil
+	}
+	return strings.Join(clauses, " AND "), nil
+}
+
+// PruneExchanges enforces retention bounds by deleting exchanges older than
+// maxAge (if > 0) and then trimming the oldest rows exceeding maxRows (if > 0),
+// while preserving any exchange referenced by finding evidence bindings.
+// Orphaned content-addressed blobs are garbage-collected afterwards.
+func (t *Traffic) PruneExchanges(ctx context.Context, maxAge time.Duration, maxRows int) (int64, error) {
+	if t == nil || t.db == nil || (maxAge <= 0 && maxRows <= 0) {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	notProtected, err := t.protectedExchangeNotInClause(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+
+	var totalDeleted int64
+	if maxAge > 0 {
+		cutoff := time.Now().Add(-maxAge).Unix()
+		n, err := t.deleteWhereContext(ctx, tx, `ts < ? AND `+notProtected, cutoff)
+		if err != nil {
+			return 0, err
+		}
+		totalDeleted += n
+	}
+
+	if maxRows > 0 {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM exchanges`).Scan(&count); err != nil {
+			return 0, err
+		}
+		if count > maxRows {
+			excess := count - maxRows
+			n, err := t.deleteWhereContext(ctx, tx,
+				`id IN (SELECT id FROM exchanges WHERE `+notProtected+` ORDER BY ts ASC, id ASC LIMIT ?)`,
+				excess)
+			if err != nil {
+				return 0, err
+			}
+			totalDeleted += n
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	if totalDeleted > 0 {
+		t.reclaim()
+		if err := t.gcBlobs(); err != nil {
+			return totalDeleted, err
+		}
+	}
+	return totalDeleted, nil
+}
+
+// startRetention runs periodic retention pruning until Close cancels t.closed.
+func (t *Traffic) startRetention(interval, maxAge time.Duration, maxRows int) {
+	if interval <= 0 || (maxAge <= 0 && maxRows <= 0) {
+		return
+	}
+	t.lifecycleMu.Lock()
+	if t.closing {
+		t.lifecycleMu.Unlock()
+		return
+	}
+	t.retentionWG.Add(1)
+	t.lifecycleMu.Unlock()
+
+	go func() {
+		defer t.retentionWG.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-t.closed:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				stopWatch := make(chan struct{})
+				go func() {
+					select {
+					case <-t.closed:
+						cancel()
+					case <-stopWatch:
+					}
+				}()
+				n, err := t.PruneExchanges(ctx, maxAge, maxRows)
+				close(stopWatch)
+				cancel()
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("[traffic] 定时清理历史流量失败：%v", err)
+				} else if n > 0 {
+					log.Printf("[traffic] 定时清理过期/超限流量 %d 条", n)
+				}
+			}
+		}
+	}()
 }
 
 // legacyBlobRefs adds hashes referenced by pre-SQLite exchanges, whose bodies are

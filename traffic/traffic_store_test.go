@@ -9,33 +9,31 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
 )
 
 // flowOpt tweaks the synthetic flow built by newFlow.
-type flowOpt func(*mproxy.Flow)
+type flowOpt func(*capturedFlow)
 
 func withRespType(ct string) flowOpt {
-	return func(f *mproxy.Flow) { f.Response.Header.Set("Content-Type", ct) }
+	return func(f *capturedFlow) { f.Response.Header.Set("Content-Type", ct) }
 }
 
 // newFlow builds the minimal flow record() needs: a request with a URL, method
 // and body, plus a response with a status and body.
-func newFlow(host, method, path string, reqBody, respBody []byte, opts ...flowOpt) *mproxy.Flow {
+func newFlow(host, method, path string, reqBody, respBody []byte, opts ...flowOpt) *capturedFlow {
 	u, err := url.Parse("http://" + host + path)
 	if err != nil {
 		panic(err)
 	}
-	f := &mproxy.Flow{
-		Request: &mproxy.Request{
+	f := &capturedFlow{
+		Request: &capturedRequest{
 			Method: method,
 			URL:    u,
 			Proto:  "HTTP/1.1",
 			Header: http.Header{"Content-Type": []string{"application/json"}},
 			Body:   reqBody,
 		},
-		Response: &mproxy.Response{
+		Response: &capturedResponse{
 			StatusCode: 200,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       respBody,
@@ -378,7 +376,7 @@ func TestPageSearchesBodies(t *testing.T) {
 // server-side sorting by resp_len.
 func TestPageFiltersAndSort(t *testing.T) {
 	tr, _ := openTraffic(t)
-	status := func(code int) flowOpt { return func(f *mproxy.Flow) { f.Response.StatusCode = code } }
+	status := func(code int) flowOpt { return func(f *capturedFlow) { f.Response.StatusCode = code } }
 	// Three exchanges with distinct status codes and response sizes.
 	tr.record(newFlow("api.example.com", "GET", "/api/users", nil, make([]byte, 10), status(200)))
 	tr.record(newFlow("api.example.com", "GET", "/api/admin", nil, make([]byte, 100), status(404)))

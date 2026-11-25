@@ -2,6 +2,7 @@ package traffic
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RC-CHN/ARTEX/db"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 )
@@ -126,10 +128,19 @@ func openPostgres(dir, addr, dsn, schema string) (*Traffic, error) {
 	quotedSchema := pgx.Identifier{schema}.Sanitize()
 	cfg.RuntimeParams["search_path"] = quotedSchema + ",public"
 	cfg.RuntimeParams["application_name"] = "artex-traffic"
-	cfg.RuntimeParams["statement_timeout"] = "120000"
+	if _, ok := cfg.RuntimeParams["statement_timeout"]; !ok {
+		cfg.RuntimeParams["statement_timeout"] = "30000"
+	}
+	if _, ok := cfg.RuntimeParams["lock_timeout"]; !ok {
+		cfg.RuntimeParams["lock_timeout"] = "5000"
+	}
+	if _, ok := cfg.RuntimeParams["idle_in_transaction_session_timeout"]; !ok {
+		cfg.RuntimeParams["idle_in_transaction_session_timeout"] = "30000"
+	}
 	d := stdlib.OpenDB(*cfg)
-	d.SetMaxOpenConns(8)
-	d.SetMaxIdleConns(8)
+	d.SetMaxOpenConns(4)
+	d.SetMaxIdleConns(2)
+	d.SetConnMaxLifetime(30 * time.Minute)
 	d.SetConnMaxIdleTime(5 * time.Minute)
 	t := &Traffic{dir: dir, addr: addr, db: &indexDB{DB: d, postgres: true}, fts: true, closed: make(chan struct{})}
 	fail := func(err error) (*Traffic, error) { d.Close(); return nil, err }
@@ -141,13 +152,20 @@ func openPostgres(dir, addr, dsn, schema string) (*Traffic, error) {
 	}
 	defer tx.Rollback()
 	// Backfills can exceed the normal request timeout. Keep the longer budget
-	// local to this transaction; pooled runtime connections retain two minutes.
+	// local to this transaction; pooled runtime connections retain 30s/5s limits.
 	if _, err := tx.ExecContext(ctx, `SELECT set_config('statement_timeout',$1,true)`, strconv.FormatInt(migrationTimeout.Milliseconds(), 10)); err != nil {
 		tx.Rollback()
 		return fail(err)
 	}
+	if _, err := tx.ExecContext(ctx, `SELECT set_config('lock_timeout','0',true)`); err != nil {
+		tx.Rollback()
+		return fail(err)
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, db.LockTrafficSchemaInit); err != nil {
+		tx.Rollback()
+		return fail(fmt.Errorf("initialize traffic PostgreSQL schema: %w", err))
+	}
 	for _, query := range []string{
-		`SELECT pg_advisory_xact_lock(7337741003)`,
 		`CREATE SCHEMA IF NOT EXISTS ` + quotedSchema,
 		`CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public`,
 		postgresSchema,
@@ -161,7 +179,7 @@ func openPostgres(dir, addr, dsn, schema string) (*Traffic, error) {
 	if err := tx.Commit(); err != nil {
 		return fail(err)
 	}
-	if err := t.migrateSQLite(); err != nil {
+	if err := t.migrateSQLite(migrationTimeout); err != nil {
 		return fail(fmt.Errorf("migrate traffic SQLite index: %w", err))
 	}
 	return t.startProxy()
@@ -173,8 +191,26 @@ func openPostgres(dir, addr, dsn, schema string) (*Traffic, error) {
 func (t *Traffic) vacuumPostgres() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	conn, err := t.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// VACUUM cannot run inside a transaction block (where SET LOCAL applies),
+	// so raise statement_timeout on this checked-out session and RESET on return.
+	if _, err := conn.ExecContext(ctx, `SET statement_timeout = '120s'`); err != nil {
+		return err
+	}
+	defer func() {
+		resetCtx, resetCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer resetCancel()
+		if _, err := conn.ExecContext(resetCtx, `RESET statement_timeout`); err != nil {
+			// Discard the tainted connection so statement_timeout='120s' never leaks back into the pool.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}()
 	for _, table := range []string{"ex_fts", "exchange_bodies", "blob_refs", "exchanges"} {
-		if _, err := t.db.ExecContext(ctx, `VACUUM (ANALYZE) `+table); err != nil {
+		if _, err := conn.ExecContext(ctx, `VACUUM (ANALYZE) `+table); err != nil {
 			return err
 		}
 	}
@@ -185,12 +221,14 @@ func (t *Traffic) vacuumPostgres() error {
 // matters for both legacy migration and archive restore (the FTS5 source index
 // was contentless, so its text cannot be copied).
 func (t *Traffic) exchangeSearchText(item ArchiveExchange) (string, error) {
-	parts := []string{item.URL, item.ReqHead}
+	var reqBodyIdx, respBodyIdx string
 	for i, body := range [][]byte{item.ReqBody, item.RespBody} {
 		hash := []string{item.ReqBlob, item.RespBlob}[i]
 		ct := item.ContentType
 		if i == 0 {
 			ct = headerContentType(item.ReqHead)
+		} else if shouldSkipRespBodyIndex(item.URL, ct) {
+			continue
 		}
 		if hash != "" {
 			f, _, err := t.Blob(hash)
@@ -204,13 +242,14 @@ func (t *Traffic) exchangeSearchText(item ArchiveExchange) (string, error) {
 			}
 		}
 		if !isBinaryBody(ct, body) {
-			parts = append(parts, truncateUTF8(body, maxIndexBody))
-		}
-		if i == 0 {
-			parts = append(parts, item.RespHead)
+			if i == 0 {
+				reqBodyIdx = truncateUTF8(body, maxIndexBody)
+			} else {
+				respBodyIdx = truncateUTF8(body, maxIndexBody)
+			}
 		}
 	}
-	return strings.Join(parts, "\n"), nil
+	return buildSearchDocument(item.URL, item.ReqHead, reqBodyIdx, item.RespHead, respBodyIdx), nil
 }
 
 func headerContentType(header string) string {

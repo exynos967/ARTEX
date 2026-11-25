@@ -4,8 +4,6 @@ import (
 	"errors"
 	"net/url"
 	"testing"
-
-	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
 )
 
 func TestHostOnly(t *testing.T) {
@@ -46,23 +44,23 @@ func TestProxyCausedErr(t *testing.T) {
 
 func TestMaybePassthroughFlagsHostOnce(t *testing.T) {
 	tr := &Traffic{}
-	f := &mproxy.Flow{Request: &mproxy.Request{URL: &url.URL{Host: "target.test:443"}}}
+	f := &capturedFlow{Request: &capturedRequest{URL: &url.URL{Host: "target.test:443"}}}
 
 	// Target-caused error → do NOT flag (keep MITM + recording).
 	tr.maybePassthrough(f, errors.New("connection refused"))
-	if _, ok := tr.pass.Load("target.test"); ok {
+	if tr.isPassthrough("target.test") {
 		t.Fatal("target-caused error must not flag passthrough")
 	}
 
 	// Proxy-caused error → flag the host for transparent passthrough.
 	tr.maybePassthrough(f, errors.New("protocol error: received DATA on a HEAD request"))
-	if _, ok := tr.pass.Load("target.test"); !ok {
+	if !tr.isPassthrough("target.test") {
 		t.Fatal("proxy-caused error must flag passthrough")
 	}
 
 	// The shouldIntercept rule uses hostOnly(req.Host); the CONNECT host carries a
 	// port, so it must resolve to the same flagged key → intercept=false (tunnel).
-	if _, tunnel := tr.pass.Load(hostOnly("target.test:443")); !tunnel {
+	if !tr.isPassthrough("target.test:443") {
 		t.Fatal("flagged host must be recognized for the CONNECT form with port")
 	}
 }
