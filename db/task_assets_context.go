@@ -203,7 +203,7 @@ func (s *AssetStore) HostsByTaskWithSources(taskID int64) ([]string, error) {
 context_assets AS (
   SELECT DISTINCT a.id
   FROM assets a
-  WHERE EXISTS (SELECT 1 FROM context_tasks ctx WHERE ctx.task_id=ANY(a.task_ids))
+  WHERE EXISTS (SELECT 1 FROM context_tasks ctx WHERE a.task_ids @> ARRAY[ctx.task_id]::bigint[])
   UNION
   SELECT ea.asset_id
   FROM exploration_anchors ea

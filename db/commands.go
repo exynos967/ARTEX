@@ -58,7 +58,7 @@ func (d *DB) ToolStats(expID *int64, q string) ([]ToolStat, error) {
 SELECT COALESCE(NULLIF(u.tool,''),'-') AS tool, COUNT(*) AS total,
        COUNT(*) FILTER (WHERE COALESCE(r.is_error,false)) AS errors
 FROM activity u
-LEFT JOIN activity r ON r.tool_use_id = u.tool_use_id AND r.kind = 'tool_result'
+LEFT JOIN activity r ON r.exploration_id = u.exploration_id AND r.tool_use_id = u.tool_use_id AND r.kind = 'tool_result'
 `+where+`
 GROUP BY 1
 ORDER BY total DESC, tool ASC`, args...)
@@ -78,13 +78,22 @@ ORDER BY total DESC, tool ASC`, args...)
 	return out, rows.Err()
 }
 
+// clampRecordPageSize bounds list page sizes for commands and LLM records.
+func clampRecordPageSize(size int) int {
+	if size <= 0 {
+		return 50
+	}
+	if size > 200 {
+		return 200
+	}
+	return size
+}
+
 // ListCommands returns tool executions (tool_use + paired tool_result) across all
 // explorations, with optional filtering and pagination. Covers every tool, not
 // just Bash; q matches the tool name or its input.
 func (d *DB) ListCommands(expID *int64, q string, page, size int) ([]CommandRecord, int, error) {
-	if size <= 0 {
-		size = 50
-	}
+	size = clampRecordPageSize(size)
 	if page < 0 {
 		page = 0
 	}
@@ -104,7 +113,7 @@ func (d *DB) ListCommands(expID *int64, q string, page, size int) ([]CommandReco
 SELECT u.id, u.exploration_id, COALESCE(u.worker,''), COALESCE(u.tool,''), COALESCE(u.detail,''),
        COALESCE(r.detail,''), COALESCE(r.is_error, false), u.created_at
 FROM activity u
-LEFT JOIN activity r ON r.tool_use_id = u.tool_use_id AND r.kind = 'tool_result'
+LEFT JOIN activity r ON r.exploration_id = u.exploration_id AND r.tool_use_id = u.tool_use_id AND r.kind = 'tool_result'
 ` + where + `
 ORDER BY u.id DESC
 LIMIT $` + fmt.Sprintf("%d", argN) + ` OFFSET $` + fmt.Sprintf("%d", argN+1)
@@ -179,13 +188,16 @@ CREATE INDEX IF NOT EXISTS idx_llm_records_ts ON llm_records(ts);
 CREATE INDEX IF NOT EXISTS idx_llm_records_session ON llm_records(session_id);
 `
 
-// llmRecordsMigrate adds new columns to existing tables.
+// llmRecordsMigrate adds new columns and indexes to existing tables.
 const llmRecordsMigrate = `
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS task_id TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS worker TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS profile_name TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_request TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_response TEXT;
+CREATE INDEX IF NOT EXISTS idx_llm_records_task_id ON llm_records(task_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_records_model_id ON llm_records(model, id DESC);
+ALTER TABLE llm_records SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
 `
 
 // EnsureLLMRecordsTable creates the llm_records table if it does not exist.
@@ -195,6 +207,9 @@ func (d *DB) EnsureLLMRecordsTable() error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	if err := SetMaintenanceTimeouts(context.Background(), tx); err != nil {
+		return err
+	}
 	if err := coordinateWithSchemaMigration(tx); err != nil {
 		return err
 	}
@@ -227,9 +242,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 
 // ListLLMRecords returns paginated LLM records with optional filters.
 func (d *DB) ListLLMRecords(model, session, task string, page, size int) ([]LLMRecord, int, error) {
-	if size <= 0 {
-		size = 50
-	}
+	size = clampRecordPageSize(size)
 	if page < 0 {
 		page = 0
 	}
@@ -249,7 +262,7 @@ func (d *DB) ListLLMRecords(model, session, task string, page, size int) ([]LLMR
 		argN++
 	}
 	if task != "" {
-		where += fmt.Sprintf(` AND COALESCE(task_id,'') = $%d`, argN)
+		where += fmt.Sprintf(` AND task_id = $%d`, argN)
 		args = append(args, task)
 		argN++
 	}
@@ -305,7 +318,7 @@ type LLMTask struct {
 // first — powers the LLM-records page's task picker.
 func (d *DB) LLMTasks() ([]LLMTask, error) {
 	rows, err := d.Query(`SELECT task_id, COUNT(*) AS n FROM llm_records
-WHERE COALESCE(task_id,'') <> '' GROUP BY task_id ORDER BY MAX(id) DESC`)
+WHERE task_id IS NOT NULL AND task_id <> '' GROUP BY task_id ORDER BY MAX(id) DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +337,15 @@ WHERE COALESCE(task_id,'') <> '' GROUP BY task_id ORDER BY MAX(id) DESC`)
 // DeleteLLMRecords removes every LLM record for one exact task_id — the same
 // match the page's task picker/filter uses. Returns rows deleted.
 func (d *DB) DeleteLLMRecords(task string) (int64, error) {
-	res, err := d.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'') = $1`, task)
+	var (
+		res sql.Result
+		err error
+	)
+	if task == "" {
+		res, err = d.Exec(`DELETE FROM llm_records WHERE task_id IS NULL OR task_id = ''`)
+	} else {
+		res, err = d.Exec(`DELETE FROM llm_records WHERE task_id = $1`, task)
+	}
 	if err != nil {
 		return 0, err
 	}

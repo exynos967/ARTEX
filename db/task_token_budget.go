@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"strconv"
 
 	"github.com/RC-CHN/ARTEX/internal/operation"
 )
@@ -22,31 +21,45 @@ type tokenBudgetReader interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+// taskTokenBudgetQuery reads the task's budget threshold, revision, and
+// trigger-maintained cumulative tokens_used from task_token_counters in one PK
+// lookup. When usage is not required (limit=0 and !includeUsage), PostgreSQL
+// short-circuits the CASE and avoids even the catalog lookup for llm_usage.
+const taskTokenBudgetQuery = `
+SELECT t.token_budget_limit, t.token_budget_revision, COALESCE(c.tokens_used, 0),
+       CASE WHEN t.token_budget_limit > 0 OR $2 THEN to_regclass('llm_usage') IS NOT NULL ELSE false END
+FROM tasks t
+LEFT JOIN task_token_counters c ON c.task_id = t.id
+WHERE t.id=$1 AND t.deleted_at IS NULL AND t.archived_at IS NULL`
+
 func (d *DB) TaskTokenBudget(ctx context.Context, taskID int64, includeUsage bool) (TaskTokenBudget, error) {
 	return taskTokenBudget(ctx, d.DB, taskID, includeUsage)
 }
-func taskTokenBudget(ctx context.Context, q tokenBudgetReader, taskID int64, includeUsage bool) (b TaskTokenBudget, err error) {
-	err = q.QueryRowContext(ctx, `SELECT token_budget_limit,token_budget_revision FROM tasks WHERE id=$1 AND deleted_at IS NULL AND archived_at IS NULL`, taskID).Scan(&b.Limit, &b.Revision)
-	if err != nil {
-		return
-	}
-	if b.Limit == 0 && !includeUsage {
-		return
-	}
+
+func taskTokenBudget(ctx context.Context, q tokenBudgetReader, taskID int64, includeUsage bool) (TaskTokenBudget, error) {
+	var limit, revision, used int64
 	var available bool
-	if err = q.QueryRowContext(ctx, `SELECT to_regclass('llm_usage') IS NOT NULL`).Scan(&available); err != nil {
-		return
+	if err := q.QueryRowContext(ctx, taskTokenBudgetQuery, taskID, includeUsage).Scan(&limit, &revision, &used, &available); err != nil {
+		return TaskTokenBudget{}, err
+	}
+	return evaluateTaskTokenBudget(limit, revision, used, available, includeUsage)
+}
+
+func evaluateTaskTokenBudget(limit, revision, used int64, available, includeUsage bool) (TaskTokenBudget, error) {
+	b := TaskTokenBudget{Limit: limit, Revision: revision}
+	if b.Limit == 0 && !includeUsage {
+		return b, nil
 	}
 	if !available {
 		if b.Limit > 0 {
-			err = &operation.Error{Code: "budget_usage_unavailable", Message: "累计用量暂不可查询。", NextAction: "恢复用量数据库后再开始自动工作；不要推断预算尚未使用。"}
+			return b, &operation.Error{Code: "budget_usage_unavailable", Message: "累计用量暂不可查询。", NextAction: "恢复用量数据库后再开始自动工作；不要推断预算尚未使用。"}
 		}
-		return
+		return b, nil
 	}
-	err = q.QueryRowContext(ctx, `SELECT COALESCE(sum(input_tokens::bigint+output_tokens::bigint),0) FROM llm_usage WHERE task_id=$1`, strconv.FormatInt(taskID, 10)).Scan(&b.Used)
-	b.UsageAvailable = err == nil
+	b.Used = used
+	b.UsageAvailable = true
 	b.Reached = b.Limit > 0 && b.Used >= b.Limit
-	return
+	return b, nil
 }
 
 func (s *ExplorationStore) TaskTokenBudget(ctx context.Context, taskID int64, includeUsage bool) (TaskTokenBudget, error) {

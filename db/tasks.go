@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -52,13 +53,16 @@ type Task struct {
 	CoverageEnabled bool `json:"coverage_enabled"`
 }
 
-// TaskDeleteResult reports optional related-data cleanup performed in the same
-// transaction as the task/exploration delete.
+// TaskDeleteResult reports optional related-data cleanup performed during the
+// task/exploration delete. Tombstoned becomes true as soon as Phase 1 commits
+// (tasks.deleted_at IS NOT NULL and assets detached/deleted), so callers know
+// PostgreSQL has already tombstoned the task even if Phase 2/3 fails later.
 type TaskDeleteResult struct {
 	AssetsDeleted     int64
 	AssetsDetached    int64
 	FindingsDeleted   int64
 	LLMRecordsDeleted int64
+	Tombstoned        bool
 }
 
 // TaskDeletePreparation is produced inside the PostgreSQL deletion transaction
@@ -303,7 +307,7 @@ SELECT $1, asset.id, $3, '任务创建时关联企业：' || company.name
 FROM assets asset
 JOIN companies company ON company.id=asset.company_id
 WHERE asset.company_id=ANY($2::bigint[])
-  AND $1=ANY(asset.task_ids)
+  AND asset.task_ids @> ARRAY[$1]::bigint[]
 ON CONFLICT (task_id, asset_id) DO UPDATE
 SET source=EXCLUDED.source,
     source_summary=EXCLUDED.source_summary,
@@ -542,15 +546,87 @@ func (d *DB) DeleteTaskCascade(id int64, deleteAssets, deleteFindings bool, dele
 	return d.DeleteTaskCascadePrepared(id, deleteAssets, deleteFindings, deleteRecords, nil)
 }
 
+const (
+	taskDeleteBatchSize   = 2000
+	taskDeleteLockTimeout = "5s"
+)
+
+// deleteInBatches executes exec repeatedly until an iteration affects fewer
+// than batchSize rows, keeping each DELETE in a short statement outside table
+// locks.
+func deleteInBatches(exec func() (int64, error), batchSize int) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = taskDeleteBatchSize
+	}
+	var total int64
+	for {
+		n, err := exec()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < int64(batchSize) {
+			return total, nil
+		}
+	}
+}
+
+func (d *DB) execDeleteBatches(query string, args ...any) (int64, error) {
+	return d.execMaintenanceDeleteBatches(context.Background(), false, query, args...)
+}
+
+// execMaintenanceDeleteBatches runs each bounded DELETE batch in its own tiny
+// transaction with maintenance timeouts (so 2000-row deletes never trip the
+// 5s/30s runtime defaults and MVCC xmin advances between batches). When
+// optional is true, PostgreSQL 42P01 (undefined_table) is treated as a no-op.
+func (d *DB) execMaintenanceDeleteBatches(ctx context.Context, optional bool, query string, args ...any) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return deleteInBatches(func() (int64, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		tx, err := d.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, err
+		}
+		defer tx.Rollback() //nolint:errcheck
+		if err := SetMaintenanceTimeouts(ctx, tx); err != nil {
+			return 0, err
+		}
+		res, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			if optional && isUndefinedTable(err) {
+				return 0, nil
+			}
+			return 0, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return n, nil
+	}, taskDeleteBatchSize)
+}
+
 // DeleteTaskCascadePrepared coordinates reversible external deletion with the
 // PostgreSQL cascade. When prepare is non-nil, host ownership is resolved and
-// prepare is invoked inside this transaction while asset and anchor writers are
-// excluded. The locks remain held through commit, closing the window where a
-// host could become shared after its traffic had already been staged.
+// prepare is invoked inside the short asset/anchor lock transaction while asset
+// and anchor writers are excluded, and the task is atomically soft-deleted
+// (deleted_at=now()) before releasing LOCK TABLE. Heavyweight child-table
+// deletes (activity, exploration_nodes/edges, findings, llm_records,
+// side_question_*, etc.) then execute outside LOCK TABLE in bounded 2000-row
+// batches before removing the task and exploration stubs.
 //
-// prepare must only stage reversible work. Any returned error or later database
-// error rolls PostgreSQL back; the caller remains responsible for rolling back
-// external work that its callback staged successfully.
+// prepare must only stage reversible work. Any returned error or database error
+// before the locked step commits rolls PostgreSQL back; the caller remains
+// responsible for rolling back external work that its callback staged. Once
+// Phase 1 commits, result.Tombstoned is set to true even if a later compaction
+// batch fails.
 func (d *DB) DeleteTaskCascadePrepared(
 	id int64,
 	deleteAssets, deleteFindings, deleteLLMRecords bool,
@@ -561,7 +637,10 @@ func (d *DB) DeleteTaskCascadePrepared(
 	if err != nil {
 		return result, err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() //nolint:errcheck
+	if err := SetMaintenanceTimeouts(context.Background(), tx); err != nil {
+		return result, err
+	}
 	var expID int64
 	if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id=$1 FOR UPDATE`, id).Scan(&expID); err != nil {
 		if err == sql.ErrNoRows {
@@ -571,10 +650,13 @@ func (d *DB) DeleteTaskCascadePrepared(
 	}
 
 	// SHARE ROW EXCLUSIVE conflicts with every INSERT/UPDATE/DELETE on these
-	// tables and with another coordinated deletion. Taking both in one fixed order
-	// prevents phantoms (a distinct asset row for the same host) as well as new
-	// ownership/anchor references until the deletion transaction commits.
+	// tables and with another coordinated deletion. Keep this lock strictly
+	// scoped to host resolution/prepare + asset/anchor detach/delete + tombstone;
+	// never hold it across heavyweight child-table deletes.
 	if deleteAssets || prepare != nil {
+		if _, err := tx.Exec(`SET LOCAL lock_timeout = '` + taskDeleteLockTimeout + `'`); err != nil {
+			return result, err
+		}
 		if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 			return result, err
 		}
@@ -598,7 +680,7 @@ func (d *DB) DeleteTaskCascadePrepared(
 		// evidence anchored by another task.
 		res, err := tx.Exec(`
 WITH candidate_assets AS (
-  SELECT id FROM assets WHERE $1 = ANY(task_ids)
+  SELECT id FROM assets WHERE task_ids @> ARRAY[$1]::bigint[]
   UNION
   SELECT ea.asset_id
   FROM exploration_anchors ea
@@ -626,33 +708,163 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 		}
 		result.AssetsDeleted, _ = res.RowsAffected()
 
-		res, err = tx.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, id)
+		res, err = tx.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE task_ids @> ARRAY[$1]::bigint[]`, id)
 		if err != nil {
 			return result, err
 		}
 		result.AssetsDetached, _ = res.RowsAffected()
 	}
-	if deleteFindings {
-		res, err := tx.Exec(`DELETE FROM findings WHERE task_id = $1`, id)
-		if err != nil {
+	if deleteAssets || prepare != nil {
+		if _, err := tx.Exec(`DELETE FROM exploration_anchors WHERE node_id IN (SELECT id FROM exploration_nodes WHERE exploration_id=$1)`, expID); err != nil {
 			return result, err
 		}
-		result.FindingsDeleted, _ = res.RowsAffected()
+	}
+	// Mark the task tombstone atomically before releasing LOCK TABLE so no live
+	// query or concurrent asset ownership check can observe this task again.
+	if _, err := tx.Exec(`UPDATE tasks SET deleted_at = COALESCE(deleted_at, now()) WHERE id=$1`, id); err != nil {
+		return result, err
+	}
+	if err := tx.Commit(); err != nil {
+		return result, err
+	}
+	result.Tombstoned = true
+
+	result.FindingsDeleted, result.LLMRecordsDeleted, err = d.completeTaskDeleteCompaction(id, expID, deleteFindings, deleteLLMRecords)
+	return result, err
+}
+
+func (d *DB) completeTaskDeleteCompaction(id, expID int64, deleteFindings, deleteLLMRecords bool) (findingsDeleted, llmRecordsDeleted int64, err error) {
+	return d.completeTaskDeleteCompactionContext(context.Background(), id, expID, deleteFindings, deleteLLMRecords)
+}
+
+func (d *DB) completeTaskDeleteCompactionContext(ctx context.Context, id, expID int64, deleteFindings, deleteLLMRecords bool) (findingsDeleted, llmRecordsDeleted int64, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Perform heavyweight deletes outside LOCK TABLE in bounded batches so
+	// concurrent asset/task writers are never stalled.
+	if deleteFindings {
+		if _, err = d.execMaintenanceDeleteBatches(ctx, false, `DELETE FROM finding_traffic_bindings
+WHERE id IN (
+  SELECT b.id FROM finding_traffic_bindings b
+  JOIN findings f ON f.id=b.finding_id
+  WHERE f.task_id=$1 LIMIT $2
+)`, id, taskDeleteBatchSize); err != nil {
+			return findingsDeleted, llmRecordsDeleted, err
+		}
+		if _, err = d.execMaintenanceDeleteBatches(ctx, false, `DELETE FROM finding_retests
+WHERE id IN (
+  SELECT r.id FROM finding_retests r
+  JOIN findings f ON f.id=r.finding_id
+  WHERE f.task_id=$1 LIMIT $2
+)`, id, taskDeleteBatchSize); err != nil {
+			return findingsDeleted, llmRecordsDeleted, err
+		}
+		findingsDeleted, err = d.execMaintenanceDeleteBatches(ctx, false, `DELETE FROM findings
+WHERE id IN (SELECT id FROM findings WHERE task_id=$1 LIMIT $2)`, id, taskDeleteBatchSize)
+		if err != nil {
+			return findingsDeleted, llmRecordsDeleted, err
+		}
 	}
 	if deleteLLMRecords {
-		res, err := tx.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(id, 10))
+		llmRecordsDeleted, err = d.execMaintenanceDeleteBatches(ctx, true, `DELETE FROM llm_records
+WHERE id IN (SELECT id FROM llm_records WHERE task_id=$1 LIMIT $2)`, strconv.FormatInt(id, 10), taskDeleteBatchSize)
 		if err != nil {
-			return result, err
+			return findingsDeleted, llmRecordsDeleted, err
 		}
-		result.LLMRecordsDeleted, _ = res.RowsAffected()
 	}
 	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
 	// task — it is kept as historical accounting even after the task is gone.
-	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
-		return result, err
+	for _, step := range []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM side_question_requests WHERE id IN (SELECT r.id FROM side_question_requests r JOIN side_question_sessions s ON s.session_key=r.session_key WHERE s.task_id=$1 LIMIT $2)`, []any{id, taskDeleteBatchSize}},
+		{`DELETE FROM side_question_sessions WHERE session_key IN (SELECT session_key FROM side_question_sessions WHERE task_id=$1 LIMIT $2)`, []any{id, taskDeleteBatchSize}},
+		{`DELETE FROM worker_budget_events WHERE id IN (SELECT id FROM worker_budget_events WHERE task_id=$1 LIMIT $2)`, []any{id, taskDeleteBatchSize}},
+		{`DELETE FROM task_deployment_events WHERE id IN (SELECT id FROM task_deployment_events WHERE task_id=$1 LIMIT $2)`, []any{id, taskDeleteBatchSize}},
+		{`DELETE FROM activity WHERE id IN (SELECT id FROM activity WHERE exploration_id=$1 LIMIT $2)`, []any{expID, taskDeleteBatchSize}},
+		{`DELETE FROM main_requests WHERE id IN (SELECT id FROM main_requests WHERE exploration_id=$1 LIMIT $2)`, []any{expID, taskDeleteBatchSize}},
+		{`DELETE FROM task_constraints WHERE id IN (SELECT id FROM task_constraints WHERE exploration_id=$1 LIMIT $2)`, []any{expID, taskDeleteBatchSize}},
+		{`DELETE FROM exploration_anchors WHERE ctid IN (SELECT a.ctid FROM exploration_anchors a JOIN exploration_nodes n ON n.id=a.node_id WHERE n.exploration_id=$1 LIMIT $2)`, []any{expID, taskDeleteBatchSize}},
+		{`DELETE FROM exploration_edges WHERE ctid IN (SELECT ctid FROM exploration_edges WHERE exploration_id=$1 LIMIT $2)`, []any{expID, taskDeleteBatchSize}},
+		{`DELETE FROM exploration_nodes WHERE id IN (SELECT id FROM exploration_nodes WHERE exploration_id=$1 LIMIT $2)`, []any{expID, taskDeleteBatchSize}},
+	} {
+		if _, err = d.execMaintenanceDeleteBatches(ctx, false, step.query, step.args...); err != nil {
+			return findingsDeleted, llmRecordsDeleted, err
+		}
 	}
-	if _, err := tx.Exec(`DELETE FROM explorations WHERE id=$1`, expID); err != nil {
-		return result, err
+
+	finalTx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return findingsDeleted, llmRecordsDeleted, err
 	}
-	return result, tx.Commit()
+	defer finalTx.Rollback() //nolint:errcheck
+	if err = SetMaintenanceTimeouts(ctx, finalTx); err != nil {
+		return findingsDeleted, llmRecordsDeleted, err
+	}
+	if _, err = finalTx.ExecContext(ctx, `DELETE FROM tasks WHERE id=$1`, id); err != nil {
+		return findingsDeleted, llmRecordsDeleted, err
+	}
+	if _, err = finalTx.ExecContext(ctx, `DELETE FROM explorations WHERE id=$1`, expID); err != nil {
+		return findingsDeleted, llmRecordsDeleted, err
+	}
+	return findingsDeleted, llmRecordsDeleted, finalTx.Commit()
+}
+
+// SweepOrphanedDeletedTasks completes Phase 2+3 cleanup for tasks that were
+// tombstoned (deleted_at IS NOT NULL) during an interrupted deletion and do not
+// belong to any cold task archive. Findings and llm_records are preserved
+// because optional user delete flags are unknown after a crash.
+func (d *DB) SweepOrphanedDeletedTasks(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if d == nil || d.DB == nil {
+		return 0, ctx.Err()
+	}
+	rows, err := d.QueryContext(ctx, `SELECT t.id, t.exploration_id
+FROM tasks t
+WHERE t.deleted_at IS NOT NULL
+  AND t.archived_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM task_archives a WHERE a.task_id = t.id)
+ORDER BY t.id`)
+	if err != nil {
+		return 0, err
+	}
+	type orphanTask struct {
+		id    int64
+		expID int64
+	}
+	var orphans []orphanTask
+	for rows.Next() {
+		var o orphanTask
+		if err := rows.Scan(&o.id, &o.expID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		orphans = append(orphans, o)
+	}
+	rowErr := rows.Err()
+	rows.Close()
+	if rowErr != nil {
+		return 0, rowErr
+	}
+
+	swept := 0
+	var errs []error
+	for _, o := range orphans {
+		if err := ctx.Err(); err != nil {
+			return swept, err
+		}
+		if _, _, err := d.completeTaskDeleteCompactionContext(ctx, o.id, o.expID, false, false); err != nil {
+			if ctx.Err() != nil {
+				return swept, ctx.Err()
+			}
+			errs = append(errs, fmt.Errorf("sweep orphaned deleted task %d: %w", o.id, err))
+			continue
+		}
+		swept++
+	}
+	return swept, errors.Join(errs...)
 }

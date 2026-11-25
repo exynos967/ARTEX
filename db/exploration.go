@@ -1103,10 +1103,12 @@ ORDER BY id`, s.expID, nodeID)
 	if err != nil {
 		return nil, nil, err
 	}
+	defer nodeRows.Close()
 	nodes, err := scanNodes(nodeRows)
 	if err != nil {
 		return nil, nil, err
 	}
+	nodeRows.Close()
 	if len(nodes) == 0 {
 		return nil, nil, nil
 	}
@@ -1605,11 +1607,13 @@ func (s *ExplorationStore) ActivityListForTerminalIntent(nodeID, sinceID int64, 
 
 // ActivitySessionFilter selects one UI "session" within a task's activity stream.
 // Exactly one field is meaningful:
-//   - Main == true  → the main-agent session (worker="mainagent") for one segment
+//   - Main == true   → the main-agent session (worker="mainagent") for one segment
 //     (MainSeg; nil/0 = the original segment, which also matches legacy NULL rows).
-//   - Worker != ""  → filter by worker name (Plan = "planner").
+//   - System == true → task-level system audit events
+//     (worker='system' OR kind IN ('llm_switch','llm_failover')).
+//   - Worker != ""   → filter by worker name (Plan = "planner").
 //     Goal Agent 的第 0 轮拆解也以 worker="planner" 落库，故 Plan 会话完整覆盖 Goal+Planner。
-//   - NodeID != nil → a Worker session, filtered by node_id (= intent id).
+//   - NodeID != nil  → a Worker session, filtered by node_id (= intent id).
 //
 // A zero value (all empty) matches the whole task (no session filter).
 type ActivitySessionFilter struct {
@@ -1617,9 +1621,16 @@ type ActivitySessionFilter struct {
 	NodeID  *int64
 	Main    bool // main-agent session
 	MainSeg *int // segment for the main session (nil == current, resolved by caller; 0 == original)
+	System  bool // task-level system audit events (worker='system' or llm_switch/llm_failover)
 }
 
 func (f ActivitySessionFilter) cond(argStart int) (string, []any) {
+	return f.SQLCondition(argStart)
+}
+
+// SQLCondition builds the SQL WHERE fragment (leading " AND ...") and positional
+// parameters starting at $argStart for ActivityPage.
+func (f ActivitySessionFilter) SQLCondition(argStart int) (string, []any) {
 	switch {
 	case f.NodeID != nil:
 		return fmt.Sprintf(" AND node_id=$%d", argStart), []any{*f.NodeID}
@@ -1629,9 +1640,11 @@ func (f ActivitySessionFilter) cond(argStart int) (string, []any) {
 			seg = *f.MainSeg
 		}
 		if seg == 0 { // original segment also owns legacy rows with NULL main_seg
-			return " AND worker='mainagent' AND COALESCE(main_seg,0)=0", nil
+			return " AND worker='mainagent' AND (main_seg = 0 OR main_seg IS NULL)", nil
 		}
 		return fmt.Sprintf(" AND worker='mainagent' AND main_seg=$%d", argStart), []any{seg}
+	case f.System:
+		return " AND (worker='system' OR kind IN ('llm_switch','llm_failover'))", nil
 	case f.Worker != "":
 		return fmt.Sprintf(" AND worker=$%d", argStart), []any{f.Worker}
 	default:

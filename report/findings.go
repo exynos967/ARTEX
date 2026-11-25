@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"path"
 	"regexp"
 	"sort"
@@ -32,61 +33,105 @@ func findingTitle(f *db.DBFinding) string {
 	return nz(f.Name, nz(f.VulnClass, "未分类"))
 }
 
-// FindingsMarkdown 把一批 findings 整合成一份汇总报告(摘要 + 按严重等级分组,
-// 每条含类别/状态/所属任务/证据/详细报告)。
-func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
+// WriteFindingsMarkdown 把一批 findings 流式写入汇总报告(摘要 + 按严重等级分组,
+// 每条含类别/状态/所属任务/证据/详细报告),避免在内存中拼接整份大报告。
+func WriteFindingsMarkdown(w io.Writer, fs []*db.DBFinding, generatedAt time.Time) error {
 	items := append([]*db.DBFinding(nil), fs...)
 	sortFindingsForExport(items)
 
-	var b strings.Builder
-	b.WriteString("# 漏洞发现汇总报告\n\n")
-	fmt.Fprintf(&b, "- **生成时间**：%s\n", generatedAt.Format("2006-01-02 15:04:05"))
-	fmt.Fprintf(&b, "- **发现总数**：%d 个\n\n", len(items))
+	if _, err := io.WriteString(w, "# 漏洞发现汇总报告\n\n"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "- **生成时间**：%s\n", generatedAt.Format("2006-01-02 15:04:05")); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "- **发现总数**：%d 个\n\n", len(items)); err != nil {
+		return err
+	}
 
 	// 摘要:各严重等级计数。
 	counts := map[string]int{}
 	for _, f := range items {
 		counts[f.Severity]++
 	}
-	b.WriteString("## 摘要\n\n")
-	b.WriteString("| 严重等级 | 数量 |\n| --- | --- |\n")
+	if _, err := io.WriteString(w, "## 摘要\n\n| 严重等级 | 数量 |\n| --- | --- |\n"); err != nil {
+		return err
+	}
 	for _, s := range []struct{ key, label string }{
 		{"critical", "严重"}, {"high", "高危"}, {"medium", "中危"}, {"low", "低危"},
 	} {
-		fmt.Fprintf(&b, "| %s | %d |\n", s.label, counts[s.key])
+		if _, err := fmt.Fprintf(w, "| %s | %d |\n", s.label, counts[s.key]); err != nil {
+			return err
+		}
 	}
-	b.WriteString("\n")
+	if _, err := io.WriteString(w, "\n"); err != nil {
+		return err
+	}
 
 	if len(items) == 0 {
-		b.WriteString("_无匹配的漏洞。_\n")
-		return b.String()
+		_, err := io.WriteString(w, "_无匹配的漏洞。_\n")
+		return err
 	}
 
-	b.WriteString("## 漏洞明细\n\n")
+	if _, err := io.WriteString(w, "## 漏洞明细\n\n"); err != nil {
+		return err
+	}
 	for i, f := range items {
-		fmt.Fprintf(&b, "### %d. [%s] %s\n\n", i+1, strings.ToUpper(nz(f.Severity, "info")), findingTitle(f))
+		if _, err := fmt.Fprintf(w, "### %d. [%s] %s\n\n", i+1, strings.ToUpper(nz(f.Severity, "info")), findingTitle(f)); err != nil {
+			return err
+		}
 		if f.VulnClass != "" {
-			fmt.Fprintf(&b, "- **类别**：%s\n", f.VulnClass)
+			if _, err := fmt.Fprintf(w, "- **类别**：%s\n", f.VulnClass); err != nil {
+				return err
+			}
 		}
-		fmt.Fprintf(&b, "- **状态**：%s\n", nz(f.Status, "pending"))
+		if _, err := fmt.Fprintf(w, "- **状态**：%s\n", nz(f.Status, "pending")); err != nil {
+			return err
+		}
 		if desc := strings.TrimSpace(f.TaskDescription); desc != "" {
-			fmt.Fprintf(&b, "- **所属任务**：%s\n", desc)
+			if _, err := fmt.Fprintf(w, "- **所属任务**：%s\n", desc); err != nil {
+				return err
+			}
 		}
-		fmt.Fprintf(&b, "- **发现时间**：%s\n\n", f.CreatedAt.Format("2006-01-02 15:04:05"))
+		if _, err := fmt.Fprintf(w, "- **发现时间**：%s\n\n", f.CreatedAt.Format("2006-01-02 15:04:05")); err != nil {
+			return err
+		}
 		if s := strings.TrimSpace(f.Summary); s != "" {
-			fmt.Fprintf(&b, "%s\n\n", s)
+			if _, err := fmt.Fprintf(w, "%s\n\n", s); err != nil {
+				return err
+			}
 		}
 		if e := strings.TrimSpace(f.Evidence); e != "" {
-			fmt.Fprintf(&b, "**证据：**\n\n```\n%s\n```\n\n", e)
+			if _, err := fmt.Fprintf(w, "**证据：**\n\n```\n%s\n```\n\n", e); err != nil {
+				return err
+			}
 		}
 		if rep := strings.TrimSpace(f.Report); rep != "" {
-			b.WriteString("**详细报告：**\n\n")
-			b.WriteString(rep)
-			b.WriteString("\n\n")
+			if _, err := io.WriteString(w, "**详细报告：**\n\n"); err != nil {
+				return err
+			}
+			if _, err := io.WriteString(w, rep); err != nil {
+				return err
+			}
+			if _, err := io.WriteString(w, "\n\n"); err != nil {
+				return err
+			}
 		}
-		b.WriteString(findingTrafficMarkdown(f, false))
-		b.WriteString("---\n\n")
+		if err := writeFindingTrafficMarkdown(w, f, false); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, "---\n\n"); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// FindingsMarkdown 把一批 findings 整合成一份汇总报告(摘要 + 按严重等级分组,
+// 每条含类别/状态/所属任务/证据/详细报告)。
+func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
+	var b strings.Builder
+	_ = WriteFindingsMarkdown(&b, fs, generatedAt)
 	return b.String()
 }
 
@@ -140,18 +185,21 @@ func FindingFilename(f *db.DBFinding) string {
 	return name + ".md"
 }
 
-// FindingsCSV 把一批 findings 渲染成 CSV(带 UTF-8 BOM,便于 Excel 正确识别中文)。
+// WriteFindingsCSV 把一批 findings 流式写入 CSV(带 UTF-8 BOM,便于 Excel 正确识别中文)。
 // 不含大段 report/evidence 全文,只放摘要类字段;需要全文用 Markdown/JSON 导出。
-func FindingsCSV(fs []*db.DBFinding) []byte {
+func WriteFindingsCSV(w io.Writer, fs []*db.DBFinding) error {
 	items := append([]*db.DBFinding(nil), fs...)
 	sortFindingsForExport(items)
 
-	var buf bytes.Buffer
-	buf.WriteString("\xEF\xBB\xBF") // UTF-8 BOM
-	w := csv.NewWriter(&buf)
-	_ = w.Write([]string{"ID", "名称", "类别", "严重等级", "状态", "所属任务", "发现时间", "概述", "流量证据数量", "流量证据ID"})
+	if _, err := io.WriteString(w, "\xEF\xBB\xBF"); err != nil { // UTF-8 BOM
+		return err
+	}
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{"ID", "名称", "类别", "严重等级", "状态", "所属任务", "发现时间", "概述", "流量证据数量", "流量证据ID"}); err != nil {
+		return err
+	}
 	for _, f := range items {
-		_ = w.Write([]string{
+		if err := cw.Write([]string{
 			fmt.Sprintf("%d", f.ID),
 			findingTitle(f),
 			f.VulnClass,
@@ -161,9 +209,19 @@ func FindingsCSV(fs []*db.DBFinding) []byte {
 			f.CreatedAt.Format("2006-01-02 15:04:05"),
 			strings.TrimSpace(f.Summary),
 			fmt.Sprint(len(f.TrafficBindings)), findingTrafficIDs(f),
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	w.Flush()
+	cw.Flush()
+	return cw.Error()
+}
+
+// FindingsCSV 把一批 findings 渲染成 CSV(带 UTF-8 BOM,便于 Excel 正确识别中文)。
+// 不含大段 report/evidence 全文,只放摘要类字段;需要全文用 Markdown/JSON 导出。
+func FindingsCSV(fs []*db.DBFinding) []byte {
+	var buf bytes.Buffer
+	_ = WriteFindingsCSV(&buf, fs)
 	return buf.Bytes()
 }
 
@@ -175,26 +233,43 @@ func findingTrafficIDs(f *db.DBFinding) string {
 	return strings.Join(ids, ",")
 }
 
-func findingTrafficMarkdown(f *db.DBFinding, attachments bool) string {
+func writeFindingTrafficMarkdown(w io.Writer, f *db.DBFinding, attachments bool) error {
 	stale := f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion
 	if len(f.TrafficBindings) == 0 && !stale {
-		return ""
+		return nil
 	}
-	var out strings.Builder
-	out.WriteString("\n## 关联流量证据\n\n")
-	fmt.Fprintf(&out, "证据版本：%d；绑定数量：%d。\n\n", f.EvidenceVersion, len(f.TrafficBindings))
+	if _, err := io.WriteString(w, "\n## 关联流量证据\n\n"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "证据版本：%d；绑定数量：%d。\n\n", f.EvidenceVersion, len(f.TrafficBindings)); err != nil {
+		return err
+	}
 	if stale {
-		out.WriteString("证据已变更，详细报告待更新。\n\n")
+		if _, err := io.WriteString(w, "证据已变更，详细报告待更新。\n\n"); err != nil {
+			return err
+		}
 	}
 	for i, b := range f.TrafficBindings {
-		fmt.Fprintf(&out, "%d. **证据 #%d · %s** — `%s %s`，状态码 %d\n", i+1, b.ID, b.Role, b.Snapshot.Method, strings.ReplaceAll(b.Snapshot.URL, "`", "%60"), b.Snapshot.Status)
+		if _, err := fmt.Fprintf(w, "%d. **证据 #%d · %s** — `%s %s`，状态码 %d\n", i+1, b.ID, b.Role, b.Snapshot.Method, strings.ReplaceAll(b.Snapshot.URL, "`", "%60"), b.Snapshot.Status); err != nil {
+			return err
+		}
 		if b.Note != "" {
-			fmt.Fprintf(&out, "   %s\n", strings.ReplaceAll(b.Note, "\n", "\n   "))
+			if _, err := fmt.Fprintf(w, "   %s\n", strings.ReplaceAll(b.Note, "\n", "\n   ")); err != nil {
+				return err
+			}
 		}
 		if attachments {
-			fmt.Fprintf(&out, "   [请求报文](evidence/%d/%d/request.http) · [响应报文](evidence/%d/%d/response.http)\n", f.ID, b.ID, f.ID, b.ID)
+			if _, err := fmt.Fprintf(w, "   [请求报文](evidence/%d/%d/request.http) · [响应报文](evidence/%d/%d/response.http)\n", f.ID, b.ID, f.ID, b.ID); err != nil {
+				return err
+			}
 		}
 	}
-	out.WriteString("\n")
+	_, err := io.WriteString(w, "\n")
+	return err
+}
+
+func findingTrafficMarkdown(f *db.DBFinding, attachments bool) string {
+	var out strings.Builder
+	_ = writeFindingTrafficMarkdown(&out, f, attachments)
 	return out.String()
 }

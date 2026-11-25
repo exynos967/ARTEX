@@ -11,14 +11,11 @@ $$ LANGUAGE plpgsql;
 -- 安全的 text→inet 转换：非法值返回 NULL 而不是抛 22P02。assets.ip 是自由文本
 -- (Agent / 资产 API 可能写进主机名)，裸转 a.ip::inet 会让单独一行脏数据把整条
 -- 企业归属重算语句打挂。调用方用 try_inet(...) IS NULL 找出这些行并告警。
--- 不用 pg_input_is_valid 是因为那要 PG16+，这里要兼容更老的存量库。
-CREATE OR REPLACE FUNCTION try_inet(value text) RETURNS inet AS $$
-BEGIN
-    RETURN value::inet;
-EXCEPTION WHEN others THEN
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+-- 使用 PG16+ pg_input_is_valid 替代 PL/pgSQL EXCEPTION 块，避免逐行子事务风暴。
+CREATE OR REPLACE FUNCTION try_inet(value text) RETURNS inet
+LANGUAGE sql STABLE AS $$
+    SELECT CASE WHEN pg_input_is_valid(value, 'pg_catalog.inet') THEN value::pg_catalog.inet END
+$$;
 
 -- =====================================================================
 -- A. 资产层：companies / assets / company_scope
@@ -241,6 +238,9 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_expnodes_part     ON exploration_nodes(exploration_id, kind);
 CREATE INDEX IF NOT EXISTS idx_expnodes_frontier ON exploration_nodes(exploration_id, priority DESC)
     WHERE kind='intent' AND state='open';
+CREATE INDEX IF NOT EXISTS idx_expnodes_running_intent ON exploration_nodes(exploration_id)
+    WHERE kind='intent' AND state='running';
+CREATE INDEX IF NOT EXISTS idx_expnodes_kind_state_id ON exploration_nodes(kind, state, id);
 DROP TRIGGER IF EXISTS trg_expnodes_upd ON exploration_nodes;
 CREATE TRIGGER trg_expnodes_upd BEFORE UPDATE ON exploration_nodes
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -323,6 +323,8 @@ CREATE INDEX IF NOT EXISTS idx_act_node  ON activity(exploration_id, node_id, id
 CREATE INDEX IF NOT EXISTS idx_act_since ON activity(exploration_id, id);
 CREATE INDEX IF NOT EXISTS idx_act_tool_call ON activity(exploration_id, tool_use_id, id)
   WHERE kind IN ('tool_use', 'tool_result');
+CREATE INDEX IF NOT EXISTS idx_act_tool_result_id ON activity(id)
+  WHERE kind='tool_result';
 -- Main/Plan history pages filter by worker (both carry NULL node_id, so idx_act_node
 -- can't distinguish them); this covers reverse pagination of those sessions.
 CREATE INDEX IF NOT EXISTS idx_act_worker ON activity(exploration_id, worker, id);
@@ -572,7 +574,7 @@ CREATE TABLE IF NOT EXISTS task_archives (
     id                         BIGSERIAL PRIMARY KEY,
     task_id                    BIGINT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
     state                      TEXT NOT NULL DEFAULT 'archive_queued' CHECK (state IN (
-                                   'archive_queued','archiving','archive_failed','ready',
+                                   'archive_queued','archiving','compacting','archive_failed','ready',
                                    'restore_queued','restoring','restore_failed',
                                    'delete_queued','deleting','delete_failed'
                                )),
@@ -580,7 +582,7 @@ CREATE TABLE IF NOT EXISTS task_archives (
     progress                   INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
     error                      TEXT NOT NULL DEFAULT '',
     warnings                   JSONB NOT NULL DEFAULT '[]',
-    format_version             INTEGER NOT NULL DEFAULT 2,
+    format_version             INTEGER NOT NULL DEFAULT 3,
     archive_path               TEXT NOT NULL DEFAULT '',
     sha256                     TEXT NOT NULL DEFAULT '',
     original_size              BIGINT NOT NULL DEFAULT 0,
@@ -600,7 +602,13 @@ CREATE TABLE IF NOT EXISTS task_archives (
     created_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE task_archives ALTER COLUMN format_version SET DEFAULT 2;
+ALTER TABLE task_archives DROP CONSTRAINT IF EXISTS task_archives_state_check;
+ALTER TABLE task_archives ADD CONSTRAINT task_archives_state_check CHECK (state IN (
+    'archive_queued','archiving','compacting','archive_failed','ready',
+    'restore_queued','restoring','restore_failed',
+    'delete_queued','deleting','delete_failed'
+));
+ALTER TABLE task_archives ALTER COLUMN format_version SET DEFAULT 3;
 CREATE INDEX IF NOT EXISTS idx_task_archives_state ON task_archives(state, requested_at, id);
 CREATE INDEX IF NOT EXISTS idx_task_archives_archived ON task_archives(archived_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_task_archives_sources ON task_archives USING GIN(source_task_ids);
@@ -679,8 +687,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_assets_task_links ON assets;
-CREATE TRIGGER trg_assets_task_links AFTER INSERT OR UPDATE OF task_ids ON assets
+DROP TRIGGER IF EXISTS trg_assets_task_links_ins ON assets;
+DROP TRIGGER IF EXISTS trg_assets_task_links_upd ON assets;
+CREATE TRIGGER trg_assets_task_links_ins AFTER INSERT ON assets
     FOR EACH ROW EXECUTE FUNCTION sync_task_asset_links();
+CREATE TRIGGER trg_assets_task_links_upd AFTER UPDATE OF task_ids ON assets
+    FOR EACH ROW WHEN (NEW.task_ids IS DISTINCT FROM OLD.task_ids)
+    EXECUTE FUNCTION sync_task_asset_links();
 
 -- Existing installations receive an auditable legacy source without rewriting
 -- task_ids. Ignore stale array ids that no longer resolve to a live task.
@@ -913,6 +926,7 @@ CREATE TABLE IF NOT EXISTS skill_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_skill_usage_skill ON skill_usage(skill, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_usage_task  ON skill_usage(task_id);
+CREATE INDEX IF NOT EXISTS idx_skill_usage_exp   ON skill_usage(exploration_id);
 
 -- 工具调用账本（见 db/tool_usage.go）。一次实际 CoreTool.Call 一行，只记归属维度，
 -- 不保存工具参数或返回内容。刻意不设外键，任务、会话或自定义工具删除后仍保留统计。
@@ -928,6 +942,7 @@ CREATE TABLE IF NOT EXISTS tool_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_tool_usage_tool ON tool_usage(tool_key, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_tool_usage_task ON tool_usage(task_id);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_exp  ON tool_usage(exploration_id);
 
 -- =====================================================================
 -- H. 内置工具目录
@@ -1069,6 +1084,9 @@ CREATE TABLE IF NOT EXISTS intercept_pending (
 );
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_status ON intercept_pending(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_task   ON intercept_pending(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intercept_pending_created ON intercept_pending(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intercept_pending_decided_at
+    ON intercept_pending((COALESCE(decided_at, created_at))) WHERE status <> 'pending';
 -- 补旧库:reason 列(已发版,加列要带 IF NOT EXISTS)。
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
 -- Detail payloads are lazy-loaded; NULL preserves the meaning of legacy history.
@@ -1109,6 +1127,7 @@ CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
 -- 「按资产」视图靠 asset_ids @> '[<id>]' 反查发现,没有这个 GIN 索引就是全表扫。
 CREATE INDEX IF NOT EXISTS idx_findings_asset_ids ON findings USING GIN(asset_ids jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS idx_findings_node_id   ON findings(node_id);
 
 -- 手动复测属于独立会话；结论与原漏洞处置状态分开保存。
 CREATE TABLE IF NOT EXISTS finding_retests (
@@ -1185,7 +1204,9 @@ CREATE TABLE IF NOT EXISTS server_logs (
     tag        TEXT NOT NULL DEFAULT '',
     text       TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_server_logs_id ON server_logs(id DESC);
+-- id is already PRIMARY KEY (B-tree supports backward scans); drop redundant legacy index.
+DROP INDEX IF EXISTS idx_server_logs_id;
+CREATE INDEX IF NOT EXISTS idx_server_logs_created ON server_logs(created_at);
 
 -- Independent /btw history and the latest provider-ready main checkpoint.
 CREATE TABLE IF NOT EXISTS side_question_sessions (
@@ -1353,6 +1374,8 @@ CREATE TABLE IF NOT EXISTS notification_events (
 );
 CREATE INDEX IF NOT EXISTS idx_notification_events_pending
     ON notification_events(id) WHERE NOT fanned_out;
+CREATE INDEX IF NOT EXISTS idx_notification_events_fanned_created
+    ON notification_events(created_at) WHERE fanned_out;
 
 -- 投递任务：一条事件 × 一个启用渠道 = 一行。fan-out 在事务外做，所以渠道
 -- 后开不会补历史(与 agent_triggers 的「迟开 trigger 不补历史」语义一致，
@@ -1380,12 +1403,20 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_due
     ON notification_deliveries(next_attempt_at) WHERE state='pending';
-CREATE INDEX IF NOT EXISTS idx_notification_deliveries_history
-    ON notification_deliveries(id DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_due_v2
+    ON notification_deliveries(channel_id, next_attempt_at, id) WHERE state IN ('pending','sending');
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_event
+    ON notification_deliveries(event_id);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_terminal_created
+    ON notification_deliveries(created_at) WHERE state IN ('sent','failed','skipped');
+-- id is already PRIMARY KEY (B-tree supports backward scans); drop redundant legacy index.
+DROP INDEX IF EXISTS idx_notification_deliveries_history;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_state_sent
+    ON notification_deliveries(state, sent_at);
 -- Experimental remote runners. Disabled by default; credentials are hashed by
 -- the broker, and revision CAS fences superseded controller instances.
 CREATE TABLE IF NOT EXISTS runner_state (
@@ -1531,6 +1562,7 @@ CREATE TABLE IF NOT EXISTS operation_receipts (
  fingerprint BYTEA NOT NULL, result JSONB NOT NULL,
  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(scope,request_id)
 );
+CREATE INDEX IF NOT EXISTS idx_operation_receipts_created ON operation_receipts(created_at);
 
 -- Legacy deployment records are retained solely for archive/export compatibility.
 -- The registration API, tools and lifecycle checks have been removed.
@@ -1557,6 +1589,7 @@ CREATE INDEX IF NOT EXISTS idx_deployment_events ON task_deployment_events(task_
 -- Intent budgets survive retries and cold archiving (which removes graph nodes).
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS token_budget_limit BIGINT NOT NULL DEFAULT 0 CHECK(token_budget_limit>=0);
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS token_budget_revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tokens_used BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS worker_budgets (
  intent_id BIGINT PRIMARY KEY, task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1586,3 +1619,96 @@ CREATE TABLE IF NOT EXISTS task_record_exports (
 );
 CREATE INDEX IF NOT EXISTS idx_record_exports_queue ON task_record_exports(state,id);
 CREATE INDEX IF NOT EXISTS idx_record_exports_tasks ON task_record_exports USING gin(task_ids);
+
+-- =====================================================================
+-- N. 增量 tokens_used 维护触发器与热表 autovacuum / fillfactor 调优
+-- =====================================================================
+-- 独立 1:1 计数器表：将高频 llm_usage 触发器写入从 tasks 主行拆出，彻底消除
+-- tasks(id) FOR NO KEY UPDATE 锁竞争与每次 LLM 调用触发 trg_tasks_upd 写放大。
+CREATE TABLE IF NOT EXISTS task_token_counters (
+    task_id     BIGINT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    tokens_used BIGINT NOT NULL DEFAULT 0
+);
+ALTER TABLE task_token_counters SET (fillfactor = 85, autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+
+-- 维护 task_token_counters.tokens_used 与 llm_usage 增量同步，消除预算判定热路径对 llm_usage 的聚合扫描。
+CREATE OR REPLACE FUNCTION sync_task_tokens_used() RETURNS trigger AS $$
+DECLARE
+    tid   BIGINT;
+    delta BIGINT;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.task_id IS NOT NULL AND NEW.task_id ~ '^[0-9]+$' AND pg_input_is_valid(NEW.task_id, 'bigint') THEN
+            tid := NEW.task_id::bigint;
+            delta := COALESCE(NEW.input_tokens, 0)::bigint + COALESCE(NEW.output_tokens, 0)::bigint;
+            IF delta <> 0 THEN
+                INSERT INTO task_token_counters(task_id, tokens_used)
+                SELECT id, GREATEST(0, delta) FROM tasks WHERE id = tid
+                ON CONFLICT (task_id) DO UPDATE
+                    SET tokens_used = GREATEST(0, task_token_counters.tokens_used + delta);
+            END IF;
+        END IF;
+        RETURN NEW;
+    ELSIF TG_OP = 'DELETE' THEN
+        IF OLD.task_id IS NOT NULL AND OLD.task_id ~ '^[0-9]+$' AND pg_input_is_valid(OLD.task_id, 'bigint') THEN
+            tid := OLD.task_id::bigint;
+            delta := -(COALESCE(OLD.input_tokens, 0)::bigint + COALESCE(OLD.output_tokens, 0)::bigint);
+            IF delta <> 0 THEN
+                UPDATE task_token_counters
+                SET tokens_used = GREATEST(0, tokens_used + delta)
+                WHERE task_id = tid;
+            END IF;
+        END IF;
+        RETURN OLD;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- llm_usage 可能由 EnsureLLMUsageTable 在首次启动后建表；仅在表已存在时挂载触发器并做一次性回填。
+-- schema_migrations 哈希门禁保证本迁移仅在 schema 变更时执行一次，不会每次启动重跑。
+DO $$
+BEGIN
+    IF to_regclass('llm_usage') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS trg_llm_usage_task_tokens ON llm_usage;
+        CREATE TRIGGER trg_llm_usage_task_tokens AFTER INSERT OR DELETE ON llm_usage
+            FOR EACH ROW EXECUTE FUNCTION sync_task_tokens_used();
+
+        INSERT INTO task_token_counters(task_id, tokens_used)
+        SELECT t.id, u.total_tokens
+        FROM tasks t
+        JOIN (
+            SELECT task_id::bigint AS tid,
+                   COALESCE(SUM(input_tokens::bigint + output_tokens::bigint), 0) AS total_tokens
+            FROM llm_usage
+            WHERE task_id IS NOT NULL
+              AND task_id ~ '^[0-9]+$'
+              AND pg_input_is_valid(task_id, 'bigint')
+            GROUP BY task_id::bigint
+        ) u ON u.tid = t.id
+        ON CONFLICT (task_id) DO UPDATE
+            SET tokens_used = EXCLUDED.tokens_used
+            WHERE task_token_counters.tokens_used IS DISTINCT FROM EXCLUDED.tokens_used;
+
+        UPDATE task_token_counters c
+        SET tokens_used = 0
+        WHERE c.tokens_used <> 0
+          AND NOT EXISTS (
+              SELECT 1 FROM llm_usage u WHERE u.task_id = c.task_id::text
+          );
+
+        ALTER TABLE llm_usage SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+    END IF;
+
+    IF to_regclass('llm_records') IS NOT NULL THEN
+        ALTER TABLE llm_records SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+    END IF;
+END $$;
+
+-- 热表存储与 autovacuum 调优（幂等）。
+ALTER TABLE activity SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+ALTER TABLE server_logs SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+ALTER TABLE intercept_pending SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+ALTER TABLE tasks SET (fillfactor = 85, autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+ALTER TABLE exploration_nodes SET (fillfactor = 85, autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+ALTER TABLE side_question_sessions SET (fillfactor = 85, autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);

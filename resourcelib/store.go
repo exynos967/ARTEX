@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RC-CHN/ARTEX/db"
 	"github.com/RC-CHN/ARTEX/internal/operation"
 	"github.com/RC-CHN/ARTEX/norma/runtimeobs"
 )
@@ -244,7 +245,7 @@ func (s *Store) List(ctx context.Context, q, kind string, before int64) ([]Resou
 
 // Every mutation uses the same lock order: shared GC -> quota -> task -> resource -> draft.
 // Bytes are received before acquiring locks, so slow uploads don't block users.
-const resourceGCLock int64 = 7337741011
+const resourceGCLock int64 = db.LockResourceGC
 
 func (s *Store) begin(ctx context.Context, a Actor, id int64) (*sql.Tx, Resource, error) {
 	return s.beginResource(ctx, a, id, false)
@@ -272,7 +273,7 @@ func lockResource(ctx context.Context, tx *sql.Tx, a Actor, id int64, allowDelet
 	var err error
 	fail := func(e error) (Resource, error) { return Resource{}, e }
 	start := time.Now()
-	_, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(7337741010)`)
+	_, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, db.LockResourceLibrary)
 	runtimeobs.Record(runtimeobs.ResourceCommit, start, err != nil)
 	if err != nil {
 		return fail(err)

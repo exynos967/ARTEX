@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/RC-CHN/ARTEX/db"
 )
 
 // Sweep removes old, unreferenced blobs left by discarded/replaced drafts or an
@@ -18,13 +20,16 @@ func (s *Store) Sweep(ctx context.Context, olderThan time.Time) (int, error) {
 		return 0, e
 	}
 	defer tx.Rollback()
+	if e = db.SetMaintenanceTimeouts(ctx, tx); e != nil {
+		return 0, e
+	}
 	var locked bool
 	// Publishers prepare directories concurrently outside the quota lock. Skip
 	// maintenance while any preparation/mutation is live; no filesystem leases.
 	if e = tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock($1)`, resourceGCLock).Scan(&locked); e != nil || !locked {
 		return 0, e
 	}
-	if e = tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock(7337741010)`).Scan(&locked); e != nil || !locked {
+	if e = tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock($1)`, db.LockResourceLibrary).Scan(&locked); e != nil || !locked {
 		return 0, e
 	}
 	keep := map[string]bool{}

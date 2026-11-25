@@ -162,6 +162,36 @@ type TaskEvent struct {
 	ToolIsErr  bool   `json:"tool_is_err"` // tool-call only: 工具返回是否为错误
 }
 
+// MaxFindingID returns the highest finding node id in exploration_nodes (0 when
+// empty). Matches NewFindingsSince's monotonic watermark domain.
+func (d *DB) MaxFindingID() (int64, error) {
+	var id int64
+	err := d.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM exploration_nodes WHERE kind='finding'`).Scan(&id)
+	return id, err
+}
+
+// MaxToolResultActivityID returns the highest tool_result activity id (0 when
+// empty). Uses idx_act_tool_result_id for O(log N) lookup.
+func (d *DB) MaxToolResultActivityID() (int64, error) {
+	var id int64
+	err := d.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM activity WHERE kind='tool_result'`).Scan(&id)
+	return id, err
+}
+
+// MaxTimedOutTaskID returns the highest timed-out live task id (0 when empty).
+func (d *DB) MaxTimedOutTaskID() (int64, error) {
+	var id int64
+	err := d.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM tasks WHERE status='timeout' AND deleted_at IS NULL`).Scan(&id)
+	return id, err
+}
+
+// MaxTaskID returns the highest live task id (0 when empty).
+func (d *DB) MaxTaskID() (int64, error) {
+	var id int64
+	err := d.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM tasks WHERE deleted_at IS NULL`).Scan(&id)
+	return id, err
+}
+
 // NewFindingsSince returns findings with node id > lastID across all live tasks,
 // ordered by id (monotonic watermark → no double-fire).
 func (d *DB) NewFindingsSince(lastID int64) ([]TaskEvent, error) {
@@ -251,7 +281,8 @@ FROM activity r
 JOIN tasks t ON t.exploration_id = r.exploration_id
 LEFT JOIN activity u ON u.exploration_id = r.exploration_id AND u.tool_use_id = r.tool_use_id AND u.kind='tool_use'
 WHERE r.kind='tool_result' AND r.id > $1 AND r.tool <> '' AND t.deleted_at IS NULL
-ORDER BY r.id`, lastID)
+ORDER BY r.id
+LIMIT 500`, lastID)
 	if err != nil {
 		return nil, err
 	}

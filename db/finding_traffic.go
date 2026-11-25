@@ -21,8 +21,8 @@ var (
 )
 
 // This lock covers the evidence filesystem as well as its SQL references. All
-// processes sharing the database use it, including readers, exports and GC.
-const findingEvidenceLockKey int64 = 7337741004
+// processes sharing the database use it, including writers, exports and GC.
+const findingEvidenceLockKey int64 = LockFindingEvidence
 
 func (d *DB) WithEvidenceTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := d.BeginTx(ctx, nil)
@@ -30,6 +30,9 @@ func (d *DB) WithEvidenceTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err = SetMaintenanceTimeouts(ctx, tx); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, findingEvidenceLockKey); err != nil {
 		return err
 	}
@@ -37,6 +40,29 @@ func (d *DB) WithEvidenceTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// WithEvidenceSessionLock holds LockFindingEvidence as a session-level advisory
+// lock on a pinned connection without keeping a PostgreSQL transaction open.
+// Use this for long filesystem/restore operations (such as archive restore
+// installing evidence blobs and then opening nested restore transactions) so
+// they never hit idle_in_transaction_session_timeout or pin MVCC xmin while
+// still mutually excluding WithEvidenceTx (GC/writers) on the same lock key.
+func (d *DB) WithEvidenceSessionLock(ctx context.Context, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	if d == nil || d.DB == nil {
+		return errors.New("nil database")
+	}
+	return withPinnedSessionLock(
+		ctx,
+		d.DB,
+		findingEvidenceLockKey,
+		`SET lock_timeout = '30s'`,
+		`RESET lock_timeout`,
+		func(*sql.Conn) error { return fn() },
+	)
 }
 
 type TrafficRef struct {
@@ -268,9 +294,20 @@ FROM finding_traffic_bindings b JOIN traffic_evidence_snapshots s ON s.id=b.snap
 	return out, rows.Err()
 }
 
-func (d *DB) GetFindingTraffic(ctx context.Context, findingID int64) (out *FindingTraffic, err error) {
-	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error { var e error; out, e = FindingTrafficTx(tx, findingID); return e })
-	return
+// GetFindingTraffic reads the finding's evidence metadata and bindings from a
+// consistent read-only snapshot without acquiring the exclusive evidence write
+// lock, so reads never block finding writes.
+func (d *DB) GetFindingTraffic(ctx context.Context, findingID int64) (*FindingTraffic, error) {
+	tx, err := d.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	out, err := FindingTrafficTx(tx, findingID)
+	if err != nil {
+		return nil, err
+	}
+	return out, tx.Commit()
 }
 
 func (d *DB) EditFindingTraffic(ctx context.Context, findingID, bindingID, version int64, role, note *string, remove bool, order []int64) error {

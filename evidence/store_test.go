@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -329,5 +332,124 @@ func TestEvidenceGCGraceAndActiveRestore(t *testing.T) {
 	bad.URL = "http://tampered.local/"
 	if err = s.InstallSnapshots(ctx, []db.TrafficEvidenceSnapshot{bad}, archive); err == nil {
 		t.Fatal("accepted tampered snapshot")
+	}
+}
+
+type stubEvidenceConnector struct{ state *stubEvidenceSQL }
+
+func (c *stubEvidenceConnector) Connect(context.Context) (driver.Conn, error) {
+	return &stubEvidenceConn{state: c.state}, nil
+}
+func (c *stubEvidenceConnector) Driver() driver.Driver { return stubEvidenceDriver{} }
+
+type stubEvidenceDriver struct{}
+
+func (stubEvidenceDriver) Open(string) (driver.Conn, error) { return nil, errors.New("use OpenDB") }
+
+type stubEvidenceSQL struct {
+	mu      sync.Mutex
+	begins  int
+	queries []string
+	args    [][]any
+}
+
+type stubEvidenceConn struct{ state *stubEvidenceSQL }
+
+func (c *stubEvidenceConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unused") }
+func (c *stubEvidenceConn) Close() error                        { return nil }
+func (c *stubEvidenceConn) Begin() (driver.Tx, error) {
+	c.state.mu.Lock()
+	c.state.begins++
+	c.state.mu.Unlock()
+	return nil, errors.New("WithInstalledSnapshots must not open a transaction")
+}
+func (c *stubEvidenceConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	vals := make([]any, len(args))
+	for i, a := range args {
+		vals[i] = a.Value
+	}
+	c.state.mu.Lock()
+	c.state.queries = append(c.state.queries, query)
+	c.state.args = append(c.state.args, vals)
+	c.state.mu.Unlock()
+	return driver.RowsAffected(1), nil
+}
+
+func TestWithInstalledSnapshotsUsesSessionLockNoTx(t *testing.T) {
+	st := &stubEvidenceSQL{}
+	sqlDB := sql.OpenDB(&stubEvidenceConnector{state: st})
+	defer sqlDB.Close()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	reqBody := []byte("GET / HTTP/1.1")
+	respBody := []byte("HTTP/1.1 200 OK")
+	reqSum := sha256.Sum256(reqBody)
+	respSum := sha256.Sum256(respBody)
+	reqHash := hex.EncodeToString(reqSum[:])
+	respHash := hex.EncodeToString(respSum[:])
+
+	for hash, body := range map[string][]byte{reqHash: reqBody, respHash: respBody} {
+		for _, root := range []string{src, dst} {
+			if root == dst && runtime.GOOS != "windows" {
+				// On POSIX systems exercise the full rename + dir.Sync() install path.
+				// Windows forbids FlushFileBuffers on directory handles.
+				continue
+			}
+			p, err := hashPath(root, hash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	snap := db.TrafficEvidenceSnapshot{
+		SourceTrafficID: "t-1",
+		CapturedAt:      1,
+		URL:             "https://example.test/",
+		Method:          "GET",
+		Status:          200,
+		ReqHead:         "GET / HTTP/1.1",
+		RespHead:        "HTTP/1.1 200 OK",
+		ReqHash:         reqHash,
+		RespHash:        respHash,
+		ReqLen:          int64(len(reqBody)),
+		RespLen:         int64(len(respBody)),
+	}
+	snap.ID = db.TrafficSnapshotID(snap)
+
+	store := New(&db.DB{DB: sqlDB}, nil, dst)
+	restoreCalled := false
+	err := store.WithInstalledSnapshots(t.Context(), []db.TrafficEvidenceSnapshot{snap}, src, func() error {
+		restoreCalled = true
+		p, err := hashPath(dst, respHash)
+		if err != nil {
+			return err
+		}
+		_, err = os.Stat(p)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("WithInstalledSnapshots: %v", err)
+	}
+	if !restoreCalled {
+		t.Fatal("restore callback was not invoked")
+	}
+	if st.begins != 0 {
+		t.Fatalf("expected 0 transactions during WithInstalledSnapshots, got %d", st.begins)
+	}
+	if len(st.queries) != 4 ||
+		st.queries[0] != `SET lock_timeout = '30s'` ||
+		st.queries[1] != `SELECT pg_advisory_lock($1)` || st.args[1][0] != db.LockFindingEvidence ||
+		st.queries[2] != `SELECT pg_advisory_unlock($1)` || st.args[2][0] != db.LockFindingEvidence ||
+		st.queries[3] != `RESET lock_timeout` {
+		t.Fatalf("unexpected session lock sequence: queries=%v args=%v", st.queries, st.args)
 	}
 }

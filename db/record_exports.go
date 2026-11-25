@@ -95,7 +95,7 @@ func (d *DB) QueueRecordExport(ctx context.Context, in RecordExportRequest, acto
 		return out, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(7337741012)`); err != nil {
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, LockRecordExport); err != nil {
 		return out, err
 	}
 	scope := fmt.Sprintf("record-export:%d", actorTaskID)
@@ -172,7 +172,7 @@ func (d *DB) FinishRecordExport(ctx context.Context, id int64, owner, checksum s
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(7337741012)`); err != nil {
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, LockRecordExport); err != nil {
 		return err
 	}
 	var retained int64
@@ -225,7 +225,7 @@ func (d *DB) retryRecordExport(ctx context.Context, id int64) (RecordExport, err
 		return RecordExport{}, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(7337741012)`); err != nil {
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, LockRecordExport); err != nil {
 		return RecordExport{}, err
 	}
 	current, err := scanRecordExport(tx.QueryRowContext(ctx, `SELECT `+recordExportCols+` FROM task_record_exports WHERE id=$1 FOR UPDATE`, id))

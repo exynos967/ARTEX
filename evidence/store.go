@@ -311,10 +311,12 @@ func (s *Store) InstallSnapshots(ctx context.Context, snapshots []db.TrafficEvid
 	return s.WithInstalledSnapshots(ctx, snapshots, source, func() error { return nil })
 }
 
-// WithInstalledSnapshots pins installed bodies until the metadata restore finishes.
-// The callback must not acquire another evidence advisory lock.
+// WithInstalledSnapshots pins installed bodies until the metadata restore finishes
+// using a session-level advisory lock (no open transaction across blob copies and
+// nested restore DB transactions). The callback must not acquire another evidence
+// advisory lock.
 func (s *Store) WithInstalledSnapshots(ctx context.Context, snapshots []db.TrafficEvidenceSnapshot, source string, restore func() error) error {
-	return s.DB.WithEvidenceTx(ctx, func(*sql.Tx) error {
+	return s.DB.WithEvidenceSessionLock(ctx, func() error {
 		for _, v := range snapshots {
 			if v.ID != db.TrafficSnapshotID(v) {
 				return errors.New("归档证据快照元数据哈希不匹配")

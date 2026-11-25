@@ -128,12 +128,12 @@ func (d *DB) ClaimRealtimeDeliveries(ctx context.Context, channelID int64, limit
 	return d.claimDeliveries(ctx, lease, claimQuery{
 		sql: `SELECT dd.id FROM notification_deliveries dd
 JOIN notification_channels c ON c.id = dd.channel_id
-WHERE dd.channel_id = $1 AND dd.state IN ($2,$3) AND dd.next_attempt_at <= now()
-  AND c.enabled AND c.mode = $4
+WHERE dd.channel_id = $1 AND dd.state IN ('pending','sending') AND dd.next_attempt_at <= now()
+  AND c.enabled AND c.mode = $2
 ORDER BY dd.next_attempt_at, dd.id
 FOR UPDATE OF dd SKIP LOCKED
-LIMIT $5`,
-		args: []any{channelID, NotifyStatePending, NotifyStateSending, NotifyModeRealtime, limit},
+LIMIT $3`,
+		args: []any{channelID, NotifyModeRealtime, limit},
 	}, nil)
 }
 
@@ -151,10 +151,10 @@ func (d *DB) DigestBatchDue(ctx context.Context, channelID int64, minAge time.Du
 	err := d.QueryRowContext(ctx, `SELECT EXISTS (
   SELECT 1 FROM notification_deliveries d
   JOIN notification_channels c ON c.id = d.channel_id
-  WHERE d.channel_id = $1 AND d.state IN ($2,$3) AND c.enabled
+  WHERE d.channel_id = $1 AND d.state IN ('pending','sending') AND c.enabled
   GROUP BY d.channel_id
-  HAVING min(d.created_at) <= now() - make_interval(secs => $4)
-)`, channelID, NotifyStatePending, NotifyStateSending, int64(minAge.Seconds())).Scan(&due)
+  HAVING min(d.created_at) <= now() - make_interval(secs => $2)
+)`, channelID, int64(minAge.Seconds())).Scan(&due)
 	return due, err
 }
 
@@ -186,11 +186,11 @@ func (d *DB) ClaimDigestBatch(ctx context.Context, channelID int64, limit int, l
 	out, err := d.claimDeliveries(ctx, lease, claimQuery{
 		sql: `SELECT dd.id FROM notification_deliveries dd
 JOIN notification_channels c ON c.id = dd.channel_id
-WHERE dd.channel_id = $1 AND dd.state IN ($2,$3) AND dd.next_attempt_at <= now() AND c.enabled
+WHERE dd.channel_id = $1 AND dd.state IN ('pending','sending') AND dd.next_attempt_at <= now() AND c.enabled
 ORDER BY dd.id
 FOR UPDATE OF dd SKIP LOCKED
-LIMIT $4`,
-		args: []any{channelID, NotifyStatePending, NotifyStateSending, limit},
+LIMIT $2`,
+		args: []any{channelID, limit},
 	}, func(tx *sql.Tx, ids []int64) error {
 		batchID := ids[0]
 		for _, id := range ids {

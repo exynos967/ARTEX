@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"sort"
 	"strconv"
 	"time"
@@ -65,6 +66,70 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_task  ON llm_usage(task_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(task_id, model);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_exp   ON llm_usage(exploration_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_session ON llm_usage(session_id, id) WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_worker_ts ON llm_usage(worker, ts) WHERE worker='judge';
+ALTER TABLE llm_usage SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02);
+CREATE OR REPLACE FUNCTION sync_task_tokens_used() RETURNS trigger AS $$
+DECLARE
+    tid   BIGINT;
+    delta BIGINT;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.task_id IS NOT NULL AND NEW.task_id ~ '^[0-9]+$' AND pg_input_is_valid(NEW.task_id, 'bigint') THEN
+            tid := NEW.task_id::bigint;
+            delta := COALESCE(NEW.input_tokens, 0)::bigint + COALESCE(NEW.output_tokens, 0)::bigint;
+            IF delta <> 0 THEN
+                INSERT INTO task_token_counters(task_id, tokens_used)
+                SELECT id, GREATEST(0, delta) FROM tasks WHERE id = tid
+                ON CONFLICT (task_id) DO UPDATE
+                    SET tokens_used = GREATEST(0, task_token_counters.tokens_used + delta);
+            END IF;
+        END IF;
+        RETURN NEW;
+    ELSIF TG_OP = 'DELETE' THEN
+        IF OLD.task_id IS NOT NULL AND OLD.task_id ~ '^[0-9]+$' AND pg_input_is_valid(OLD.task_id, 'bigint') THEN
+            tid := OLD.task_id::bigint;
+            delta := -(COALESCE(OLD.input_tokens, 0)::bigint + COALESCE(OLD.output_tokens, 0)::bigint);
+            IF delta <> 0 THEN
+                UPDATE task_token_counters
+                SET tokens_used = GREATEST(0, tokens_used + delta)
+                WHERE task_id = tid;
+            END IF;
+        END IF;
+        RETURN OLD;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+DO $$
+BEGIN
+    IF to_regclass('task_token_counters') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM pg_trigger
+           WHERE tgname = 'trg_llm_usage_task_tokens'
+             AND tgrelid = 'llm_usage'::regclass
+             AND NOT tgisinternal
+       ) THEN
+        CREATE TRIGGER trg_llm_usage_task_tokens AFTER INSERT OR DELETE ON llm_usage
+            FOR EACH ROW EXECUTE FUNCTION sync_task_tokens_used();
+
+        INSERT INTO task_token_counters(task_id, tokens_used)
+        SELECT t.id, u.total_tokens
+        FROM tasks t
+        JOIN (
+            SELECT task_id::bigint AS tid,
+                   COALESCE(SUM(input_tokens::bigint + output_tokens::bigint), 0) AS total_tokens
+            FROM llm_usage
+            WHERE task_id IS NOT NULL
+              AND task_id ~ '^[0-9]+$'
+              AND pg_input_is_valid(task_id, 'bigint')
+            GROUP BY task_id::bigint
+        ) u ON u.tid = t.id
+        ON CONFLICT (task_id) DO UPDATE
+            SET tokens_used = EXCLUDED.tokens_used
+            WHERE task_token_counters.tokens_used IS DISTINCT FROM EXCLUDED.tokens_used;
+    END IF;
+END $$;
 `
 
 // EnsureLLMUsageTable creates the llm_usage metering table if it does not exist.
@@ -74,6 +139,9 @@ func (d *DB) EnsureLLMUsageTable() error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	if err := SetMaintenanceTimeouts(context.Background(), tx); err != nil {
+		return err
+	}
 	if err := coordinateWithSchemaMigration(tx); err != nil {
 		return err
 	}
@@ -110,14 +178,29 @@ VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,$7,$8,$9,$
 // Accurate even with per-agent model bindings, pool rotation/failover, and
 // interrupted runs, since every call (success or error) is metered.
 func (d *DB) TokenByModel(taskID string) ([]ModelTokenStat, error) {
-	rows, err := d.Query(`
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if taskID == "" {
+		rows, err = d.Query(`
 SELECT COALESCE(NULLIF(model,''),'(unknown)') AS model, COUNT(*) AS calls,
        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
        COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
 FROM llm_usage
-WHERE COALESCE(task_id,'') = $1
+WHERE task_id IS NULL OR task_id = ''
+GROUP BY model
+ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC, model`)
+	} else {
+		rows, err = d.Query(`
+SELECT COALESCE(NULLIF(model,''),'(unknown)') AS model, COUNT(*) AS calls,
+       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
+FROM llm_usage
+WHERE task_id = $1
 GROUP BY model
 ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC, model`, taskID)
+	}
 	if err != nil {
 		return nil, err
 	}

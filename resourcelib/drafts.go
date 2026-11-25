@@ -10,6 +10,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/RC-CHN/ARTEX/db"
 )
 
 const draftCols = `id,resource_id,base_version_id,revision,state,COALESCE(published_version_id,0),size,manifest,actor,updated_at`
@@ -191,6 +193,9 @@ func (s *Store) Upload(ctx context.Context, id, revision int64, p string, execut
 		return d, err
 	}
 	defer tx.Rollback()
+	if err = db.SetMaintenanceTimeouts(ctx, tx); err != nil {
+		return d, err
+	}
 	if p == DocumentName {
 		content, e := os.ReadFile(staged)
 		if e != nil {
@@ -367,6 +372,9 @@ func (s *Store) Publish(ctx context.Context, id, revision int64, note, validatio
 		return Version{}, err
 	}
 	defer tx.Rollback()
+	if err = db.SetMaintenanceTimeouts(ctx, tx); err != nil {
+		return Version{}, err
+	}
 	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, resourceGCLock); err != nil {
 		return Version{}, err
 	}

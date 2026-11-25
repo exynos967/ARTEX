@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -438,7 +439,7 @@ ORDER BY a.id`, taskID)
 	}
 	defer rows.Close()
 
-	byKey := map[string]*CoverageGraphNode{}
+	byKey := map[string]struct{}{}
 	rootByDomain := map[string]string{} // root domain → node key
 	subByDomain := map[string]string{}  // subdomain    → node key
 	ipByAddr := map[string]string{}     // ip literal   → node key
@@ -446,14 +447,12 @@ ORDER BY a.id`, taskID)
 	svcByHost := map[string]string{}
 	companyIDs := map[int64]bool{} // referenced company ids (need a node)
 
-	add := func(n CoverageGraphNode) *CoverageGraphNode {
+	add := func(n CoverageGraphNode) {
 		if _, ok := byKey[n.Key]; ok {
-			return byKey[n.Key]
+			return
 		}
 		g.Nodes = append(g.Nodes, n)
-		p := &g.Nodes[len(g.Nodes)-1]
-		byKey[n.Key] = p
-		return p
+		byKey[n.Key] = struct{}{}
 	}
 
 	for rows.Next() {
@@ -468,25 +467,25 @@ ORDER BY a.id`, taskID)
 		n.CompanyID = companyID
 		n.InScope = true
 		n.Label = coverageNodeLabel(&n)
-		p := add(n)
+		add(n)
 		switch n.Kind {
 		case "root_domain":
 			if n.Domain != "" {
-				rootByDomain[n.Domain] = p.Key
+				rootByDomain[n.Domain] = n.Key
 			}
 		case "subdomain":
 			if n.Domain != "" {
-				subByDomain[n.Domain] = p.Key
+				subByDomain[n.Domain] = n.Key
 			}
 		case "ip":
 			if n.IP != "" {
-				ipByAddr[n.IP] = p.Key
+				ipByAddr[n.IP] = n.Key
 			}
 		case "service":
-			host, port := hostPortOf(p)
+			host, port := hostPortOf(&n)
 			if host != "" {
-				svcByHost[host] = p.Key
-				svcByHostPort[host+"|"+strconv.Itoa(port)] = p.Key
+				svcByHost[host] = n.Key
+				svcByHostPort[host+"|"+strconv.Itoa(port)] = n.Key
 			}
 		}
 		if companyID > 0 {
@@ -498,7 +497,7 @@ ORDER BY a.id`, taskID)
 	}
 
 	// Connector root domains: any subdomain whose root domain is not itself an
-	// in-scope node. Pull the real asset row if one exists (so the drawer shows
+	// in-scope node. Pull real asset rows in one bulk query (so the drawer shows
 	// real detail), else synthesize a bare "r:<domain>" placeholder. Both gray.
 	missingRoots := map[string]bool{}
 	for _, n := range g.Nodes {
@@ -508,36 +507,86 @@ ORDER BY a.id`, taskID)
 			}
 		}
 	}
-	for root := range missingRoots {
-		var id, companyID int64
-		err := s.db.QueryRow(`SELECT id, COALESCE(company_id,0) FROM assets
-WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
-		var node CoverageGraphNode
-		if err == nil && id > 0 {
-			node = CoverageGraphNode{Key: assetKey(id), Kind: "root_domain", AssetID: id,
-				CompanyID: companyID, Domain: root, Label: root}
-			if companyID > 0 {
-				companyIDs[companyID] = true
-			}
-		} else {
-			node = CoverageGraphNode{Key: "r:" + root, Kind: "root_domain", Domain: root, Label: root}
+	if len(missingRoots) > 0 {
+		missingRootList := make([]string, 0, len(missingRoots))
+		for root := range missingRoots {
+			missingRootList = append(missingRootList, root)
 		}
-		add(node)
-		rootByDomain[root] = node.Key
+		slices.Sort(missingRootList)
+
+		type rootRef struct {
+			id        int64
+			companyID int64
+		}
+		foundRoots := make(map[string]rootRef, len(missingRootList))
+		rootRows, err := s.db.Query(`
+SELECT DISTINCT ON (domain) domain, id, COALESCE(company_id, 0)
+FROM assets
+WHERE type = 'root_domain' AND domain = ANY($1::text[])
+ORDER BY domain, id`, missingRootList)
+		if err != nil {
+			return nil, err
+		}
+		for rootRows.Next() {
+			var domain string
+			var ref rootRef
+			if err := rootRows.Scan(&domain, &ref.id, &ref.companyID); err != nil {
+				rootRows.Close()
+				return nil, err
+			}
+			foundRoots[domain] = ref
+		}
+		if err := rootRows.Err(); err != nil {
+			rootRows.Close()
+			return nil, err
+		}
+		rootRows.Close()
+
+		for _, root := range missingRootList {
+			var node CoverageGraphNode
+			if ref, ok := foundRoots[root]; ok && ref.id > 0 {
+				node = CoverageGraphNode{Key: assetKey(ref.id), Kind: "root_domain", AssetID: ref.id,
+					CompanyID: ref.companyID, Domain: root, Label: root}
+				if ref.companyID > 0 {
+					companyIDs[ref.companyID] = true
+				}
+			} else {
+				node = CoverageGraphNode{Key: "r:" + root, Kind: "root_domain", Domain: root, Label: root}
+			}
+			add(node)
+			rootByDomain[root] = node.Key
+		}
 	}
 
 	// Company nodes for every referenced company id — always gray context.
+	// Fetch all referenced companies in a single query instead of per-id lookups.
+	needCompanyIDs := make([]int64, 0, len(companyIDs))
 	for id := range companyIDs {
-		key := companyKey(id)
-		if _, ok := byKey[key]; ok {
-			continue
+		if _, ok := byKey[companyKey(id)]; !ok {
+			needCompanyIDs = append(needCompanyIDs, id)
 		}
-		var name string
-		if err := s.db.QueryRow(`SELECT name FROM companies WHERE id=$1`, id).Scan(&name); err != nil {
-			continue
+	}
+	if len(needCompanyIDs) > 0 {
+		slices.Sort(needCompanyIDs)
+		compRows, err := s.db.Query(`SELECT id, name FROM companies WHERE id = ANY($1::bigint[]) ORDER BY id`, needCompanyIDs)
+		if err != nil {
+			return nil, err
 		}
-		add(CoverageGraphNode{Key: key, Kind: "company", CompanyID: id,
-			Label: name, AssetID: 0})
+		for compRows.Next() {
+			var id int64
+			var name string
+			if err := compRows.Scan(&id, &name); err != nil {
+				compRows.Close()
+				return nil, err
+			}
+			add(CoverageGraphNode{Key: companyKey(id), Kind: "company", CompanyID: id,
+				Label: name, AssetID: 0})
+		}
+		if err := compRows.Err(); err != nil {
+			compRows.Close()
+			return nil, err
+		}
+		compRows.Close()
 	}
 
 	// Derived containment edges (only when the parent node exists).

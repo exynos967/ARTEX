@@ -312,13 +312,13 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 		return "(" + strings.Join(parts, " OR ") + ")", nil
 	}
 
-	// task_id: $N = ANY(task_ids)
+	// task_id: task_ids @> ARRAY[$N]::bigint[] (uses idx_av2_task_ids GIN index)
 	if f == "task_id" {
 		n, err := strconv.ParseInt(e.Value, 10, 64)
 		if err != nil {
 			return "", fmt.Errorf("task_id 需要整数值: %s", e.Value)
 		}
-		return b.next(n) + " = ANY(task_ids)", nil
+		return "task_ids @> ARRAY[" + b.next(n) + "]::bigint[]", nil
 	}
 
 	// company_id: exact integer
@@ -495,7 +495,7 @@ func (s *AssetStore) CountDSL(dsl, typ string, taskID int64) (int, error) {
 	}
 	if taskID > 0 {
 		args = append(args, taskID)
-		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
+		where += fmt.Sprintf(" AND task_ids @> ARRAY[$%d]::bigint[]", len(args))
 	}
 	var n int
 	err = s.db.QueryRow("SELECT count(*) FROM assets WHERE "+where, args...).Scan(&n)
@@ -527,7 +527,7 @@ func (s *AssetStore) QueryDSL(dsl, typ string, taskID int64, limit, offset int) 
 	}
 	if taskID > 0 {
 		args = append(args, taskID)
-		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
+		where += fmt.Sprintf(" AND task_ids @> ARRAY[$%d]::bigint[]", len(args))
 	}
 	args = append(args, limit, offset)
 	q := assetSelectCols + " WHERE " + where +

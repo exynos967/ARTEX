@@ -173,23 +173,26 @@ WHERE id=$1`,
 // 停用一个渠道时，把它尚未发出的投递一并标记为 skipped：否则重新启用后
 // 会突然收到一批「停用期间积压」的旧漏洞，时效已失且容易误判为新增。
 func (d *DB) SetNotificationChannelEnabled(ctx context.Context, id int64, enabled bool) error {
-	return d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE notification_channels SET enabled=$2 WHERE id=$1`, id, enabled)
-		if err != nil {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // 提交成功后是 no-op
+	res, err := tx.ExecContext(ctx, `UPDATE notification_channels SET enabled=$2 WHERE id=$1`, id, enabled)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotificationChannelNotFound
+	}
+	if !enabled {
+		if _, err := tx.ExecContext(ctx, `UPDATE notification_deliveries SET state=$2, last_error=$3
+WHERE channel_id=$1 AND state IN ('pending','sending')`,
+			id, NotifyStateSkipped, "渠道已停用"); err != nil {
 			return err
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return ErrNotificationChannelNotFound
-		}
-		if !enabled {
-			if _, err := tx.ExecContext(ctx, `UPDATE notification_deliveries SET state=$2, last_error=$3
-WHERE channel_id=$1 AND state IN ($4,$5)`,
-				id, NotifyStateSkipped, "渠道已停用", NotifyStatePending, NotifyStateSending); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return tx.Commit()
 }
 
 // DeleteNotificationChannel 删除渠道。其投递历史随外键级联删除
@@ -379,22 +382,29 @@ FROM notification_channels WHERE enabled ORDER BY id`)
 	return out, rows.Err()
 }
 
-// NotificationAssetNames 把资产 id 解析成简短展示名，供推送消息使用。
-//
-// 返回顺序与入参一致、长度可能小于入参（不存在的 id 被跳过）。保持入参顺序是
-// 为了让同一条漏洞的消息在多次投递里资产顺序稳定——否则重试后收到的消息里
-// 资产次序变了，会被误读成「资产变了」。
-func (d *DB) NotificationAssetNames(ctx context.Context, ids []int64) ([]string, error) {
-	if len(ids) == 0 {
-		return nil, nil
+// NotificationAssetNamesBatch 批量把资产 id 解析为 id → 简短展示名 映射，
+// 供汇总推送在单次查询内补齐整批漏洞关联的资产名，避免逐条 N+1 往返。
+func (d *DB) NotificationAssetNamesBatch(ctx context.Context, assetIDs []int64) (map[int64]string, error) {
+	if len(assetIDs) == 0 {
+		return map[int64]string{}, nil
 	}
-	ph, args := placeholders(1, ids)
-	rows, err := d.QueryContext(ctx, `SELECT id, type, domain, ip, url, app_name, bundle_id FROM assets WHERE id IN (`+ph+`)`, args...)
+	unique := make([]int64, 0, len(assetIDs))
+	seen := make(map[int64]struct{}, len(assetIDs))
+	for _, id := range assetIDs {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	rows, err := d.QueryContext(ctx,
+		`SELECT id, type, domain, ip, url, app_name, bundle_id FROM assets WHERE id = ANY($1::bigint[])`,
+		unique)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	labels := map[int64]string{}
+	labels := make(map[int64]string, len(unique))
 	for rows.Next() {
 		var (
 			id                int64
@@ -405,13 +415,35 @@ func (d *DB) NotificationAssetNames(ctx context.Context, ids []int64) ([]string,
 		if err := rows.Scan(&id, &typ, &domain, &ip, &url, &appName, &bundleID); err != nil {
 			return nil, err
 		}
-		labels[id] = assetDisplayName(typ, domain.String, ip.String, url.String, appName.String, bundleID.String)
+		if label := assetDisplayName(typ, domain.String, ip.String, url.String, appName.String, bundleID.String); label != "" {
+			labels[id] = label
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	return labels, nil
+}
+
+// NotificationAssetNames 把资产 id 解析成简短展示名，供推送消息使用。
+//
+// 返回顺序与入参一致、长度可能小于入参（不存在的 id 被跳过）。保持入参顺序是
+// 为了让同一条漏洞的消息在多次投递里资产顺序稳定——否则重试后收到的消息里
+// 资产次序变了，会被误读成「资产变了」。
+func (d *DB) NotificationAssetNames(ctx context.Context, ids []int64) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	labels, err := d.NotificationAssetNamesBatch(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	return resolveNotificationAssetNames(ids, labels), nil
+}
+
+func resolveNotificationAssetNames(ids []int64, labels map[int64]string) []string {
 	out := make([]string, 0, len(ids))
-	seen := map[int64]bool{}
+	seen := make(map[int64]bool, len(ids))
 	for _, id := range ids {
 		if seen[id] {
 			continue
@@ -421,7 +453,7 @@ func (d *DB) NotificationAssetNames(ctx context.Context, ids []int64) ([]string,
 			out = append(out, label)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // assetDisplayName 按资产类型挑选最具辨识度的标识。
@@ -539,11 +571,10 @@ func (d *DB) NotificationStatsSnapshot(ctx context.Context) (*NotificationStats,
 	if err := d.QueryRowContext(ctx, `SELECT
     (SELECT count(*) FROM notification_channels),
     (SELECT count(*) FROM notification_channels WHERE enabled),
-    (SELECT count(*) FROM notification_deliveries WHERE state IN ($1,$2)),
-    (SELECT count(*) FROM notification_deliveries WHERE state=$3),
-    (SELECT count(*) FROM notification_deliveries WHERE state=$4 AND sent_at >= date_trunc('day', now())),
-    COALESCE((SELECT EXTRACT(EPOCH FROM (now() - min(created_at))) * 1000 FROM notification_deliveries WHERE state=$1), 0)::bigint`,
-		NotifyStatePending, NotifyStateSending, NotifyStateFailed, NotifyStateSent).
+    (SELECT count(*) FROM notification_deliveries WHERE state IN ('pending','sending')),
+    (SELECT count(*) FROM notification_deliveries WHERE state='failed'),
+    (SELECT count(*) FROM notification_deliveries WHERE state='sent' AND sent_at >= date_trunc('day', now())),
+    COALESCE((SELECT EXTRACT(EPOCH FROM (now() - min(created_at))) * 1000 FROM notification_deliveries WHERE state='pending'), 0)::bigint`).
 		Scan(&s.Channels, &s.ChannelsOn, &s.Pending, &s.Failed, &s.SentToday, &s.BacklogAgeMS); err != nil {
 		return nil, err
 	}

@@ -2,6 +2,8 @@ package resourcelib
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -249,7 +251,7 @@ func TestResourceAuthorizationRevocationAndLockCancellation(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer tx.Rollback()
-	if _, e = tx.Exec(`SELECT pg_advisory_xact_lock(7337741010)`); e != nil {
+	if _, e = tx.Exec(`SELECT pg_advisory_xact_lock($1)`, db.LockResourceLibrary); e != nil {
 		t.Fatal(e)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Millisecond)
@@ -386,5 +388,79 @@ func TestResourceMaintenanceKeepsPublishedAndActiveDraftFiles(t *testing.T) {
 		if _, e = os.Stat(s.BlobPath(f)); e != nil {
 			t.Fatalf("referenced file removed: %v", e)
 		}
+	}
+}
+
+type stubResConnector struct{ state *stubResState }
+
+func (c *stubResConnector) Connect(context.Context) (driver.Conn, error) {
+	return &stubResConn{state: c.state}, nil
+}
+func (c *stubResConnector) Driver() driver.Driver { return stubResDriver{} }
+
+type stubResDriver struct{}
+
+func (stubResDriver) Open(string) (driver.Conn, error) { return nil, errors.New("use OpenDB") }
+
+type stubResState struct {
+	mu      sync.Mutex
+	queries []string
+}
+
+type stubResConn struct{ state *stubResState }
+
+func (c *stubResConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unused") }
+func (c *stubResConn) Close() error                        { return nil }
+func (c *stubResConn) Begin() (driver.Tx, error)           { return stubResTx{}, nil }
+func (c *stubResConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.state.mu.Lock()
+	c.state.queries = append(c.state.queries, query)
+	c.state.mu.Unlock()
+	return driver.RowsAffected(0), nil
+}
+func (c *stubResConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	c.state.mu.Lock()
+	c.state.queries = append(c.state.queries, query)
+	c.state.mu.Unlock()
+	if strings.Contains(query, "pg_try_advisory_xact_lock") {
+		return &stubResRows{cols: []string{"locked"}, vals: [][]driver.Value{{false}}}, nil
+	}
+	return &stubResRows{cols: []string{"col"}}, nil
+}
+
+type stubResTx struct{}
+
+func (stubResTx) Commit() error   { return nil }
+func (stubResTx) Rollback() error { return nil }
+
+type stubResRows struct {
+	cols []string
+	vals [][]driver.Value
+	idx  int
+}
+
+func (r *stubResRows) Columns() []string { return r.cols }
+func (r *stubResRows) Close() error      { return nil }
+func (r *stubResRows) Next(dest []driver.Value) error {
+	if r.idx >= len(r.vals) {
+		return io.EOF
+	}
+	copy(dest, r.vals[r.idx])
+	r.idx++
+	return nil
+}
+
+func TestSweepSetsMaintenanceTimeouts(t *testing.T) {
+	st := &stubResState{}
+	sqlDB := sql.OpenDB(&stubResConnector{state: st})
+	defer sqlDB.Close()
+
+	s := &Store{DB: sqlDB, Root: t.TempDir()}
+	n, err := s.Sweep(t.Context(), time.Now())
+	if err != nil || n != 0 {
+		t.Fatalf("Sweep returned n=%d err=%v, want 0/nil", n, err)
+	}
+	if len(st.queries) < 2 || !strings.Contains(st.queries[0], "SET LOCAL idle_in_transaction_session_timeout = '0'") {
+		t.Fatalf("Sweep did not set maintenance timeouts before lock probe: %v", st.queries)
 	}
 }

@@ -1,6 +1,8 @@
 package db
 
 import (
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"slices"
@@ -869,13 +871,24 @@ func TestCalcCSegment(t *testing.T) {
 // =====================================================================
 
 func TestMarshalStringArray(t *testing.T) {
-	got := marshalStringArray([]string{"a", "b", "c"})
-	if got != `{"a","b","c"}` {
-		t.Errorf("unexpected: %q", got)
+	cases := []struct {
+		name string
+		in   []string
+		want string
+	}{
+		{"empty", nil, "{}"},
+		{"plain", []string{"a", "b", "c"}, `{"a","b","c"}`},
+		{"quotes", []string{`a"b`}, `{"a\"b"}`},
+		{"backslashes", []string{`c:\windows\system32`}, `{"c:\\windows\\system32"}`},
+		{"trailing_backslash", []string{`trail\`}, `{"trail\\"}`},
+		{"backslash_and_quote", []string{`a\"b`, `x,y`, `{z}`}, `{"a\\\"b","x,y","{z}"}`},
 	}
-	got2 := marshalStringArray(nil)
-	if got2 != "{}" {
-		t.Errorf("empty: %q", got2)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := marshalStringArray(tc.in); got != tc.want {
+				t.Fatalf("marshalStringArray(%q)=%q want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1123,4 +1136,189 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	if !sawOut {
 		t.Fatalf("taskID<=0 should fall back to global and include out-of-scope asset %d", outIDs[0])
 	}
+}
+
+type fakeSavepointExec struct {
+	queries []string
+	failOn  string
+}
+
+func (f *fakeSavepointExec) Exec(query string, _ ...any) (sql.Result, error) {
+	f.queries = append(f.queries, query)
+	if f.failOn != "" && query == f.failOn {
+		return nil, errors.New("savepoint failed")
+	}
+	return fakeResult(0), nil
+}
+
+func TestWithOptionalSavepoint(t *testing.T) {
+	t.Run("success_releases_savepoint", func(t *testing.T) {
+		exec := &fakeSavepointExec{}
+		err := withOptionalSavepointExec(exec, "sp_ok", func() error {
+			exec.queries = append(exec.queries, "WORK")
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		want := []string{"SAVEPOINT sp_ok", "WORK", "RELEASE SAVEPOINT sp_ok"}
+		if !slices.Equal(exec.queries, want) {
+			t.Fatalf("queries=%v want %v", exec.queries, want)
+		}
+	})
+
+	t.Run("error_rolls_back_and_releases_savepoint", func(t *testing.T) {
+		exec := &fakeSavepointExec{}
+		sentinel := errors.New("constraint failed")
+		err := withOptionalSavepointExec(exec, "sp_err", func() error {
+			exec.queries = append(exec.queries, "BAD_WORK")
+			return sentinel
+		})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("err=%v want %v", err, sentinel)
+		}
+		want := []string{"SAVEPOINT sp_err", "BAD_WORK", "ROLLBACK TO SAVEPOINT sp_err", "RELEASE SAVEPOINT sp_err"}
+		if !slices.Equal(exec.queries, want) {
+			t.Fatalf("queries=%v want %v", exec.queries, want)
+		}
+	})
+
+	t.Run("savepoint_creation_error_skips_fn", func(t *testing.T) {
+		exec := &fakeSavepointExec{failOn: "SAVEPOINT sp_fail"}
+		called := false
+		if err := withOptionalSavepointExec(exec, "sp_fail", func() error {
+			called = true
+			return nil
+		}); err == nil || called {
+			t.Fatalf("expected error without calling fn: err=%v called=%v", err, called)
+		}
+	})
+}
+
+func TestCanonicalAssetUpsertOrderAndSavepointIsolation(t *testing.T) {
+	extractAssetOrder := func(events []stubExecEvent) []string {
+		var order []string
+		for _, ev := range events {
+			switch {
+			case strings.Contains(ev.query, "VALUES ('root_domain'"):
+				order = append(order, "root_domain")
+			case strings.Contains(ev.query, "VALUES ('subdomain'"):
+				order = append(order, "subdomain")
+			case strings.Contains(ev.query, "VALUES ('ip'"):
+				ip, _ := ev.args[0].(string)
+				order = append(order, "ip:"+ip)
+			case strings.Contains(ev.query, "VALUES (\n    'service', $1, 'http'"):
+				order = append(order, "service_http")
+			case strings.Contains(ev.query, "VALUES ('service', 'other'"):
+				order = append(order, "service_other")
+			case strings.Contains(ev.query, "VALUES ('endpoint'"):
+				order = append(order, "endpoint")
+			}
+		}
+		return order
+	}
+
+	newStubAssetStore := func(failIP bool) (*stubSQLState, *AssetStore) {
+		var nextID int64 = 10
+		st := &stubSQLState{
+			queryHandler: func(_ int, _ bool, query string, _ []any) ([]string, [][]driver.Value, error) {
+				if strings.Contains(query, "FROM company_scope") {
+					return []string{"company_id"}, nil, nil
+				}
+				if strings.Contains(query, "INSERT INTO assets") {
+					if failIP && strings.Contains(query, "VALUES ('ip'") {
+						return nil, nil, errors.New("simulated ip upsert failure")
+					}
+					nextID++
+					return []string{"id"}, [][]driver.Value{{nextID}}, nil
+				}
+				return []string{"col"}, nil, nil
+			},
+		}
+		d := st.openDB()
+		t.Cleanup(func() { d.Close() })
+		return st, d.Assets()
+	}
+
+	t.Run("UpsertSubdomain_order_root_subdomain_sorted_ips", func(t *testing.T) {
+		st, store := newStubAssetStore(false)
+		id, err := store.UpsertSubdomain(UpsertSubdomainReq{
+			Domain:      "api.example.com",
+			RecordType:  "A",
+			RecordValue: []string{"10.0.0.9", "10.0.0.2"},
+			TaskID:      1,
+		})
+		if err != nil || id == 0 {
+			t.Fatalf("UpsertSubdomain id=%d err=%v", id, err)
+		}
+		got := extractAssetOrder(st.snapshotEvents())
+		want := []string{"root_domain", "subdomain", "ip:10.0.0.2", "ip:10.0.0.9"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("UpsertSubdomain order=%v want %v", got, want)
+		}
+	})
+
+	t.Run("UpsertHTTPService_order_root_subdomain_ip_service", func(t *testing.T) {
+		st, store := newStubAssetStore(false)
+		id, err := store.UpsertHTTPService(UpsertHTTPServiceReq{
+			URL:    "https://app.example.com:8443/login",
+			IP:     "10.0.0.5",
+			TaskID: 1,
+		})
+		if err != nil || id == 0 {
+			t.Fatalf("UpsertHTTPService id=%d err=%v", id, err)
+		}
+		got := extractAssetOrder(st.snapshotEvents())
+		want := []string{"root_domain", "subdomain", "ip:10.0.0.5", "service_http"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("UpsertHTTPService order=%v want %v", got, want)
+		}
+	})
+
+	t.Run("UpsertOtherService_order_root_subdomain_ip_service_and_savepoint_recovery", func(t *testing.T) {
+		st, store := newStubAssetStore(true)
+		id, err := store.UpsertOtherService(UpsertOtherServiceReq{
+			Domain:      "db.example.com",
+			IP:          "10.0.0.8",
+			Port:        5432,
+			ServiceName: "postgres",
+			TaskID:      1,
+		})
+		if err != nil || id == 0 {
+			t.Fatalf("UpsertOtherService should survive side-effect IP error via SAVEPOINT: id=%d err=%v", id, err)
+		}
+		events := st.snapshotEvents()
+		got := extractAssetOrder(events)
+		want := []string{"root_domain", "subdomain", "ip:10.0.0.8", "service_other"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("UpsertOtherService order=%v want %v", got, want)
+		}
+		var sawRollbackToSavepoint bool
+		for _, ev := range events {
+			if ev.query == "ROLLBACK TO SAVEPOINT sp_other_ip" {
+				sawRollbackToSavepoint = true
+			}
+		}
+		if !sawRollbackToSavepoint {
+			t.Fatalf("expected ROLLBACK TO SAVEPOINT sp_other_ip on side-effect failure; events=%+v", events)
+		}
+	})
+
+	t.Run("UpsertEndpoint_order_root_subdomain_ip_endpoint", func(t *testing.T) {
+		st, store := newStubAssetStore(false)
+		id, err := store.UpsertEndpoint(UpsertEndpointReq{
+			URL:    "https://api.example.com/v1/users",
+			Method: "GET",
+			IP:     "10.0.0.12",
+			TaskID: 1,
+		})
+		if err != nil || id == 0 {
+			t.Fatalf("UpsertEndpoint id=%d err=%v", id, err)
+		}
+		got := extractAssetOrder(st.snapshotEvents())
+		want := []string{"root_domain", "subdomain", "ip:10.0.0.12", "endpoint"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("UpsertEndpoint order=%v want %v", got, want)
+		}
+	})
 }

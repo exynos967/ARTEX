@@ -4,10 +4,14 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 	"time"
@@ -20,12 +24,190 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
-const schemaMigrationLockKey int64 = 7337741001
+const schemaMigrationLockKey int64 = LockSchemaMigration
 
-// maxOpenConns 是连接池上限，见 Open 里的说明。取值远低于 PostgreSQL 默认的
-// max_connections=100，同时远高于应用自身的嵌套取连接深度（启动期的 schema
-// advisory lock 会在持有一条连接的同时让 seedBuiltins 另取连接），不会自锁。
-const maxOpenConns = 32
+// maxOpenConns / maxIdleConns 是主库连接池上限，见 Open 里的说明。留足余量给
+// traffic 连接池、psql / reset-password.sh 以及可能并存的其他实例，同时远高于
+// 启动期 schema advisory lock 的嵌套取连接深度，不会自锁。
+const (
+	maxOpenConns = 18
+	maxIdleConns = 8
+)
+
+var defaultDSNTimeouts = []struct {
+	key string
+	val string
+}{
+	{"connect_timeout", "5"},
+	{"statement_timeout", "30000"},
+	{"lock_timeout", "5000"},
+	{"idle_in_transaction_session_timeout", "30000"},
+}
+
+// applyDefaultTimeouts injects conservative connection/session timeouts into a
+// PostgreSQL DSN (URL or keyword-value format) only when the caller has not
+// already specified them explicitly (either as top-level parameters or via
+// PostgreSQL `options`).
+func applyDefaultTimeouts(dsn string) string {
+	trimmed := strings.TrimSpace(dsn)
+	if trimmed == "" {
+		return dsn
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return dsn
+		}
+		q := u.Query()
+		optionsVal := queryValueFold(q, "options")
+		changed := false
+		for _, def := range defaultDSNTimeouts {
+			if hasQueryKeyFold(q, def.key) || hasPGOption(optionsVal, def.key) {
+				continue
+			}
+			q.Set(def.key, def.val)
+			changed = true
+		}
+		if !changed {
+			return dsn
+		}
+		u.RawQuery = q.Encode()
+		return u.String()
+	}
+
+	keys, optionsVal := parseKeywordDSNKeys(trimmed)
+	var extra []string
+	for _, def := range defaultDSNTimeouts {
+		if keys[def.key] || hasPGOption(optionsVal, def.key) {
+			continue
+		}
+		extra = append(extra, def.key+"="+def.val)
+	}
+	if len(extra) == 0 {
+		return dsn
+	}
+	return trimmed + " " + strings.Join(extra, " ")
+}
+
+func hasQueryKeyFold(q url.Values, target string) bool {
+	for k := range q {
+		if strings.EqualFold(k, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func queryValueFold(q url.Values, target string) string {
+	for k, vals := range q {
+		if strings.EqualFold(k, target) && len(vals) > 0 {
+			return vals[len(vals)-1]
+		}
+	}
+	return ""
+}
+
+// hasPGOption reports whether a libpq `options` string configures the given GUC
+// parameter via `-c key=val`, `-c key = val`, or `--key=val`.
+func hasPGOption(options, key string) bool {
+	if strings.TrimSpace(options) == "" {
+		return false
+	}
+	fields := strings.Fields(options)
+	for i := 0; i < len(fields); i++ {
+		tok := fields[i]
+		var assign string
+		switch {
+		case tok == "-c" && i+1 < len(fields):
+			i++
+			assign = fields[i]
+		case strings.HasPrefix(tok, "-c") && len(tok) > 2:
+			assign = tok[2:]
+		case strings.HasPrefix(tok, "--") && len(tok) > 2:
+			assign = tok[2:]
+		default:
+			continue
+		}
+		name, _, hasEq := strings.Cut(assign, "=")
+		if !hasEq && i+1 < len(fields) && strings.HasPrefix(fields[i+1], "=") {
+			hasEq = true
+		}
+		if hasEq && strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(name), "-", "_"), key) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseKeywordDSNKeys extracts lowercased parameter names (and the `options`
+// value if present) from a libpq keyword=value connection string, honoring
+// single-quoted values and backslash escapes.
+func parseKeywordDSNKeys(dsn string) (map[string]bool, string) {
+	keys := map[string]bool{}
+	var optionsVal string
+	i, n := 0, len(dsn)
+	skipSpace := func() {
+		for i < n && (dsn[i] == ' ' || dsn[i] == '\t' || dsn[i] == '\n' || dsn[i] == '\r') {
+			i++
+		}
+	}
+	for i < n {
+		skipSpace()
+		if i >= n {
+			break
+		}
+		start := i
+		for i < n && dsn[i] != '=' && dsn[i] != ' ' && dsn[i] != '\t' && dsn[i] != '\n' && dsn[i] != '\r' {
+			i++
+		}
+		key := strings.ToLower(dsn[start:i])
+		skipSpace()
+		if i >= n || dsn[i] != '=' {
+			// Skip malformed token to avoid infinite loop.
+			for i < n && dsn[i] != ' ' && dsn[i] != '\t' && dsn[i] != '\n' && dsn[i] != '\r' {
+				i++
+			}
+			continue
+		}
+		i++ // consume '='
+		skipSpace()
+		var val strings.Builder
+		if i < n && dsn[i] == '\'' {
+			i++ // opening quote
+			for i < n {
+				if dsn[i] == '\\' && i+1 < n {
+					val.WriteByte(dsn[i+1])
+					i += 2
+					continue
+				}
+				if dsn[i] == '\'' {
+					i++
+					break
+				}
+				val.WriteByte(dsn[i])
+				i++
+			}
+		} else {
+			for i < n && dsn[i] != ' ' && dsn[i] != '\t' && dsn[i] != '\n' && dsn[i] != '\r' {
+				if dsn[i] == '\\' && i+1 < n {
+					val.WriteByte(dsn[i+1])
+					i += 2
+					continue
+				}
+				val.WriteByte(dsn[i])
+				i++
+			}
+		}
+		if key != "" {
+			keys[key] = true
+			if key == "options" {
+				optionsVal = val.String()
+			}
+		}
+	}
+	return keys, optionsVal
+}
 
 var schemaDeadlockRetryDelays = [...]time.Duration{
 	100 * time.Millisecond,
@@ -36,6 +218,47 @@ var schemaDeadlockRetryDelays = [...]time.Duration{
 
 type schemaExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+type schemaMigrationRunner interface {
+	schemaExecer
+	CurrentSchemaDigest(ctx context.Context, key string) (string, bool, error)
+}
+
+type sqlSchemaMigrator struct {
+	conn *sql.Conn
+}
+
+func (m sqlSchemaMigrator) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return m.conn.ExecContext(ctx, query, args...)
+}
+
+func (m sqlSchemaMigrator) CurrentSchemaDigest(ctx context.Context, key string) (string, bool, error) {
+	var hash string
+	err := m.conn.QueryRowContext(ctx, `SELECT sha256 FROM schema_migrations WHERE key = $1`, key).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return hash, true, nil
+}
+
+const schemaMigrationKey = "schema.sql"
+
+const schemaMigrationsTableDDL = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    key TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)`
+
+// schemaDigest computes the deterministic SHA-256 hex digest used to gate
+// startup DDL re-execution via schema_migrations.
+func schemaDigest(sqlText string) string {
+	sum := sha256.Sum256([]byte(sqlText))
+	return hex.EncodeToString(sum[:])
 }
 
 func isPostgresDeadlock(err error) bool {
@@ -56,24 +279,146 @@ func applySchemaWithRetry(ctx context.Context, execer schemaExecer, sleep func(t
 	}
 }
 
-// withSchemaMigrationLock pins the session-level lock to one checked-out
-// connection. Running pg_advisory_lock through *sql.DB is incorrect because a
-// later schema or unlock call may use a different pooled PostgreSQL session.
-func withSchemaMigrationLock(ctx context.Context, sqlDB *sql.DB, action func(*sql.Conn) error) (err error) {
+// applySchemaIfChanged ensures schema_migrations exists and skips re-running
+// schema.sql when its SHA-256 digest matches the last applied version.
+func applySchemaIfChanged(ctx context.Context, m schemaMigrationRunner, sleep func(time.Duration)) (bool, error) {
+	if _, err := m.ExecContext(ctx, schemaMigrationsTableDDL); err != nil {
+		return false, fmt.Errorf("ensure schema_migrations: %w", err)
+	}
+	wantHash := schemaDigest(schemaSQL)
+	gotHash, ok, err := m.CurrentSchemaDigest(ctx, schemaMigrationKey)
+	if err != nil {
+		return false, fmt.Errorf("read schema_migrations: %w", err)
+	}
+	if ok && gotHash == wantHash {
+		log.Printf("[pg] schema up-to-date, skipped DDL")
+		return false, nil
+	}
+	if err := applySchemaWithRetry(ctx, m, sleep); err != nil {
+		return false, err
+	}
+	if _, err := m.ExecContext(ctx, `
+INSERT INTO schema_migrations(key, sha256, applied_at)
+VALUES ($1, $2, now())
+ON CONFLICT (key) DO UPDATE
+    SET sha256 = EXCLUDED.sha256,
+        applied_at = EXCLUDED.applied_at`, schemaMigrationKey, wantHash); err != nil {
+		return false, fmt.Errorf("record schema_migrations: %w", err)
+	}
+	return true, nil
+}
+
+const (
+	maintenanceLocalTimeoutsSQL        = `SET LOCAL statement_timeout = '0'; SET LOCAL lock_timeout = '30s'; SET LOCAL idle_in_transaction_session_timeout = '0'`
+	maintenanceSessionTimeoutsSQL      = `SET statement_timeout = '0'; SET lock_timeout = '30s'; SET idle_in_transaction_session_timeout = '0'`
+	resetMaintenanceSessionTimeoutsSQL = `RESET statement_timeout; RESET lock_timeout; RESET idle_in_transaction_session_timeout`
+	sessionCleanupTimeout              = 5 * time.Second
+)
+
+// SetMaintenanceTimeouts overrides conservative default DSN timeouts for the
+// current transaction so legitimate long-running maintenance operations (DDL,
+// backfills, archive snapshot/restore/compaction, evidence/resource sweeps) do
+// not get aborted prematurely by the 5s lock / 30s statement / 30s idle-in-tx
+// runtime limits. SET LOCAL automatically reverts at transaction end.
+func SetMaintenanceTimeouts(ctx context.Context, exec interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}) error {
+	if exec == nil {
+		return errors.New("nil maintenance timeout execer")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := exec.ExecContext(ctx, maintenanceLocalTimeoutsSQL); err != nil {
+		return fmt.Errorf("set maintenance timeouts: %w", err)
+	}
+	return nil
+}
+
+// discardConn marks a pinned *sql.Conn as bad so database/sql closes and drops
+// the underlying PostgreSQL session instead of returning a dirty session (with
+// an unreleased advisory lock or non-default session timeouts) to the pool.
+func discardConn(conn *sql.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+}
+
+// withPinnedSessionLock checks out a dedicated *sql.Conn, applies optional
+// session-level timeout overrides, acquires a session-level PostgreSQL advisory
+// lock (no open transaction, no idle_in_transaction_session_timeout, no MVCC
+// xmin pinning), runs action, and cleanly unlocks + resets timeouts before
+// returning the connection to the pool (discarding the connection if cleanup
+// fails so pool callers never inherit leaked locks or altered GUCs).
+func withPinnedSessionLock(
+	ctx context.Context,
+	sqlDB *sql.DB,
+	lockKey int64,
+	setTimeoutsSQL string,
+	resetTimeoutsSQL string,
+	action func(*sql.Conn) error,
+) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	conn, err := sqlDB.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, schemaMigrationLockKey); err != nil {
+	timeoutsSet := false
+	locked := false
+	defer func() {
+		dirty := false
+		if locked {
+			cleanCtx, cancel := context.WithTimeout(context.Background(), sessionCleanupTimeout)
+			if _, unlockErr := conn.ExecContext(cleanCtx, `SELECT pg_advisory_unlock($1)`, lockKey); unlockErr != nil {
+				dirty = true
+				if err == nil {
+					err = fmt.Errorf("advisory unlock: %w", unlockErr)
+				}
+			}
+			cancel()
+		}
+		if timeoutsSet && !dirty {
+			cleanCtx, cancel := context.WithTimeout(context.Background(), sessionCleanupTimeout)
+			if _, resetErr := conn.ExecContext(cleanCtx, resetTimeoutsSQL); resetErr != nil {
+				dirty = true
+			}
+			cancel()
+		}
+		if dirty {
+			discardConn(conn)
+		}
+		_ = conn.Close()
+	}()
+
+	if setTimeoutsSQL != "" {
+		if _, err := conn.ExecContext(ctx, setTimeoutsSQL); err != nil {
+			discardConn(conn)
+			return fmt.Errorf("set session timeouts: %w", err)
+		}
+		timeoutsSet = true
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
 		return fmt.Errorf("advisory lock: %w", err)
 	}
-	defer func() {
-		if _, unlockErr := conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, schemaMigrationLockKey); unlockErr != nil && err == nil {
-			err = fmt.Errorf("advisory unlock: %w", unlockErr)
-		}
-	}()
+	locked = true
 	return action(conn)
+}
+
+// withSchemaMigrationLock pins the session-level lock to one checked-out
+// connection with maintenance session timeouts so startup DDL and backfills
+// never trip the short runtime lock/statement defaults.
+func withSchemaMigrationLock(ctx context.Context, sqlDB *sql.DB, action func(*sql.Conn) error) error {
+	return withPinnedSessionLock(
+		ctx,
+		sqlDB,
+		schemaMigrationLockKey,
+		maintenanceSessionTimeoutsSQL,
+		resetMaintenanceSessionTimeoutsSQL,
+		action,
+	)
 }
 
 // coordinateWithSchemaMigration makes long, multi-table archive transactions
@@ -96,6 +441,11 @@ func DSN() (dsn, source string, err error) {
 // DB wraps the shared *sql.DB. PG handles its own connection pool + concurrency
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
 type DB struct{ *sql.DB }
+
+// quotePGIdent safely quotes a PostgreSQL identifier by doubling embedded double quotes.
+func quotePGIdent(ident string) string {
+	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
+}
 
 // ensureDatabase connects to the postgres system database and creates the target
 // database if it does not exist. dsn must be a postgres:// URL.
@@ -122,7 +472,7 @@ func ensureDatabase(dsn string) error {
 	var exists bool
 	_ = admin.QueryRow(`SELECT true FROM pg_database WHERE datname=$1`, dbName).Scan(&exists)
 	if !exists {
-		if _, err := admin.Exec(`CREATE DATABASE "` + dbName + `"`); err != nil {
+		if _, err := admin.Exec(`CREATE DATABASE ` + quotePGIdent(dbName)); err != nil {
 			return fmt.Errorf("create database %q: %w", dbName, err)
 		}
 	}
@@ -131,10 +481,11 @@ func ensureDatabase(dsn string) error {
 
 // Open connects, applies the schema (idempotent), and seeds builtin rows.
 func Open(dsn string) (*DB, error) {
-	if err := ensureDatabase(dsn); err != nil {
+	effectiveDSN := applyDefaultTimeouts(dsn)
+	if err := ensureDatabase(effectiveDSN); err != nil {
 		return nil, err
 	}
-	sqlDB, err := sql.Open("pgx", dsn)
+	sqlDB, err := sql.Open("pgx", effectiveDSN)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +496,7 @@ func Open(dsn string) (*DB, error) {
 	// "读不到"和"没有"。maxOpenConns 要留出余量给 psql / reset-password.sh 以及
 	// 可能并存的其他实例；若 max_connections 调低过，这里也要跟着往下调。
 	sqlDB.SetMaxOpenConns(maxOpenConns)
-	sqlDB.SetMaxIdleConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxIdleConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
 	if err := sqlDB.Ping(); err != nil {
@@ -157,7 +508,7 @@ func Open(dsn string) (*DB, error) {
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.
 	err = withSchemaMigrationLock(context.Background(), sqlDB, func(conn *sql.Conn) error {
-		if err := applySchemaWithRetry(context.Background(), conn, time.Sleep); err != nil {
+		if _, err := applySchemaIfChanged(context.Background(), sqlSchemaMigrator{conn: conn}, time.Sleep); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
 		if err := d.seedBuiltins(); err != nil {

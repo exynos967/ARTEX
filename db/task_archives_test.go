@@ -286,8 +286,8 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 		t.Fatalf("restored task = %+v, %v", live, err)
 	}
 	budget, err := d.TaskTokenBudget(t.Context(), task.ID, true)
-	if err != nil || budget.Limit != 123456 || budget.Revision != 2 {
-		t.Fatal("archive reset budget", budget, err)
+	if err != nil || budget.Limit != 123456 || budget.Revision != 2 || budget.Used != 18 {
+		t.Fatal("archive reset or miscounted budget", budget, err)
 	}
 	if live.Name != "cold task" || !live.Paused {
 		t.Fatalf("restored task metadata mismatch: %+v", live)

@@ -98,9 +98,10 @@ func (d *DB) Assets() *AssetStore {
 // Companies returns the company store associated with this asset store.
 func (s *AssetStore) Companies() *CompanyStore { return s.company }
 
-// withCompanyScopeMutation serializes scope resolution and every asset write
-// that consumes its result in one transaction. Nested asset side effects reuse
-// the same transaction through the scoped store.
+// withCompanyScopeMutation acquires a shared advisory lock so concurrent asset
+// upserts run in parallel while still serializing safely against exclusive
+// company scope mutations (recomputeAttributionTx / rule edits / task creation).
+// Nested asset side effects reuse the same transaction through the scoped store.
 func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error)) (int64, error) {
 	if s.tx != nil {
 		return fn(s)
@@ -110,7 +111,7 @@ func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := lockCompanyScopeMutation(tx); err != nil {
+	if err := lockCompanyScopeShared(tx); err != nil {
 		return 0, err
 	}
 	scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
@@ -213,13 +214,45 @@ func marshalJSONBArray(items []map[string]any) (string, error) {
 	return "{" + strings.Join(parts, ",") + "}", nil
 }
 
+type savepointExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// withOptionalSavepoint isolates a best-effort side-effect upsert inside a
+// PostgreSQL SAVEPOINT so any transient error rolls back only the side effect
+// instead of aborting the enclosing transaction into 25P02.
+func withOptionalSavepoint(tx *sql.Tx, name string, fn func() error) error {
+	if tx == nil {
+		return fn()
+	}
+	return withOptionalSavepointExec(tx, name, fn)
+}
+
+func withOptionalSavepointExec(exec savepointExecer, name string, fn func() error) error {
+	if exec == nil {
+		return fn()
+	}
+	if _, err := exec.Exec("SAVEPOINT " + name); err != nil {
+		return err
+	}
+	if err := fn(); err != nil {
+		_, _ = exec.Exec("ROLLBACK TO SAVEPOINT " + name)
+		_, _ = exec.Exec("RELEASE SAVEPOINT " + name)
+		return err
+	}
+	_, _ = exec.Exec("RELEASE SAVEPOINT " + name)
+	return nil
+}
+
 func marshalStringArray(items []string) string {
 	if len(items) == 0 {
 		return "{}"
 	}
 	escaped := make([]string, len(items))
 	for i, s := range items {
-		escaped[i] = `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+		s = strings.ReplaceAll(s, `\`, `\\`)
+		s = strings.ReplaceAll(s, `"`, `\"`)
+		escaped[i] = `"` + s + `"`
 	}
 	return "{" + strings.Join(escaped, ",") + "}"
 }
@@ -449,15 +482,19 @@ type UpsertSubdomainReq struct {
 }
 
 // UpsertSubdomain idempotently inserts or merges a subdomain asset and triggers
-// side effects: root_domain upsert + IP bound_domains update.
+// side effects in canonical lock order: root_domain -> subdomain -> ip.
 func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err error) {
+	return s.upsertSubdomain(req, true)
+}
+
+func (s *AssetStore) upsertSubdomain(req UpsertSubdomainReq, linkRoot bool) (id int64, err error) {
 	domain := DomainKey(req.Domain)
 	if domain == "" {
 		return 0, fmt.Errorf("domain is required")
 	}
 	if s.tx == nil {
 		return s.withCompanyScopeMutation(func(scoped *AssetStore) (int64, error) {
-			return scoped.UpsertSubdomain(req)
+			return scoped.upsertSubdomain(req, linkRoot)
 		})
 	}
 
@@ -472,16 +509,12 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 		return 0, err
 	}
 
-	// side effect 1: ensure root domain exists
-	_, _ = s.UpsertRootDomain(UpsertRootDomainReq{
-		Domain: rootDomain,
-		TaskID: req.TaskID,
-	})
-
-	// side effect 2: if A/AAAA record, upsert each IP + bind domain.
-	// RecordValue is []string; each element may itself be comma-separated (legacy).
+	// Extract valid IPs up front (without touching assets yet) so row locks
+	// follow the global canonical order: root_domain -> subdomain -> ip (sorted).
 	var ipStr string // first valid IP, used for the subdomain row itself
+	var validIPs []string
 	if req.RecordType == "A" || req.RecordType == "AAAA" {
+		seenIP := map[string]struct{}{}
 		for _, rv := range req.RecordValue {
 			for _, part := range strings.Split(rv, ",") {
 				candidate := strings.TrimSpace(part)
@@ -491,18 +524,29 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 				if ipStr == "" {
 					ipStr = candidate
 				}
-				_, _ = s.UpsertIP(UpsertIPReq{
-					IP:           candidate,
-					BoundDomains: []string{domain},
-					TaskID:       req.TaskID,
-				})
+				if _, dup := seenIP[candidate]; !dup {
+					seenIP[candidate] = struct{}{}
+					validIPs = append(validIPs, candidate)
+				}
 			}
 		}
+		sort.Strings(validIPs)
 	}
 
 	cseg := calcCSegment(ipStr)
 	if companyID == nil && ipStr != "" {
 		companyID, _ = s.resolveCompanyWithICP("", ipStr, "")
+	}
+
+	// side effect 1 (canonical step 1: root_domain): ensure root domain exists.
+	if linkRoot {
+		_ = withOptionalSavepoint(s.tx, "sp_sub_root", func() error {
+			_, e := s.UpsertRootDomain(UpsertRootDomainReq{
+				Domain: rootDomain,
+				TaskID: req.TaskID,
+			})
+			return e
+		})
 	}
 
 	var taskIDs string
@@ -525,6 +569,7 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 	recordType := req.RecordType
 	recordValueArr := marshalStringArray(req.RecordValue)
 
+	// canonical step 2: subdomain
 	err = s.tx.QueryRow(`
 INSERT INTO assets(type, domain, root_domain, record_type, record_value, ip, c_segment, icp, company_id, company_source, task_ids)
 VALUES ('subdomain', $1, $2, $3, $4::text[], $5, $6::cidr, $7, $8, 'scope', $9::bigint[])
@@ -546,7 +591,22 @@ ON CONFLICT (domain, COALESCE(record_type,'')) WHERE type = 'subdomain' DO UPDAT
     extra        = assets.extra || EXCLUDED.extra,
     last_seen    = now()
 RETURNING id`, domain, rootDomain, recordType, recordValueArr, ipVal, csegVal, icpVal, companyID, taskIDs).Scan(&id)
-	return id, err
+	if err != nil {
+		return 0, err
+	}
+
+	// side effect 2 (canonical step 3: ip): upsert each IP in deterministic order.
+	for _, candidate := range validIPs {
+		_ = withOptionalSavepoint(s.tx, "sp_sub_ip", func() error {
+			_, e := s.UpsertIP(UpsertIPReq{
+				IP:           candidate,
+				BoundDomains: []string{domain},
+				TaskID:       req.TaskID,
+			})
+			return e
+		})
+	}
+	return id, nil
 }
 
 // =====================================================================
@@ -735,6 +795,28 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 		faviconVal = req.FaviconMMH3
 	}
 
+	// Canonical lock/upsert order: root_domain -> subdomain -> ip -> service.
+	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	if req.IP != "" {
+		var boundDomains []string
+		if domain != "" {
+			boundDomains = []string{domain}
+		}
+		var openPorts []PortService
+		if port > 0 {
+			openPorts = []PortService{{Port: port, Service: serviceName}}
+		}
+		_ = withOptionalSavepoint(s.tx, "sp_http_ip", func() error {
+			_, e := s.UpsertIP(UpsertIPReq{
+				IP:           req.IP,
+				BoundDomains: boundDomains,
+				OpenPorts:    openPorts,
+				TaskID:       req.TaskID,
+			})
+			return e
+		})
+	}
+
 	var id int64
 	err = s.tx.QueryRow(`
 INSERT INTO assets(
@@ -779,25 +861,6 @@ RETURNING id`,
 	).Scan(&id)
 	if err != nil {
 		return 0, err
-	}
-
-	// side effects: register root_domain + subdomain as their own assets too
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
-	if req.IP != "" {
-		var boundDomains []string
-		if domain != "" {
-			boundDomains = []string{domain}
-		}
-		var openPorts []PortService
-		if port > 0 {
-			openPorts = []PortService{{Port: port, Service: serviceName}}
-		}
-		_, _ = s.UpsertIP(UpsertIPReq{
-			IP:           req.IP,
-			BoundDomains: boundDomains,
-			OpenPorts:    openPorts,
-			TaskID:       req.TaskID,
-		})
 	}
 	return id, nil
 }
@@ -880,6 +943,24 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 		csegVal = cseg
 	}
 
+	// Canonical lock/upsert order: root_domain -> subdomain -> ip -> service.
+	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	if req.IP != "" && req.Port > 0 {
+		var boundDomains []string
+		if domain != "" {
+			boundDomains = []string{domain}
+		}
+		_ = withOptionalSavepoint(s.tx, "sp_other_ip", func() error {
+			_, e := s.UpsertIP(UpsertIPReq{
+				IP:           req.IP,
+				BoundDomains: boundDomains,
+				OpenPorts:    []PortService{{Port: req.Port, Service: serviceName}},
+				TaskID:       req.TaskID,
+			})
+			return e
+		})
+	}
+
 	var id int64
 	err = s.tx.QueryRow(`
 INSERT INTO assets(
@@ -915,33 +996,25 @@ RETURNING id`,
 	if err != nil {
 		return 0, err
 	}
-
-	// side effects
-	if req.IP != "" && req.Port > 0 {
-		var boundDomains []string
-		if domain != "" {
-			boundDomains = []string{domain}
-		}
-		_, _ = s.UpsertIP(UpsertIPReq{
-			IP:           req.IP,
-			BoundDomains: boundDomains,
-			OpenPorts:    []PortService{{Port: req.Port, Service: serviceName}},
-			TaskID:       req.TaskID,
-		})
-	}
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
 	return id, nil
 }
 
 // linkHostAssets ensures a service/endpoint's host is also registered as its own
 // root_domain and (when it's a real subdomain, not the apex or an IP) subdomain
-// asset — so those asset types stay populated and can anchor task scope. Best-effort.
+// asset — in canonical order (root_domain -> subdomain), each isolated inside a
+// SAVEPOINT so a transient side-effect error cannot abort the enclosing tx.
 func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) {
 	if rootDomain != "" {
-		_, _ = s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID})
+		_ = withOptionalSavepoint(s.tx, "sp_host_root", func() error {
+			_, err := s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID})
+			return err
+		})
 	}
 	if domain != "" && domain != rootDomain && net.ParseIP(domain) == nil {
-		_, _ = s.UpsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID})
+		_ = withOptionalSavepoint(s.tx, "sp_host_sub", func() error {
+			_, err := s.upsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID}, false)
+			return err
+		})
 	}
 }
 
@@ -1015,6 +1088,15 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 		csegVal = cseg
 	}
 
+	// Canonical lock/upsert order: root_domain -> subdomain -> ip -> endpoint.
+	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	if req.IP != "" {
+		_ = withOptionalSavepoint(s.tx, "sp_ep_ip", func() error {
+			_, e := s.UpsertIP(UpsertIPReq{IP: req.IP, TaskID: req.TaskID})
+			return e
+		})
+	}
+
 	var id int64
 	err = s.tx.QueryRow(`
 INSERT INTO assets(
@@ -1049,12 +1131,6 @@ RETURNING id`,
 	).Scan(&id)
 	if err != nil {
 		return 0, err
-	}
-	// side effects: endpoint previously registered none — register its host as
-	// root_domain + subdomain(+IP) so those asset types get populated too.
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
-	if req.IP != "" {
-		_, _ = s.UpsertIP(UpsertIPReq{IP: req.IP, TaskID: req.TaskID})
 	}
 	return id, nil
 }
@@ -1165,7 +1241,7 @@ func (s *AssetStore) QueryByTask(taskID int64, typ string, limit, offset int) ([
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
        COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
-FROM assets WHERE $1 = ANY(task_ids)`
+FROM assets WHERE task_ids @> ARRAY[$1]::bigint[]`
 	args := []any{taskID}
 	if typ != "" {
 		args = append(args, typ)
@@ -1188,7 +1264,7 @@ FROM assets WHERE $1 = ANY(task_ids)`
 }
 
 func (s *AssetStore) CountByTask(taskID int64, typ string) (int, error) {
-	q := `SELECT count(*) FROM assets WHERE $1 = ANY(task_ids)`
+	q := `SELECT count(*) FROM assets WHERE task_ids @> ARRAY[$1]::bigint[]`
 	args := []any{taskID}
 	if typ != "" {
 		args = append(args, typ)
@@ -1200,7 +1276,7 @@ func (s *AssetStore) CountByTask(taskID int64, typ string) (int, error) {
 }
 
 func (s *AssetStore) CountsByTypeForTask(taskID int64) (map[string]int, error) {
-	rows, err := s.db.Query(`SELECT type, COUNT(*) FROM assets WHERE $1 = ANY(task_ids) GROUP BY type`, taskID)
+	rows, err := s.db.Query(`SELECT type, COUNT(*) FROM assets WHERE task_ids @> ARRAY[$1]::bigint[] GROUP BY type`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -1218,7 +1294,7 @@ func (s *AssetStore) DeleteByTaskID(taskID int64) (int64, error) {
 		return 0, err
 	}
 	deleted, _ := res.RowsAffected()
-	if _, err := s.db.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, taskID); err != nil {
+	if _, err := s.db.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE task_ids @> ARRAY[$1]::bigint[]`, taskID); err != nil {
 		return deleted, err
 	}
 	return deleted, nil
@@ -1230,7 +1306,7 @@ func (s *AssetStore) DeleteByTaskID(taskID int64) (int64, error) {
 func (s *AssetStore) HostsByTask(taskID int64) ([]string, error) {
 	rows, err := s.db.Query(`
 SELECT COALESCE(domain,''), COALESCE(ip,''), COALESCE(url,'')
-FROM assets WHERE $1 = ANY(task_ids)`, taskID)
+FROM assets WHERE task_ids @> ARRAY[$1]::bigint[]`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -1285,7 +1361,7 @@ type rowsQuerier interface {
 func hostsForTaskDeletion(q rowsQuerier, taskID, explorationID int64) ([]string, error) {
 	rows, err := q.Query(`
 WITH current_assets AS (
-  SELECT id FROM assets WHERE $1 = ANY(task_ids)
+  SELECT id FROM assets WHERE task_ids @> ARRAY[$1]::bigint[]
   UNION
   SELECT ea.asset_id
   FROM exploration_anchors ea
@@ -1365,7 +1441,7 @@ const assetSelectCols = `SELECT id, type, company_id, array_to_json(task_ids)::t
        COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
 FROM assets`
 
-// GetByIDs returns assets with the given ids (order preserved by id array order).
+// GetByIDs returns assets with the given ids in deterministic id ASC order.
 func (s *AssetStore) GetByIDs(ids []int64) ([]*Asset, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -1376,7 +1452,7 @@ func (s *AssetStore) GetByIDs(ids []int64) ([]*Asset, error) {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = id
 	}
-	sql := assetSelectCols + " WHERE id IN (" + strings.Join(placeholders, ",") + ") ORDER BY last_seen DESC"
+	sql := assetSelectCols + " WHERE id IN (" + strings.Join(placeholders, ",") + ") ORDER BY id ASC"
 	rows, err := s.db.Query(sql, args...)
 	if err != nil {
 		return nil, err
