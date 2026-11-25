@@ -58,7 +58,7 @@ function isLoadedEntry(entry: EvictableSessionEntry): boolean {
 }
 
 function evictEntry<T extends EvictableSessionEntry>(entry: T): T {
-  const next: Record<string, unknown> = {
+  const next: EvictableSessionEntry = {
     ...entry,
     items: [],
   };
