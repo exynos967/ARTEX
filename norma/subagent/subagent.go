@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/RC-CHN/ARTEX/norma/harness"
 	"github.com/RC-CHN/ARTEX/norma/llm"
@@ -54,14 +56,19 @@ func NewTool(cfg Config) tool.CoreTool {
 	if cfg.MaxDepth <= 0 {
 		cfg.MaxDepth = 3
 	}
-	var names string
-	for n, d := range cfg.Agents {
-		names += fmt.Sprintf("\n- %s: %s", n, d.Description)
+	keys := make([]string, 0, len(cfg.Agents))
+	for n := range cfg.Agents {
+		keys = append(keys, n)
+	}
+	sort.Strings(keys)
+	var names strings.Builder
+	for _, n := range keys {
+		fmt.Fprintf(&names, "\n- %s: %s", n, cfg.Agents[n].Description)
 	}
 	return tool.Build(tool.Spec{
 		Name:        "Agent",
 		Description: "Delegates a self-contained sub-task to an isolated subagent that runs with its own prompt and tools, returning only its final answer. Use it to parallelize independent work or to keep large intermediate output out of the main context.",
-		Prompt:      "Available agent_type values:" + names,
+		Prompt:      "Available agent_type values:" + names.String(),
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

@@ -27,11 +27,13 @@ const (
 	sessDefGraceMs  = 15000     // startup grace before quiet can fire
 	sessDefIdleMs   = 30 * 60 * 1000
 	sessRereadMs    = 5 * 60 * 1000 // keep an exited session this long for re-reads
-	sessDefRows     = 24
-	sessDefCols     = 80
-	sessDefReadLine = 200
-	sessDefReadByte = 8192
-	sessWaitCapMs   = 120000 // default hard wait ceiling for shell_send(wait)
+	sessDefRows          = 24
+	sessDefCols          = 80
+	sessDefReadLine      = 200
+	sessDefReadByte      = 8192
+	sessWaitCapMs        = 120000 // default hard wait ceiling for shell_send(wait)
+	maxActivePTYSessions = 4      // concurrent running PTY sessions per Manager
+	sessReaperInterval   = 60 * time.Second
 )
 
 // InteractiveShellDisabled reports whether interactive shell sessions are turned off
@@ -66,9 +68,24 @@ type ptySession struct {
 	lastOut  time.Time
 	exitedAt time.Time
 
-	readCur  int64         // tool-side read cursor (shell_read without since_cursor continues here)
-	notifyCh chan struct{} // pinged on new output
-	done     chan struct{} // closed when the process exits
+	readCur int64                     // tool-side read cursor (shell_read without since_cursor continues here)
+	subs    map[chan struct{}]struct{} // broadcast output subscribers (guarded by mu)
+	done    chan struct{}             // closed when the process exits
+}
+
+func (s *ptySession) subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	s.mu.Lock()
+	if s.subs == nil {
+		s.subs = make(map[chan struct{}]struct{})
+	}
+	s.subs[ch] = struct{}{}
+	s.mu.Unlock()
+	return ch, func() {
+		s.mu.Lock()
+		delete(s.subs, ch)
+		s.mu.Unlock()
+	}
 }
 
 func (s *ptySession) readCursor() int64 {
@@ -80,6 +97,33 @@ func (s *ptySession) setReadCursor(c int64) {
 	s.mu.Lock()
 	s.readCur = c
 	s.mu.Unlock()
+}
+
+func (s *ptySession) totalBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.total
+}
+
+// closePTMX closes the PTY master FD exactly once in a race-free manner.
+func (s *ptySession) closePTMX() {
+	s.mu.Lock()
+	ptmx := s.ptmx
+	s.ptmx = nil
+	s.mu.Unlock()
+	if ptmx != nil {
+		_ = ptmx.Close()
+	}
+}
+
+func (s *ptySession) writeInput(p []byte) (int, error) {
+	s.mu.Lock()
+	ptmx := s.ptmx
+	s.mu.Unlock()
+	if ptmx == nil {
+		return 0, os.ErrClosed
+	}
+	return ptmx.Write(p)
 }
 
 // --- ring buffer + output ---
@@ -110,11 +154,13 @@ func (s *ptySession) append(p []byte) {
 		_, _ = s.emu.Write(p)
 	}
 	s.lastOut = time.Now()
-	s.mu.Unlock()
-	select {
-	case s.notifyCh <- struct{}{}:
-	default:
+	for ch := range s.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
 	}
+	s.mu.Unlock()
 }
 
 func (s *ptySession) tailStr(n int) string {
@@ -208,6 +254,9 @@ func (s *ptySession) exit() *int {
 // output silence for quiet, the process exits, or the deadline/ctx fires. Returns the
 // reason. grace delays the first quiet check so a slow-starting program isn't judged done.
 func (s *ptySession) waitComplete(ctx context.Context, quiet, grace, timeout time.Duration, prompt *regexp.Regexp, sentinel string) string {
+	notifyCh, unsub := s.subscribe()
+	defer unsub()
+
 	dl := time.NewTimer(timeout)
 	defer dl.Stop()
 	first := quiet
@@ -224,7 +273,7 @@ func (s *ptySession) waitComplete(ctx context.Context, quiet, grace, timeout tim
 			return "timeout"
 		case <-dl.C:
 			return "timeout"
-		case <-s.notifyCh:
+		case <-notifyCh:
 			tail := s.tailStr(4096)
 			if prompt != nil && prompt.MatchString(tail) {
 				return "prompt"
@@ -272,13 +321,12 @@ func (m *Manager) reapSessions() {
 func (s *ptySession) kill() {
 	s.mu.Lock()
 	s.state = "closed"
-	ptmx, cmd := s.ptmx, s.cmd
+	cmd := s.cmd
+	done := s.done
 	s.mu.Unlock()
-	if ptmx != nil {
-		_ = ptmx.Close()
-	}
+	s.closePTMX()
 	if cmd != nil && cmd.Process != nil {
-		treeKill(cmd.Process)
+		treeKillWithDone(cmd.Process, done, nil)
 	}
 }
 
@@ -290,9 +338,15 @@ func (m *Manager) closeAllSessions() {
 	}
 	m.sessions = map[string]*ptySession{}
 	m.sessMu.Unlock()
+	var wg sync.WaitGroup
 	for _, s := range ss {
-		s.kill()
+		wg.Add(1)
+		go func(sess *ptySession) {
+			defer wg.Done()
+			sess.kill()
+		}(s)
 	}
+	wg.Wait()
 }
 
 func (m *Manager) session(id string) (*ptySession, bool) {
@@ -302,12 +356,49 @@ func (m *Manager) session(id string) (*ptySession, bool) {
 	return s, ok
 }
 
+func (m *Manager) activePTYSessionsLocked() int {
+	n := 0
+	for _, s := range m.sessions {
+		if s.running() {
+			n++
+		}
+	}
+	return n
+}
+
+func (m *Manager) startSessionReaper() {
+	if m.rootCtx == nil {
+		return
+	}
+	m.sessReaperOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(sessReaperInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-m.rootCtx.Done():
+					return
+				case <-ticker.C:
+					m.reapSessions()
+				}
+			}
+		}()
+	})
+}
+
 // openSession starts an interactive program in a fresh PTY and begins its read loop.
 func (m *Manager) openSession(command, workDir string, env []string, rows, cols int, mode string, prompt *regexp.Regexp) (*ptySession, error) {
 	if !ptySupported() {
 		return nil, fmt.Errorf("交互式 shell(PTY) 在当前平台不支持")
 	}
+	m.startSessionReaper()
 	m.reapSessions()
+	m.sessMu.Lock()
+	active := m.activePTYSessionsLocked()
+	m.sessMu.Unlock()
+	if active >= maxActivePTYSessions {
+		return nil, fmt.Errorf("活跃交互式 shell 会话已达上限 (%d/%d)，请先用 shell_close 关闭不再使用的会话", active, maxActivePTYSessions)
+	}
 	if rows <= 0 {
 		rows = sessDefRows
 	}
@@ -315,8 +406,17 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 		cols = sessDefCols
 	}
 	shell, flags := shellCmd()
+	done := make(chan struct{})
 	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, command)...)
 	cmd.Dir = workDir
+	cmd.WaitDelay = cmdWaitDelay
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		treeKillWithDone(cmd.Process, done, nil)
+		return nil
+	}
 	if e := withEnv(env); e != nil {
 		cmd.Env = e
 	}
@@ -324,28 +424,37 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 	if err != nil {
 		return nil, err
 	}
-	m.sessMu.Lock()
-	m.sessSeq++
-	id := fmt.Sprintf("sh_%d", m.sessSeq)
-	m.sessMu.Unlock()
 
 	s := &ptySession{
-		id: id, command: command, rows: rows, cols: cols, mode: mode, prompt: prompt,
+		command: command, rows: rows, cols: cols, mode: mode, prompt: prompt,
 		cmd: cmd, ptmx: ptmx, state: "running", lastOut: time.Now(),
-		notifyCh: make(chan struct{}, 1), done: make(chan struct{}),
+		done: done,
 	}
 	m.sessMu.Lock()
+	if active := m.activePTYSessionsLocked(); active >= maxActivePTYSessions {
+		m.sessMu.Unlock()
+		s.closePTMX()
+		if cmd.Process != nil {
+			forceKillProcessGroup(cmd.Process)
+		}
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("活跃交互式 shell 会话已达上限 (%d/%d)，请先用 shell_close 关闭不再使用的会话", active, maxActivePTYSessions)
+	}
+	m.sessSeq++
+	id := fmt.Sprintf("sh_%d", m.sessSeq)
+	s.id = id
 	m.sessions[id] = s
 	m.sessMu.Unlock()
 
-	go m.readLoop(s)
+	go m.readLoop(s, ptmx)
 	return s, nil
 }
 
-func (m *Manager) readLoop(s *ptySession) {
+func (m *Manager) readLoop(s *ptySession, ptmx *os.File) {
+	defer s.closePTMX()
 	b := make([]byte, 32*1024)
-	for {
-		n, err := s.ptmx.Read(b)
+	for ptmx != nil {
+		n, err := ptmx.Read(b)
 		if n > 0 {
 			s.append(b[:n])
 		}
@@ -354,6 +463,7 @@ func (m *Manager) readLoop(s *ptySession) {
 		}
 	}
 	_ = s.cmd.Wait()
+	s.closePTMX()
 	s.mu.Lock()
 	if s.state != "closed" {
 		s.state = "exited"
@@ -371,7 +481,7 @@ func (m *Manager) readLoop(s *ptySession) {
 // task-notification with the tail, so the model is woken between turns to review it.
 func (m *Manager) dispatchWaiter(s *ptySession, quiet, grace, timeout time.Duration) {
 	by := s.waitComplete(m.rootCtx, quiet, grace, timeout, s.prompt, "")
-	from := s.total - 4096
+	from := s.totalBytes() - 4096
 	if from < 0 {
 		from = 0
 	}
@@ -396,13 +506,29 @@ func (m *Manager) enqueueSessNote(s *ptySession, kind TaskKind, status TaskStatu
 // of the given patterns; each pattern fires a one-shot notification when first matched.
 // A session exit fires a final notification. The session is NOT killed on a match.
 func (m *Manager) monitorWaiter(s *ptySession, pats []*regexp.Regexp) {
+	notifyCh, unsub := s.subscribe()
+	defer unsub()
+
 	fired := make([]bool, len(pats))
+	checkTail := func() {
+		tail := s.tailStr(8192)
+		for i, p := range pats {
+			if !fired[i] && p.MatchString(tail) {
+				fired[i] = true
+				m.enqueueSessNote(s, KindMonitor, TaskRunning,
+					fmt.Sprintf("监听会话 %s 命中 /%s/：\n%s", s.id, p.String(), tail))
+			}
+		}
+	}
+	if s.totalBytes() > 0 {
+		checkTail()
+	}
 	for {
 		select {
 		case <-m.rootCtx.Done():
 			return
 		case <-s.done:
-			from := s.total - 4096
+			from := s.totalBytes() - 4096
 			if from < 0 {
 				from = 0
 			}
@@ -410,15 +536,8 @@ func (m *Manager) monitorWaiter(s *ptySession, pats []*regexp.Regexp) {
 			m.enqueueSessNote(s, KindMonitor, TaskCompleted,
 				fmt.Sprintf("监听会话 %s（%s）已结束(exit %s)。\n%s", s.id, short(s.command), fmtExit(s.exit()), tail))
 			return
-		case <-s.notifyCh:
-			tail := s.tailStr(8192)
-			for i, p := range pats {
-				if !fired[i] && p.MatchString(tail) {
-					fired[i] = true
-					m.enqueueSessNote(s, KindMonitor, TaskRunning,
-						fmt.Sprintf("监听会话 %s 命中 /%s/：\n%s", s.id, p.String(), tail))
-				}
-			}
+		case <-notifyCh:
+			checkTail()
 		}
 	}
 }

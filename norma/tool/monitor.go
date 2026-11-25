@@ -43,11 +43,17 @@ func runMonitor(_ context.Context, input json.RawMessage, tc *ToolContext) (Resu
 	if tc == nil || tc.Tasks == nil {
 		return Errorf("Error: background tasks are not enabled"), nil
 	}
+	if running, maxBG := tc.Tasks.RunningBackgroundCount(), tc.Tasks.MaxBackgroundTasks(); running >= maxBG {
+		return Errorf(fmt.Sprintf(
+			"Error: background task limit reached (%d/%d running). Wait for an existing task to finish or stop one with TaskList/TaskStop before launching another.",
+			running, maxBG)), nil
+	}
 	t, err := tc.Tasks.Spawn(SpawnSpec{
 		Command:     in.Command,
 		Description: in.Description,
 		Kind:        KindMonitor,
 		WorkingDir:  tc.WorkingDir,
+		Env:         tc.Env,
 	})
 	if err != nil {
 		return Errorf("Error: failed to start monitor: " + err.Error()), nil

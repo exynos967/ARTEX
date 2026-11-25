@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -33,6 +34,7 @@ type orReq struct {
 	MaxOutputTokens int           `json:"max_output_tokens,omitempty"`
 	Reasoning       *orReasoning  `json:"reasoning,omitempty"`
 	Temperature     *float64      `json:"temperature,omitempty"`
+	PromptCacheKey  string        `json:"prompt_cache_key,omitempty"`
 	Stream          bool          `json:"stream"`
 	Store           bool          `json:"store"`
 }
@@ -62,12 +64,18 @@ type orTool struct {
 }
 
 func (p *openaiResponsesProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
+	// Keep the full system prompt (static prefix followed by any dynamic suffix)
+	// in top-level instructions rather than demoting post-boundary segments into
+	// a trailing user input item. OpenAI automatic prefix caching matches from
+	// token 0, so the static prefix remains cached without altering instruction
+	// hierarchy or role alternation.
 	body := orReq{
 		Model:           p.cfg.Model,
 		Instructions:    joinSystem(req.System),
 		Input:           toResponsesInput(req.Messages),
 		MaxOutputTokens: req.MaxTokens,
 		Temperature:     req.Temperature,
+		PromptCacheKey:  normalizePromptCacheKey(req.PromptCacheKey),
 		Stream:          stream,
 		Store:           false, // stateless: full history sent each call
 	}
@@ -130,8 +138,73 @@ func (p *openaiResponsesProvider) setHeaders(r *http.Request) {
 
 // ---- streaming ----
 
+type responsesToolRef struct {
+	callID string
+	idx    int
+}
+
+type responsesStreamState struct {
+	byItemID      map[string]responsesToolRef
+	byOutputIndex map[int]responsesToolRef
+	hasToolCall   bool
+	hasLast       bool
+	lastRef       responsesToolRef
+	nextIdx       int
+}
+
+func newResponsesStreamState() *responsesStreamState {
+	return &responsesStreamState{
+		byItemID:      map[string]responsesToolRef{},
+		byOutputIndex: map[int]responsesToolRef{},
+	}
+}
+
+func (s *responsesStreamState) registerCall(itemID, callID string, outputIndex *int) responsesToolRef {
+	idx := s.nextIdx
+	if outputIndex != nil {
+		idx = *outputIndex
+	}
+	if idx >= s.nextIdx {
+		s.nextIdx = idx + 1
+	}
+	ref := responsesToolRef{callID: callID, idx: idx}
+	s.hasToolCall = true
+	s.hasLast = true
+	s.lastRef = ref
+	s.byOutputIndex[idx] = ref
+	if itemID != "" {
+		s.byItemID[itemID] = ref
+	}
+	return ref
+}
+
+func (s *responsesStreamState) lookupCall(itemID, callID string, outputIndex *int) (responsesToolRef, bool) {
+	if itemID != "" {
+		if ref, ok := s.byItemID[itemID]; ok {
+			return ref, true
+		}
+	}
+	if outputIndex != nil {
+		if ref, ok := s.byOutputIndex[*outputIndex]; ok {
+			return ref, true
+		}
+	}
+	if callID != "" {
+		idx := 0
+		if outputIndex != nil {
+			idx = *outputIndex
+		}
+		return responsesToolRef{callID: callID, idx: idx}, true
+	}
+	if s.hasLast {
+		return s.lastRef, true
+	}
+	return responsesToolRef{}, false
+}
+
 func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequest) iter.Seq2[StreamEvent, error] {
 	return func(yield func(StreamEvent, error) bool) {
+		req.PromptCacheKey = resolvePromptCacheKey(ctx, req)
 		body, err := p.buildBody(req, true)
 		if err != nil {
 			yield(StreamEvent{}, err)
@@ -147,19 +220,43 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 		}
 		defer resp.Body.Close()
 		scan := newSSEScanner(resp.Body)
+		state := newResponsesStreamState()
+		terminalSeen := false
 		for {
 			event, data, serr := scan.next()
 			if serr == io.EOF {
+				if !terminalSeen {
+					if ctx.Err() != nil {
+						yield(StreamEvent{}, ctx.Err())
+						return
+					}
+					yield(StreamEvent{}, &IncompleteResponseError{
+						Reason:      IncompleteMissingTerminal,
+						Diagnostics: StreamDiagnostics{StreamEnd: StreamEndEOF},
+					})
+				}
 				return
 			}
 			if serr != nil {
-				yield(StreamEvent{}, serr)
+				if ctx.Err() != nil {
+					yield(StreamEvent{}, ctx.Err())
+					return
+				}
+				if errors.Is(serr, ErrSSEEventTooLarge) {
+					yield(StreamEvent{}, serr)
+					return
+				}
+				yield(StreamEvent{}, &IncompleteResponseError{
+					Reason:      IncompleteStreamRead,
+					Diagnostics: StreamDiagnostics{StreamEnd: StreamEndReadError},
+					cause:       serr,
+				})
 				return
 			}
 			if data == "" {
 				continue
 			}
-			ev, ok, perr := parseResponsesFrame(event, data)
+			ev, ok, terminal, perr := parseResponsesFrame(event, data, state)
 			if perr != nil {
 				yield(StreamEvent{}, perr)
 				return
@@ -170,6 +267,11 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 			if !yield(ev, nil) {
 				return
 			}
+			if terminal {
+				terminalSeen = true
+				yield(StreamEvent{Type: SEMessageStop}, nil)
+				return
+			}
 		}
 	}
 }
@@ -177,13 +279,17 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 // parseResponsesFrame maps one named Responses SSE event to a neutral
 // StreamEvent. Unrecognized events (response.created, *.in_progress, item.done,
 // content_part.*, etc.) return ok=false and are skipped.
-func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
+func parseResponsesFrame(event, data string, state *responsesStreamState) (StreamEvent, bool, bool, error) {
 	// The event name is authoritative; some gateways omit the SSE `event:` line
 	// and put the discriminator only in the JSON `type` field, so fall back to it.
 	var f struct {
-		Type string `json:"type"`
-		// output_item.added: item carries the function_call id/name.
+		Type        string `json:"type"`
+		OutputIndex *int   `json:"output_index"`
+		ItemID      string `json:"item_id"`
+		CallID      string `json:"call_id"`
+		// output_item.added: item carries the function_call id/call_id/name.
 		Item struct {
+			ID        string `json:"id"`
 			Type      string `json:"type"`
 			CallID    string `json:"call_id"`
 			Name      string `json:"name"`
@@ -202,7 +308,7 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(data), &f); err != nil {
-		return StreamEvent{}, false, nil // tolerate keepalives / non-JSON
+		return StreamEvent{}, false, false, nil // tolerate keepalives / non-JSON
 	}
 	kind := event
 	if kind == "" {
@@ -211,42 +317,53 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 	switch kind {
 	case "response.output_item.added":
 		if f.Item.Type == "function_call" {
-			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name}, true, nil
+			ref := state.registerCall(f.Item.ID, f.Item.CallID, f.OutputIndex)
+			return StreamEvent{Type: SEToolUseStart, ToolID: ref.callID, ToolName: f.Item.Name, Index: ref.idx}, true, false, nil
 		}
 	case "response.output_text.delta":
 		if f.Delta != "" {
-			return StreamEvent{Type: SETextDelta, Text: f.Delta}, true, nil
+			return StreamEvent{Type: SETextDelta, Text: f.Delta}, true, false, nil
 		}
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		if f.Delta != "" {
-			return StreamEvent{Type: SEThinkingDelta, Text: f.Delta}, true, nil
+			return StreamEvent{Type: SEThinkingDelta, Text: f.Delta}, true, false, nil
 		}
 	case "response.function_call_arguments.delta":
 		if f.Delta != "" {
-			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta}, true, nil
+			ev := StreamEvent{Type: SEToolInputJSON, Text: f.Delta}
+			if ref, ok := state.lookupCall(f.ItemID, f.CallID, f.OutputIndex); ok {
+				ev.ToolID = ref.callID
+				ev.Index = ref.idx
+			}
+			return ev, true, false, nil
 		}
 	case "response.completed", "response.incomplete":
-		ev := StreamEvent{Type: SEMessageDelta, StopReason: "end_turn"}
-		if f.Response.IncompleteDetails != nil && f.Response.IncompleteDetails.Reason == "max_output_tokens" {
-			ev.StopReason = "max_tokens"
+		stop := "end_turn"
+		if state != nil && state.hasToolCall {
+			stop = "tool_use"
 		}
+		if f.Response.IncompleteDetails != nil && f.Response.IncompleteDetails.Reason == "max_output_tokens" {
+			stop = "max_tokens"
+		}
+		ev := StreamEvent{Type: SEMessageDelta, StopReason: stop}
 		if f.Response.Usage != nil {
 			ev.Usage = f.Response.Usage.norm()
 		}
-		return ev, true, nil
+		return ev, true, true, nil
 	case "response.failed", "error":
 		msg := "stream error"
 		if f.Error != nil {
 			msg = f.Error.Message
 		}
-		return StreamEvent{}, false, fmt.Errorf("openai-responses: %s", msg)
+		return StreamEvent{}, false, false, fmt.Errorf("openai-responses: %s", msg)
 	}
-	return StreamEvent{}, false, nil
+	return StreamEvent{}, false, false, nil
 }
 
 // ---- non-streaming ----
 
 func (p *openaiResponsesProvider) Complete(ctx context.Context, req CompletionRequest) (Message, string, Usage, error) {
+	req.PromptCacheKey = resolvePromptCacheKey(ctx, req)
 	body, err := p.buildBody(req, false)
 	if err != nil {
 		return Message{}, "", Usage{}, err
@@ -259,7 +376,7 @@ func (p *openaiResponsesProvider) Complete(ctx context.Context, req CompletionRe
 		return Message{}, "", Usage{}, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if err != nil {
 		return Message{}, "", Usage{}, err
 	}

@@ -106,7 +106,11 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 	if backend == "" {
 		backend = "ddgs"
 	}
-	client := newFetchClient(WebFetchConfig{Proxy: cfg.Proxy, CACert: cfg.CACert, InsecureTLS: cfg.InsecureTLS})
+	opts := fetchClientOpts{Proxy: cfg.Proxy, CACert: cfg.CACert, InsecureTLS: cfg.InsecureTLS}
+	if backend == "deepseek" {
+		opts.ResponseHeaderTimeout = 120 * time.Second
+	}
+	client := newFetchClientOpts(opts)
 	switch backend {
 	case "ddgs":
 		return &ddgsProvider{client: client, endpoint: ddgsEndpoint}, nil
@@ -227,7 +231,7 @@ func (p *ddgsProvider) Search(ctx context.Context, query string, limit int) ([]S
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 	if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusTooManyRequests {
 		return nil, fmt.Errorf("DuckDuckGo is rate-limiting (HTTP %d); try again later or switch backend", resp.StatusCode)
 	}
@@ -337,7 +341,7 @@ func (p *braveProvider) Search(ctx context.Context, query string, limit int) ([]
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("Brave Search returned HTTP %d", resp.StatusCode)
 	}
@@ -403,7 +407,7 @@ func (p *tavilyProvider) Search(ctx context.Context, query string, limit int) ([
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("Tavily Search returned HTTP %d", resp.StatusCode)
 	}

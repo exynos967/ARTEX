@@ -45,11 +45,17 @@ const (
 	KindMonitor TaskKind = "monitor"
 )
 
-// Tunables for the on-disk output store.
+// Tunables for the on-disk output store and background task bounds.
 const (
 	// maxTaskOutputBytes caps a single task's output file; a task that exceeds it
 	// is terminated to keep a runaway process from filling the disk.
 	maxTaskOutputBytes = 50 << 20 // 50 MiB
+	// maxRunningBackgroundTasks caps concurrent active backgrounded tasks per session.
+	maxRunningBackgroundTasks = 4
+	// maxBackgroundTTL caps wall-clock lifetime of any backgrounded task.
+	maxBackgroundTTL = 15 * time.Minute
+	// maxTailReadBytes caps bytes read by tailFile / TaskOutput in one call.
+	maxTailReadBytes = 1 << 20 // 1 MiB
 	// staleSessionTTL bounds how long another session's task directory survives
 	// before it is garbage-collected on the next Manager creation.
 	staleSessionTTL = 24 * time.Hour
@@ -73,6 +79,8 @@ type Task struct {
 	backgrounded bool          // surfaced as a background task: notify on exit
 	notified     bool          // completion already enqueued into pending
 	oversize     bool          // terminated by the size watchdog
+	timedOut     bool          // terminated by the background TTL watchdog
+	cg           *cmdCgroup    // optional Linux cgroup v2 handle
 	cmd          *exec.Cmd
 	done         chan struct{} // closed by watch when the process exits
 }
@@ -152,6 +160,8 @@ type Manager struct {
 	pending []Notification
 	dir     string
 	seq     int
+	maxBG   int
+	maxTTL  time.Duration
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -159,9 +169,10 @@ type Manager struct {
 	// interactive PTY shell sessions (see shell_session.go). Separate map + mutex
 	// from the file-based tasks above: sessions are persistent, stdin-driven, and
 	// keep an in-memory ring buffer rather than streaming to a file.
-	sessMu   sync.Mutex
-	sessions map[string]*ptySession
-	sessSeq  int
+	sessMu         sync.Mutex
+	sessions       map[string]*ptySession
+	sessSeq        int
+	sessReaperOnce sync.Once
 }
 
 func baseTaskDir() string { return filepath.Join(os.TempDir(), "norma") }
@@ -182,9 +193,59 @@ func NewManager(sessionID string) (*Manager, error) {
 		tasks:      map[string]*Task{},
 		sessions:   map[string]*ptySession{},
 		dir:        dir,
+		maxBG:      maxRunningBackgroundTasks,
+		maxTTL:     maxBackgroundTTL,
 		rootCtx:    ctx,
 		rootCancel: cancel,
 	}, nil
+}
+
+// SetLimits overrides the per-session maximum concurrent background tasks and
+// background task wall-clock TTL. Non-positive values leave the current setting
+// unchanged.
+func (m *Manager) SetLimits(maxBG int, maxTTL time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if maxBG > 0 {
+		m.maxBG = maxBG
+	}
+	if maxTTL > 0 {
+		m.maxTTL = maxTTL
+	}
+}
+
+// MaxBackgroundTasks returns the maximum number of concurrently running
+// backgrounded tasks allowed in this session.
+func (m *Manager) MaxBackgroundTasks() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.maxBG > 0 {
+		return m.maxBG
+	}
+	return maxRunningBackgroundTasks
+}
+
+// MaxBackgroundTTL returns the wall-clock cap for backgrounded tasks.
+func (m *Manager) MaxBackgroundTTL() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.maxTTL > 0 {
+		return m.maxTTL
+	}
+	return maxBackgroundTTL
+}
+
+// RunningBackgroundCount returns the number of currently running backgrounded tasks.
+func (m *Manager) RunningBackgroundCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, t := range m.tasks {
+		if t.backgrounded && t.Status == TaskRunning {
+			n++
+		}
+	}
+	return n
 }
 
 // cleanStaleSessions removes sibling session directories older than the TTL.
@@ -235,12 +296,17 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	}
 	cmd.Stdout = f
 	cmd.Stderr = f
-	setDetached(cmd)
+	cg := newCmdCgroup()
+	setDetachedWithCgroup(cmd, cg)
 
 	if err := cmd.Start(); err != nil {
+		cg.cleanup()
 		_ = f.Close()
 		_ = os.Remove(outPath)
 		return nil, err
+	}
+	if cg != nil && !cg.attach(cmd.Process.Pid) {
+		cg = nil
 	}
 
 	t := &Task{
@@ -251,6 +317,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 		Status:      TaskRunning,
 		StartTime:   time.Now(),
 		OutputPath:  outPath,
+		cg:          cg,
 		cmd:         cmd,
 		done:        make(chan struct{}),
 	}
@@ -265,7 +332,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 
 func (m *Manager) watch(t *Task, f *os.File) {
 	stop := make(chan struct{})
-	go m.watchSize(t, stop)
+	go m.watchLimits(t, stop)
 
 	err := t.cmd.Wait()
 	close(stop)
@@ -285,17 +352,27 @@ func (m *Manager) watch(t *Task, f *os.File) {
 		}
 	}
 	t.EndTime = time.Now()
-	close(t.done)
 	if t.backgrounded && !t.notified && (t.Status == TaskCompleted || t.Status == TaskFailed) {
 		t.notified = true
 		m.pending = append(m.pending, m.notifFor(t))
 	}
+	close(t.done)
 	m.mu.Unlock()
+
+	// Clean up any Linux cgroup v2 directory only AFTER status is finalized and
+	// t.done is closed so concurrent Kill/watchdog cannot clobber status or race
+	// against an already-reaped PID during cgroup removal retries.
+	t.cg.cleanup()
 }
 
-// watchSize terminates a task whose output file grows past the cap.
-func (m *Manager) watchSize(t *Task, stop chan struct{}) {
-	ticker := time.NewTicker(2 * time.Second)
+// watchLimits terminates a task whose output file grows past the size cap or
+// whose backgrounded wall-clock runtime exceeds MaxBackgroundTTL.
+func (m *Manager) watchLimits(t *Task, stop chan struct{}) {
+	interval := 2 * time.Second
+	if ttl := m.MaxBackgroundTTL(); ttl > 0 && ttl/4 < interval {
+		interval = max(ttl/4, 20*time.Millisecond)
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -303,7 +380,19 @@ func (m *Manager) watchSize(t *Task, stop chan struct{}) {
 			return
 		case <-ticker.C:
 			if fi, err := os.Stat(t.OutputPath); err == nil && fi.Size() > maxTaskOutputBytes {
-				m.terminate(t, TaskFailed, true)
+				m.terminate(t, TaskFailed, true, false)
+				return
+			}
+			m.mu.Lock()
+			bg := t.backgrounded
+			start := t.StartTime
+			ttl := m.maxTTL
+			if ttl <= 0 {
+				ttl = maxBackgroundTTL
+			}
+			m.mu.Unlock()
+			if bg && ttl > 0 && time.Since(start) > ttl {
+				m.terminate(t, TaskFailed, false, true)
 				return
 			}
 		}
@@ -312,7 +401,7 @@ func (m *Manager) watchSize(t *Task, stop chan struct{}) {
 
 // terminate kills a still-running task, recording the given terminal status. The
 // watch goroutine observes the exit and finalizes EndTime / notifications.
-func (m *Manager) terminate(t *Task, status TaskStatus, oversize bool) {
+func (m *Manager) terminate(t *Task, status TaskStatus, oversize, timedOut bool) {
 	m.mu.Lock()
 	if t.Status != TaskRunning {
 		m.mu.Unlock()
@@ -320,10 +409,13 @@ func (m *Manager) terminate(t *Task, status TaskStatus, oversize bool) {
 	}
 	t.Status = status
 	t.oversize = oversize
+	t.timedOut = timedOut
 	proc := t.cmd.Process
+	done := t.done
+	cg := t.cg
 	m.mu.Unlock()
-	if proc != nil {
-		treeKill(proc)
+	if proc != nil || cg != nil {
+		treeKillWithDone(proc, done, cg)
 	}
 }
 
@@ -332,6 +424,8 @@ func (m *Manager) notifFor(t *Task) Notification {
 	switch {
 	case t.oversize:
 		sum = fmt.Sprintf("Task %q 输出超过上限已被终止 (%s)。", short(t.Command), t.Kind)
+	case t.timedOut:
+		sum = fmt.Sprintf("Task %q 运行超时已被终止 (%s)。", short(t.Command), t.Kind)
 	case t.Status == TaskCompleted:
 		sum = fmt.Sprintf("Task %q 已完成 (exit %d)。用 TaskOutput 或 Read 读取输出文件。", short(t.Command), t.ExitCode)
 	case t.Status == TaskFailed:
@@ -414,29 +508,30 @@ func (m *Manager) Kill(id string) bool {
 	if !ok {
 		return false
 	}
-	m.terminate(t, TaskKilled, false)
+	m.terminate(t, TaskKilled, false, false)
 	return true
 }
 
 // KillAll terminates every running task and returns how many were stopped.
 func (m *Manager) KillAll() int {
 	m.mu.Lock()
-	ts := make([]*Task, 0, len(m.tasks))
+	var running []*Task
 	for _, t := range m.tasks {
-		ts = append(ts, t)
-	}
-	m.mu.Unlock()
-	n := 0
-	for _, t := range ts {
-		m.mu.Lock()
-		running := t.Status == TaskRunning
-		m.mu.Unlock()
-		if running {
-			m.terminate(t, TaskKilled, false)
-			n++
+		if t.Status == TaskRunning {
+			running = append(running, t)
 		}
 	}
-	return n
+	m.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, t := range running {
+		wg.Add(1)
+		go func(task *Task) {
+			defer wg.Done()
+			m.terminate(task, TaskKilled, false, false)
+		}(t)
+	}
+	wg.Wait()
+	return len(running)
 }
 
 // Get returns a snapshot of one task.
@@ -510,25 +605,60 @@ func (m *Manager) DrainNotifications() []Notification {
 	return out
 }
 
-// Cleanup kills all tasks, cancels the root context, and removes the session's
-// task directory. Safe to call on a nil Manager.
+// Cleanup kills all tasks and interactive sessions, cancels the root context,
+// waits up to 3s for all tracked processes to exit (and release file handles /
+// cgroups), and removes the session's task directory. Safe to call on a nil Manager.
 func (m *Manager) Cleanup() {
 	if m == nil {
 		return
 	}
+	var waitChs []<-chan struct{}
+	m.mu.Lock()
+	for _, t := range m.tasks {
+		if t.done != nil {
+			waitChs = append(waitChs, t.done)
+		}
+	}
+	m.mu.Unlock()
+
+	m.sessMu.Lock()
+	for _, s := range m.sessions {
+		if s.done != nil {
+			waitChs = append(waitChs, s.done)
+		}
+	}
+	m.sessMu.Unlock()
+
 	m.KillAll()
 	m.closeAllSessions()
 	if m.rootCancel != nil {
 		m.rootCancel()
 	}
+
+	if len(waitChs) > 0 {
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+	waitDone:
+		for _, ch := range waitChs {
+			select {
+			case <-ch:
+			case <-timer.C:
+				break waitDone
+			}
+		}
+	}
 	_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>
 }
 
-// tailFile reads the last maxBytes of a file, prefixing a notice when earlier
-// output is omitted.
+// tailFile reads the last maxBytes of a file (capped at maxTailReadBytes),
+// prefixing a notice when earlier output is omitted. Always bounds reads via
+// io.LimitReader so a live growing file cannot cause unbounded allocation.
 func tailFile(path string, maxBytes int) (string, error) {
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxOutput
+	}
+	if maxBytes > maxTailReadBytes {
+		maxBytes = maxTailReadBytes
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -541,7 +671,7 @@ func tailFile(path string, maxBytes int) (string, error) {
 	}
 	size := fi.Size()
 	if size <= int64(maxBytes) {
-		b, err := io.ReadAll(f)
+		b, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)))
 		if err != nil {
 			return "", err
 		}
@@ -551,7 +681,7 @@ func tailFile(path string, maxBytes int) (string, error) {
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
 		return "", err
 	}
-	b, err := io.ReadAll(f)
+	b, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)))
 	if err != nil {
 		return "", err
 	}

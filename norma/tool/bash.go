@@ -24,8 +24,16 @@ var catastrophicBash = []*regexp.Regexp{
 }
 
 // disallowedAutoBackground lists commands that must never be silently moved to
-// the background on timeout.
-var disallowedAutoBackground = []string{"sleep"}
+// the background on timeout (wait primitives, heavy scanners, browsers, network
+// clients, and long-running script runtimes).
+var disallowedAutoBackground = []string{
+	"sleep",
+	"katana", "nuclei", "httpx", "ffuf", "naabu", "sqlmap", "nmap", "masscan",
+	"gobuster", "feroxbuster", "dirsearch", "subfinder", "amass",
+	"chromium", "google-chrome", "playwright",
+	"curl", "wget",
+	"python", "python3", "node",
+}
 
 // NewBash builds the Bash tool: run a shell command with a timeout, optionally in
 // the background.
@@ -104,6 +112,11 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 	spec := SpawnSpec{Command: command, Kind: KindBash, WorkingDir: tc.WorkingDir, Description: short(command), Env: tc.Env}
 
 	if explicitBG {
+		if running, maxBG := tc.Tasks.RunningBackgroundCount(), tc.Tasks.MaxBackgroundTasks(); running >= maxBG {
+			return Errorf(fmt.Sprintf(
+				"Error: background task limit reached (%d/%d running). Wait for an existing task to finish or stop one with TaskList/TaskStop before launching another.",
+				running, maxBG)), nil
+		}
 		t, err := tc.Tasks.Spawn(spec)
 		if err != nil {
 			return Errorf("Error: failed to start background command: " + err.Error()), nil
@@ -137,7 +150,7 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 	}
 
 	// Timed out while still running.
-	if autoBackgroundAllowed(command) {
+	if autoBackgroundAllowed(command) && tc.Tasks.RunningBackgroundCount() < tc.Tasks.MaxBackgroundTasks() {
 		tc.Tasks.Background(t.ID)
 		return Text(fmt.Sprintf(
 			"Command still running after %s; moved to background as %s. Output file: %s\nUse TaskOutput{task_id:%q} to read its output; you are notified when it completes.",
@@ -145,6 +158,10 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 	}
 	out, _ := tc.Tasks.Output(t.ID, 0)
 	tc.Tasks.Kill(t.ID)
+	select {
+	case <-t.done:
+	case <-time.After(3 * time.Second):
+	}
 	tc.Tasks.Forget(t.ID)
 	return Errorf(Capture(tc, out) + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
 }
@@ -166,7 +183,20 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	buf := newCaptureWriter(tc)
 	cmd.Stdout = buf
 	cmd.Stderr = buf
-	err := cmd.Run()
+	cg := newCmdCgroup()
+	setDetachedWithCgroup(cmd, cg)
+
+	var err error
+	if startErr := cmd.Start(); startErr != nil {
+		cg.cleanup()
+		err = startErr
+	} else {
+		if cg != nil && !cg.attach(cmd.Process.Pid) {
+			cg = nil
+		}
+		err = cmd.Wait()
+		cg.cleanup()
+	}
 
 	out := buf.finish()
 	if cctx.Err() == context.DeadlineExceeded {
@@ -189,20 +219,273 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 }
 
 // autoBackgroundAllowed reports whether a timed-out command may be moved to the
-// background instead of being killed.
+// background instead of being killed. It inspects every shell segment separated
+// by &&, ||, ;, |, or newline and strips common wrapper prefixes (env, timeout,
+// nohup, nice, sudo, subshell parens, and env assignments) so chained or
+// wrapped scanners cannot bypass the denylist.
 func autoBackgroundAllowed(command string) bool {
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
+	segs := splitShellSegments(command)
+	if len(segs) == 0 {
 		return false
 	}
-	base := fields[0]
-	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
-		base = base[i+1:]
-	}
-	for _, d := range disallowedAutoBackground {
-		if base == d {
-			return false
+	foundAny := false
+	for _, seg := range segs {
+		cmdName, ok := extractSegmentCommand(seg)
+		if !ok {
+			continue
+		}
+		foundAny = true
+		for _, d := range disallowedAutoBackground {
+			if cmdName == d {
+				return false
+			}
 		}
 	}
-	return true
+	return foundAny
+}
+
+// splitShellSegments splits command on unquoted shell operators (&&, ||, |&, ;,
+// |, \n) while preserving quotes and avoiding splits inside redirections such
+// as 2>&1.
+func splitShellSegments(command string) []string {
+	var segs []string
+	var cur strings.Builder
+	inSingle, inDouble := false, false
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			segs = append(segs, s)
+		}
+		cur.Reset()
+	}
+	for i := 0; i < len(command); i++ {
+		ch := command[i]
+		if ch == '\\' && !inSingle && i+1 < len(command) {
+			next := command[i+1]
+			if next == '"' || next == '\'' || next == ';' || next == '|' || next == '&' || next == '\n' {
+				cur.WriteByte(ch)
+				cur.WriteByte(next)
+				i++
+				continue
+			}
+		}
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			cur.WriteByte(ch)
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			cur.WriteByte(ch)
+			continue
+		}
+		if inSingle || inDouble {
+			cur.WriteByte(ch)
+			continue
+		}
+		switch ch {
+		case ';', '\n':
+			flush()
+		case '|':
+			if i+1 < len(command) && (command[i+1] == '|' || command[i+1] == '&') {
+				i++
+			}
+			flush()
+		case '&':
+			if i+1 < len(command) && command[i+1] == '&' {
+				i++
+				flush()
+				continue
+			}
+			// Keep redirections like 2>&1 or &>file intact.
+			if (i > 0 && command[i-1] == '>') || (i+1 < len(command) && command[i+1] == '>') {
+				cur.WriteByte(ch)
+				continue
+			}
+			flush()
+		default:
+			cur.WriteByte(ch)
+		}
+	}
+	flush()
+	return segs
+}
+
+// extractSegmentCommand peels subshell grouping, env assignments, shell control
+// keywords, and wrapper commands (env, timeout, nohup, nice, sudo) from one
+// shell segment and returns the normalized lowercase executable basename.
+func extractSegmentCommand(seg string) (string, bool) {
+	fields := strings.Fields(seg)
+	i := 0
+	for i < len(fields) {
+		tok := strings.TrimLeft(fields[i], "({!")
+		if tok == "" {
+			i++
+			continue
+		}
+		fields[i] = tok
+
+		// Skip leading VAR=val environment variable assignments.
+		if isEnvAssign(tok) {
+			i++
+			continue
+		}
+
+		base := normalizeCmdBase(tok)
+		switch base {
+		case "do", "then", "else", "elif", "if", "while", "until", "command", "exec":
+			i++
+			continue
+		case "time":
+			i++
+			if i < len(fields) && fields[i] == "-p" {
+				i++
+			}
+			continue
+		case "nohup":
+			i++
+			if i < len(fields) && fields[i] == "--" {
+				i++
+			}
+			continue
+		case "env":
+			i++
+			for i < len(fields) {
+				f := fields[i]
+				if f == "--" {
+					i++
+					break
+				}
+				if isEnvAssign(f) {
+					i++
+					continue
+				}
+				if strings.HasPrefix(f, "-") && f != "-" {
+					if envFlagTakesArg(f) && !strings.Contains(f, "=") {
+						i += 2
+					} else {
+						i++
+					}
+					continue
+				}
+				if f == "-" {
+					i++
+					continue
+				}
+				break
+			}
+			continue
+		case "timeout":
+			i++
+			for i < len(fields) {
+				f := fields[i]
+				if f == "--" {
+					i++
+					break
+				}
+				if strings.HasPrefix(f, "-") {
+					if timeoutFlagTakesArg(f) && !strings.Contains(f, "=") {
+						i += 2
+					} else {
+						i++
+					}
+					continue
+				}
+				break
+			}
+			// Skip the required DURATION positional argument.
+			if i < len(fields) {
+				i++
+			}
+			continue
+		case "nice":
+			i++
+			for i < len(fields) {
+				f := fields[i]
+				if f == "--" {
+					i++
+					break
+				}
+				if f == "-n" || f == "--adjustment" {
+					i += 2
+					continue
+				}
+				if strings.HasPrefix(f, "-") {
+					i++
+					continue
+				}
+				break
+			}
+			continue
+		case "sudo":
+			i++
+			for i < len(fields) {
+				f := fields[i]
+				if f == "--" {
+					i++
+					break
+				}
+				if isEnvAssign(f) {
+					i++
+					continue
+				}
+				if strings.HasPrefix(f, "-") {
+					if sudoFlagTakesArg(f) && !strings.Contains(f, "=") {
+						i += 2
+					} else {
+						i++
+					}
+					continue
+				}
+				break
+			}
+			continue
+		}
+		if base == "" {
+			return "", false
+		}
+		return base, true
+	}
+	return "", false
+}
+
+func isEnvAssign(tok string) bool {
+	eq := strings.IndexByte(tok, '=')
+	return eq > 0 && !strings.ContainsAny(tok[:eq], "/\\\"'-")
+}
+
+func normalizeCmdBase(tok string) string {
+	base := strings.TrimRight(tok, ")}")
+	base = strings.Trim(base, "\"'")
+	if idx := strings.LastIndexAny(base, "/\\"); idx >= 0 {
+		base = base[idx+1:]
+	}
+	base = strings.TrimSuffix(strings.ToLower(base), ".exe")
+	return base
+}
+
+func envFlagTakesArg(f string) bool {
+	switch f {
+	case "-u", "--unset", "-C", "--chdir", "-S", "--split-string",
+		"--block-signal", "--default-signal", "--ignore-signal":
+		return true
+	}
+	return false
+}
+
+func timeoutFlagTakesArg(f string) bool {
+	switch f {
+	case "-k", "--kill-after", "-s", "--signal":
+		return true
+	}
+	return false
+}
+
+func sudoFlagTakesArg(f string) bool {
+	switch f {
+	case "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+		"-r", "--role", "-t", "--type", "-C", "--close-from", "-T", "--command-timeout",
+		"-D", "--chdir":
+		return true
+	}
+	return false
 }

@@ -53,15 +53,14 @@ func TestSettlementConcurrentToolAdmission(t *testing.T) {
 		}()
 	}
 	close(start)
-	schemas := []llm.ToolSchema{{Name: "probe"}}
-	if !l.beginSettlement(ReasonTimeout, &schemas) {
+	if !l.beginSettlement(ReasonTimeout) {
 		t.Error("settlement did not begin")
 	}
 	wg.Wait()
 
 	before := calls.Load()
 	result, _ := l.execOne(t.Context(), use, nil)
-	if !result.IsError || calls.Load() != before || len(schemas) != 0 {
+	if !result.IsError || calls.Load() != before {
 		t.Fatal("settlement admitted a disabled tool", result)
 	}
 	if l.settleReason != ReasonTimeout || len(l.messages) != 1 {

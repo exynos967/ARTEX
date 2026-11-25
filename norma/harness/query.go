@@ -103,9 +103,11 @@ type QueryInput struct {
 
 	// Settlement, when non-nil with a Prompt, runs a bounded wrap-up phase the
 	// moment a budget (MaxTurns/MaxDuration) is hit: it injects Prompt as a user
-	// turn and hides DisabledTools, so a budget-terminated run can checkpoint its
-	// findings instead of ending abruptly. The run still finishes with the budget's
-	// reason (ReasonMaxTurns/ReasonTimeout), never ReasonCompleted. Nil = off.
+	// turn and blocks DisabledTools at execution time (leaving wire tool schemas
+	// unchanged so the prompt-cache prefix stays intact), so a budget-terminated
+	// run can checkpoint its findings instead of ending abruptly. The run still
+	// finishes with the budget's reason (ReasonMaxTurns/ReasonTimeout), never
+	// ReasonCompleted. Nil = off.
 	Settlement *Settlement
 	// TurnBudget reserves a durable model attempt before issuing it. Hosts may
 	// enforce a cumulative budget across resumes. An unavailable ledger fails
@@ -134,7 +136,7 @@ type TurnBudget interface {
 type Settlement struct {
 	Prompt        string   // wrap-up instruction injected as a user turn (empty = settlement off)
 	MaxTurns      int      // turn budget for the wrap-up phase itself (0 = default 2)
-	DisabledTools []string // tool names hidden from the model during wrap-up (e.g. ["Bash"])
+	DisabledTools []string // tool names blocked at execution time during wrap-up (e.g. ["Bash"])
 	// PromptByReason optionally overrides Prompt based on WHY the run settled
 	// (keyed by the terminal reason, e.g. ReasonTimeout / ReasonMaxTurns). When the
 	// settling reason has a non-empty entry here it is used; otherwise Prompt is used.
@@ -343,14 +345,23 @@ func (l *loop) injectTaskNotifications() bool {
 	return true
 }
 
+// tailRefRecorder is optionally implemented by a Recorder (e.g. transcript.Writer)
+// that persists kept-tail messages after a compaction boundary as compact
+// references to already-persisted records rather than duplicating large payloads.
+type tailRefRecorder interface {
+	RecordMessageRef(m llm.Message)
+}
+
 // recordNewBoundary persists a boundary that compaction just inserted (detected
 // by a rise in the boundary-marker count). It writes the post-boundary working
 // set — the boundary marker, the summary, and the kept recent tail — as durable
-// messages, so a COLD-START Resume restores the compacted view via MessagesForAPI
-// instead of replaying raw history and re-summarizing. The tail is re-recorded
-// after the boundary (it also exists earlier as births); only the post-boundary
-// copy is sent to the model. RecordBoundary keeps the observability-only marker
-// (a Type:"boundary" record, skipped during reconstruction).
+// records, so a COLD-START Resume restores the compacted view via MessagesForAPI
+// instead of replaying raw history and re-summarizing. When the Recorder
+// implements tailRefRecorder, kept-tail messages after the boundary marker and
+// summary are recorded via RecordMessageRef so large tool results are referenced
+// rather than duplicated on disk. RecordBoundary keeps the observability and
+// cumulative-usage checkpoint (a Type:"boundary" record, skipped during message
+// reconstruction).
 func (l *loop) recordNewBoundary() {
 	if l.in.Recorder == nil {
 		return
@@ -363,8 +374,17 @@ func (l *loop) recordNewBoundary() {
 		if meta, ok := llm.ParseBoundaryMeta(l.messages[i]); ok {
 			l.in.Recorder.RecordBoundary(meta)
 		}
-		for _, m := range l.messages[i:] { // boundary marker + summary + kept tail
-			l.in.Recorder.RecordMessage(m, llm.Usage{})
+		tail := l.messages[i:] // boundary marker + summary + [reinjected skills +] kept tail
+		refRec, hasRef := l.in.Recorder.(tailRefRecorder)
+		for idx, m := range tail {
+			// Boundary marker (idx==0) and freshly generated summary (idx==1) are
+			// newly created; subsequent kept-tail messages may already exist on
+			// disk and can be written as compact refs.
+			if hasRef && idx >= 2 {
+				refRec.RecordMessageRef(m)
+			} else {
+				l.in.Recorder.RecordMessage(m, llm.Usage{})
+			}
 		}
 	}
 	l.boundaryCount = c
@@ -471,7 +491,7 @@ func (l *loop) run() {
 				l.record(msg, llm.Usage{})
 			}
 			if !d.Allowed {
-				if !l.summaryOnly && d.Settle && !l.settling.Load() && l.beginSettlement(ReasonMaxTurns, &schemas) {
+				if !l.summaryOnly && d.Settle && !l.settling.Load() && l.beginSettlement(ReasonMaxTurns) {
 					continue
 				}
 				reason := ReasonMaxTurns
@@ -734,7 +754,7 @@ func (l *loop) run() {
 				l.finish(l.settleReason, nil, "")
 				return
 			}
-			if l.beginSettlement(ReasonTimeout, &schemas) {
+			if l.beginSettlement(ReasonTimeout) {
 				l.toolCtx = l.ctx // wrap-up tools run live, bounded only by settleMaxTurns
 				l.lastContinue = ContinueNextTurn
 				continue
@@ -767,7 +787,7 @@ func (l *loop) run() {
 			if hitTime && !hitTurns {
 				reason = ReasonTimeout
 			}
-			if l.beginSettlement(reason, &schemas) {
+			if l.beginSettlement(reason) {
 				l.lastContinue = ContinueNextTurn
 				continue
 			}
@@ -817,10 +837,11 @@ func (l *loop) settleMaxTurns() int {
 }
 
 // beginSettlement enters the wrap-up phase when configured: injects the caller's
-// prompt as a user turn and hides DisabledTools, so a budget-terminated run can
-// checkpoint its findings. Returns false when no settlement is configured (caller
-// then finishes immediately).
-func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema) bool {
+// prompt as a user turn and enables execution-layer blocking of DisabledTools
+// (leaving req.Tools byte-identical so the prompt-cache prefix survives into
+// wrap-up). Returns false when no settlement is configured (caller then finishes
+// immediately).
+func (l *loop) beginSettlement(reason TerminalReason) bool {
 	s := l.in.Settlement
 	if s == nil {
 		return false
@@ -838,9 +859,6 @@ func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema)
 	l.settling.Store(true)
 	l.settleReason = reason
 	l.settleTurn = 0
-	if len(s.DisabledTools) > 0 {
-		*schemas = filterToolSchemas(*schemas, s.DisabledTools)
-	}
 	return true
 }
 
@@ -1010,9 +1028,8 @@ func (l *loop) requestMessages() []llm.Message {
 
 func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	l.interruptedToolInput = nil
-	if l.summaryOnly {
-		schemas = nil
-	}
+	// Keep req.Tools byte-identical during summaryOnly recovery to preserve the
+	// prompt-cache prefix; streamExec enforces summaryOnly at execution time.
 	l.maybeInjectTodoReminder()
 	msgs := l.requestMessages()
 	if l.finalTextRecoveryPrompt != "" {

@@ -1,6 +1,9 @@
 package llm
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // Skill-invocation messages carry an invoked skill's full instructions in the
 // conversation as an independent user message (not a tool_result), wrapped in a
@@ -81,7 +84,11 @@ func TruncateSkillMessage(m Message, maxChars int) Message {
 		head = text[:k] // header + open tag + body, without the footer
 	}
 	if len(head) > maxChars {
-		head = head[:maxChars]
+		cut := maxChars
+		for cut > 0 && maxChars-cut < utf8.UTFMax && !utf8.RuneStart(head[cut]) {
+			cut--
+		}
+		head = head[:cut]
 	}
 	return Message{Role: m.Role, Content: []ContentBlock{TextBlock(head + skillTruncNote + skillFooter)}}
 }

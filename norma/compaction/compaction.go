@@ -42,6 +42,14 @@ type Config struct {
 	// KeepRecent is the number of recent messages AutoCompact always preserves as
 	// the un-summarized tail (default 8). MicroCompact uses its own microKeepRecent.
 	KeepRecent int
+
+	// Optional parent request prefix mirrored onto compaction summarization calls
+	// so providers can reuse the parent conversation's KV cache (system + tools +
+	// message head). Empty fields fall back to the standalone summary prompt.
+	System          []string
+	DynamicBoundary int
+	Tools           []llm.ToolSchema
+	SystemReminder  string
 }
 
 func (c *Config) defaults() {
@@ -77,12 +85,36 @@ type Compactor struct {
 	summarize Summarizer
 	failures  int
 	tripped   bool
+
+	// Batch/hysteresis MicroCompact epoch state: clearedIDs tracks tool_use IDs
+	// cleared in prior sweeps so they stay cleared idempotently, while
+	// microNextTrigger holds the high-water token count required before another
+	// sweep may add new IDs. Between sweeps the prefix stays byte-identical.
+	clearedIDs       map[string]bool
+	microNextTrigger int
 }
 
 // New builds a Compactor. summarize may be nil to disable AutoCompact.
 func New(cfg Config, summarize Summarizer) *Compactor {
 	cfg.defaults()
 	return &Compactor{cfg: cfg, summarize: summarize}
+}
+
+// SetSummaryPrefix updates the parent request prefix mirrored onto compaction
+// summary calls (e.g. when a session builds its per-prompt SystemReminder or
+// refreshes its system segments). Empty slices/strings leave existing values
+// untouched unless explicitly replaced.
+func (c *Compactor) SetSummaryPrefix(prefix SummaryPrefix) {
+	if len(prefix.System) > 0 {
+		c.cfg.System = append([]string(nil), prefix.System...)
+		c.cfg.DynamicBoundary = prefix.DynamicBoundary
+	}
+	if len(prefix.Tools) > 0 {
+		c.cfg.Tools = append([]llm.ToolSchema(nil), prefix.Tools...)
+	}
+	if prefix.SystemReminder != "" {
+		c.cfg.SystemReminder = prefix.SystemReminder
+	}
 }
 
 // --- threshold math ---
@@ -111,6 +143,15 @@ func (c *Compactor) buffer() int {
 }
 func (c *Compactor) autoThreshold() int  { return c.effectiveWindow() - c.buffer() }
 func (c *Compactor) microThreshold() int { return c.effectiveWindow() * 6 / 10 }
+
+// microHysteresis is the token growth band (10% of effective window) required
+// after a MicroCompact sweep before another sweep can mutate the prefix again.
+func (c *Compactor) microHysteresis() int { return max(c.effectiveWindow()/10, 1) }
+
+func (c *Compactor) resetMicroEpoch() {
+	c.clearedIDs = nil
+	c.microNextTrigger = 0
+}
 
 // maxTurnGrowth == claude-code estimateMaxTurnGrowth: min(maxOutput,20000)+15000.
 func (c *Compactor) maxTurnGrowth() int { return c.reservedForSummary() + toolResultGrowthGuess }
@@ -167,28 +208,54 @@ func blockChars(b llm.ContentBlock) int {
 }
 
 // Pre conditions the history before a model request: MicroCompact to clear stale
-// tool results, then AutoCompact at the threshold (or predictively). Both are
-// non-destructive. lastInputTokens is the previous response's total token size
-// (0 if none yet), used as the initial gate count.
+// tool results in cache-preserving batches, then AutoCompact at the threshold
+// (or predictively). Both are non-destructive. lastInputTokens is the previous
+// response's total token size (0 if none yet), used as the initial gate count.
 func (c *Compactor) Pre(ctx context.Context, msgs []llm.Message, lastInputTokens int) []llm.Message {
 	if c.cfg.ContextWindow <= 0 {
 		return msgs
 	}
+	// Re-apply previously cleared IDs idempotently (and absorb any already-cleared
+	// blocks present in msgs) so cleared results never flip back on a resumed or
+	// copied slice.
+	preApplyEst := 0
+	if len(c.clearedIDs) > 0 {
+		preApplyEst = c.count(msgs, 0)
+	}
+	msgs, reapplied := c.applyCleared(msgs)
 	tok := c.count(msgs, lastInputTokens)
+	if reapplied {
+		postApplyEst := c.count(msgs, 0)
+		if lastInputTokens > 0 {
+			saved := max(0, preApplyEst-postApplyEst)
+			tok = max(postApplyEst, lastInputTokens-saved)
+		} else {
+			tok = postApplyEst
+		}
+	}
 	if tok <= c.microThreshold() {
 		return msgs
 	}
-	// MicroCompact: clear old COMPACTABLE tool results (non-destructive). Only
-	// re-estimate when it actually changed the array; otherwise the gate count
-	// (which prefers the accurate last-response size) still holds.
-	if out, changed := c.microCompact(msgs); changed {
-		msgs = out
-		tok = c.count(msgs, 0)
+	// Batch/hysteresis MicroCompact: only open a new sweep epoch when tokens
+	// exceed the high-water trigger. Between sweeps, clearedIDs stays fixed so
+	// subsequent turns keep a byte-identical prefix for KV cache reuse.
+	trigger := max(c.microThreshold(), c.microNextTrigger)
+	if tok > trigger {
+		preEst := c.count(msgs, 0)
+		if out, changed := c.microSweep(msgs); changed {
+			msgs = out
+			postEst := c.count(msgs, 0)
+			saved := max(0, preEst-postEst)
+			expectedPost := max(postEst, tok-saved)
+			c.microNextTrigger = max(c.microThreshold(), expectedPost+c.microHysteresis())
+			tok = expectedPost
+		}
 	}
 	// AutoCompact: at the threshold, or predictively if the next turn would overflow.
 	if tok >= c.autoThreshold() || c.predictiveOver(tok) {
 		if out, ok := c.autoCompact(ctx, msgs, tok, "auto"); ok {
 			msgs = out
+			c.resetMicroEpoch()
 		}
 	}
 	return msgs
@@ -200,6 +267,7 @@ func (c *Compactor) Pre(ctx context.Context, msgs []llm.Message, lastInputTokens
 func (c *Compactor) Reactive(ctx context.Context, msgs []llm.Message) ([]llm.Message, bool) {
 	before := c.count(msgs, 0)
 	if out, ok := c.autoCompact(ctx, msgs, before, "reactive"); ok {
+		c.resetMicroEpoch()
 		return out, c.count(out, 0) < before
 	}
 	return msgs, false
@@ -241,21 +309,13 @@ func lastNNonMarkerStart(msgs []llm.Message, keep int) int {
 	return i
 }
 
-// --- MicroCompact: keep the most recent N compactable results, clear the rest ---
+// --- MicroCompact: batch/hysteresis clearing of stale compactable tool results ---
 
-// microCompact clears the bodies of all COMPACTABLE tool results except the most
-// recent microKeepRecent, returning the (possibly new) message slice and whether
-// anything changed. It is non-destructive: a cleared result can be re-read.
+// microCompact performs a single stateless sweep clearing all COMPACTABLE tool
+// results in the active post-boundary view except the most recent microKeepRecent.
 func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
-	// Collect compactable tool_use ids in encounter order.
-	var ids []string
-	for _, m := range msgs {
-		for _, b := range m.Content {
-			if b.Type == llm.BlockToolUse && compactableTools[b.Name] {
-				ids = append(ids, b.ID)
-			}
-		}
-	}
+	start := llm.LastBoundaryIndex(msgs) + 1
+	ids := collectCompactableIDs(msgs, start)
 	if len(ids) <= microKeepRecent {
 		return msgs, false // nothing old enough to clear
 	}
@@ -263,20 +323,77 @@ func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
 	for _, id := range ids[:len(ids)-microKeepRecent] {
 		clearSet[id] = true
 	}
+	return applyMicroClear(msgs, start, clearSet)
+}
+
+// microSweep opens a new MicroCompact epoch, adding all compactable tool_use IDs
+// older than microKeepRecent (in the post-boundary view) to c.clearedIDs and
+// applying them to msgs.
+func (c *Compactor) microSweep(msgs []llm.Message) ([]llm.Message, bool) {
+	start := llm.LastBoundaryIndex(msgs) + 1
+	ids := collectCompactableIDs(msgs, start)
+	if len(ids) <= microKeepRecent {
+		return msgs, false
+	}
+	if c.clearedIDs == nil {
+		c.clearedIDs = make(map[string]bool, len(ids)-microKeepRecent)
+	}
+	for _, id := range ids[:len(ids)-microKeepRecent] {
+		c.clearedIDs[id] = true
+	}
+	return applyMicroClear(msgs, start, c.clearedIDs)
+}
+
+// applyCleared absorbs any already-cleared tool results in msgs into c.clearedIDs
+// and idempotently re-applies c.clearedIDs so previously cleared items stay cleared.
+func (c *Compactor) applyCleared(msgs []llm.Message) ([]llm.Message, bool) {
+	start := llm.LastBoundaryIndex(msgs) + 1
+	for i := start; i < len(msgs); i++ {
+		for _, b := range msgs[i].Content {
+			if b.Type == llm.BlockToolResult && b.ToolUseID != "" && isCleared(b.Content) {
+				if c.clearedIDs == nil {
+					c.clearedIDs = map[string]bool{}
+				}
+				c.clearedIDs[b.ToolUseID] = true
+			}
+		}
+	}
+	if len(c.clearedIDs) == 0 {
+		return msgs, false
+	}
+	return applyMicroClear(msgs, start, c.clearedIDs)
+}
+
+func collectCompactableIDs(msgs []llm.Message, start int) []string {
+	var ids []string
+	for i := start; i < len(msgs); i++ {
+		for _, b := range msgs[i].Content {
+			if b.Type == llm.BlockToolUse && compactableTools[b.Name] {
+				ids = append(ids, b.ID)
+			}
+		}
+	}
+	return ids
+}
+
+func applyMicroClear(msgs []llm.Message, start int, clearSet map[string]bool) ([]llm.Message, bool) {
 	changed := false
-	out := append([]llm.Message(nil), msgs...)
-	for i := range out {
+	var out []llm.Message
+	for i := start; i < len(msgs); i++ {
 		var nc []llm.ContentBlock
-		for j, b := range out[i].Content {
+		for j, b := range msgs[i].Content {
 			if b.Type == llm.BlockToolResult && clearSet[b.ToolUseID] && !isCleared(b.Content) {
 				if nc == nil {
-					nc = append([]llm.ContentBlock(nil), out[i].Content...)
+					nc = append([]llm.ContentBlock(nil), msgs[i].Content...)
 				}
 				nc[j].Content = []llm.ContentBlock{llm.TextBlock(microClearedMessage)}
 				changed = true
 			}
 		}
 		if nc != nil {
+			if out == nil {
+				out = append([]llm.Message(nil), msgs...)
+			}
 			out[i].Content = nc
 		}
 	}
@@ -304,8 +421,18 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 	if len(toSummarize) == 0 {
 		return msgs, false
 	}
-	summary, err := c.summarize(ctx, toSummarize)
-	if err != nil {
+	sumCtx := ctx
+	if _, ok := summaryPrefixFrom(sumCtx); !ok &&
+		(len(c.cfg.System) > 0 || len(c.cfg.Tools) > 0 || c.cfg.DynamicBoundary > 0 || c.cfg.SystemReminder != "") {
+		sumCtx = WithSummaryPrefix(sumCtx, SummaryPrefix{
+			System:          c.cfg.System,
+			DynamicBoundary: c.cfg.DynamicBoundary,
+			Tools:           c.cfg.Tools,
+			SystemReminder:  c.cfg.SystemReminder,
+		})
+	}
+	summary, err := c.summarize(sumCtx, toSummarize)
+	if err != nil || strings.TrimSpace(summary) == "" {
 		c.failures++
 		if c.failures >= maxAutoCompactFails {
 			c.tripped = true

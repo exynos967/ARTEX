@@ -9,6 +9,7 @@ import (
 	"iter"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 )
 
 type openaiProvider struct{ cfg Config }
@@ -57,6 +58,7 @@ type oaReq struct {
 	Stop                []string      `json:"stop,omitempty"`
 	Thinking            *oaThinking   `json:"thinking,omitempty"`
 	ReasoningEffort     string        `json:"reasoning_effort,omitempty"`
+	PromptCacheKey      string        `json:"prompt_cache_key,omitempty"`
 	Stream              bool          `json:"stream"`
 	StreamOptions       *oaStreamOpts `json:"stream_options,omitempty"`
 }
@@ -228,20 +230,27 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	if req.Thinking != "" {
 		thinkingType = req.Thinking
 	}
-	// The request is in thinking mode when either a thinking type is set (a
-	// `thinking` body field goes out) or a reasoning effort is configured — the
+	// The request is in thinking mode when thinking is actively enabled or
+	// reasoning effort is configured (and not overridden to "disabled") — the
 	// same providers that then demand reasoning_content be echoed back.
-	thinking := thinkingType != "" || p.cfg.ReasoningEffort != ""
+	thinking := thinkingType == "enabled" || (thinkingType != "disabled" && p.cfg.ReasoningEffort != "")
 
+	// Keep the full system prompt (static prefix followed by dynamic suffix) in
+	// the leading system message rather than demoting post-boundary segments into
+	// a trailing user message. OpenAI/DeepSeek automatic prefix caching matches
+	// the longest shared prefix from token 0, so the static prefix remains cached
+	// while preserving strict role alternation, DeepSeek reasoning continuity,
+	// and system instruction hierarchy.
 	msgs := toOpenAIMessages(joinSystem(req.System), req.Messages)
 	msgs = sanitizeOpenAIMessages(msgs, thinking)
 
 	body := oaReq{
-		Model:       p.cfg.Model,
-		Messages:    msgs,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      stream,
+		Model:          p.cfg.Model,
+		Messages:       msgs,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		PromptCacheKey: normalizePromptCacheKey(req.PromptCacheKey),
+		Stream:         stream,
 	}
 	// The output cap goes into exactly one key. Reasoning models accept only
 	// "max_completion_tokens"; everything else still takes "max_tokens", which
@@ -256,10 +265,15 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	if stream {
 		body.StreamOptions = &oaStreamOpts{IncludeUsage: true}
 	}
-	if thinkingType != "" {
+	// Only send the non-standard "thinking" body field when Config.ThinkingType
+	// is configured or the request explicitly asks for "enabled" (never emit
+	// "thinking":{"type":"disabled"} to standard OpenAI /chat/completions).
+	if thinkingType != "" && (p.cfg.ThinkingType != "" || req.Thinking == "enabled") {
 		body.Thinking = &oaThinking{Type: thinkingType}
 	}
-	body.ReasoningEffort = p.cfg.ReasoningEffort // omitempty drops it when unset
+	if req.Thinking != "disabled" {
+		body.ReasoningEffort = p.cfg.ReasoningEffort // omitempty drops it when unset
+	}
 	for _, t := range req.Tools {
 		var ot oaTool
 		ot.Type = "function"
@@ -290,6 +304,7 @@ func isEmptyResponseRetryable(stopReason string) bool {
 
 func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter.Seq2[StreamEvent, error] {
 	return func(yield func(StreamEvent, error) bool) {
+		req.PromptCacheKey = resolvePromptCacheKey(ctx, req)
 		body, err := p.buildBody(req, true)
 		if err != nil {
 			if !yield(StreamEvent{Type: SEStreamDiagnostics, Diagnostics: &StreamDiagnostics{StreamEnd: StreamEndRequestError}}, nil) {
@@ -342,6 +357,11 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 					break
 				}
 				if serr != nil {
+					if errors.Is(serr, ErrSSEEventTooLarge) {
+						diagnostics.StreamEnd = StreamEndProtocolError
+						streamErr = serr
+						break
+					}
 					diagnostics.StreamEnd = StreamEndReadError
 					incomplete = IncompleteStreamRead
 					break
@@ -471,6 +491,7 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 // response whose body is an error object (some gateways do this instead of a 4xx)
 // is surfaced as an error rather than an empty completion.
 func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (Message, string, Usage, error) {
+	req.PromptCacheKey = resolvePromptCacheKey(ctx, req)
 	body, err := p.buildBody(req, false)
 	if err != nil {
 		return Message{}, "", Usage{}, err
@@ -489,7 +510,7 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 		if err != nil {
 			return lastPartial, "", totalUsage, incompleteRetryRequestError(ctx, err, attempt)
 		}
-		raw, rerr := io.ReadAll(resp.Body)
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 		resp.Body.Close()
 		if rerr != nil {
 			if ctx.Err() != nil {
@@ -528,6 +549,54 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 	}
 }
 
+// oaUsage normalizes Chat Completions usage across OpenAI, DeepSeek
+// (prompt_cache_hit_tokens), and OpenAI-compatible proxies that expose cache
+// write tokens either at top-level or inside prompt_tokens_details.
+type oaUsage struct {
+	PromptTokens             int `json:"prompt_tokens"`
+	CompletionTokens         int `json:"completion_tokens"`
+	PromptCacheHitTokens     int `json:"prompt_cache_hit_tokens"`
+	CacheWriteTokens         int `json:"cache_write_tokens"`
+	CachedCreationTokens     int `json:"cached_creation_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	PromptTokensDetails      struct {
+		CachedTokens             int `json:"cached_tokens"`
+		CacheWriteTokens         int `json:"cache_write_tokens"`
+		CachedCreationTokens     int `json:"cached_creation_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+func (u oaUsage) norm() Usage {
+	cacheRead := u.PromptTokensDetails.CachedTokens
+	if cacheRead == 0 {
+		cacheRead = u.PromptCacheHitTokens
+	}
+	cacheWrite := firstPositive(
+		u.PromptTokensDetails.CacheWriteTokens,
+		u.PromptTokensDetails.CachedCreationTokens,
+		u.PromptTokensDetails.CacheCreationInputTokens,
+		u.CacheWriteTokens,
+		u.CachedCreationTokens,
+		u.CacheCreationInputTokens,
+	)
+	return Usage{
+		InputTokens:      u.PromptTokens,
+		OutputTokens:     u.CompletionTokens,
+		CacheReadTokens:  cacheRead,
+		CacheWriteTokens: cacheWrite,
+	}
+}
+
+func firstPositive(vals ...int) int {
+	for _, v := range vals {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
 // parseOpenAIResponse decodes a non-streaming Chat Completions response body into
 // the neutral Message model. reasoning_content/reasoning (a reasoning model's
 // thinking) is mapped to a thinking block; content to a text block; tool_calls to
@@ -545,13 +614,7 @@ func parseOpenAIResponse(raw []byte, rawTools map[string]bool) (Message, string,
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
-		Usage *struct {
-			PromptTokens        int `json:"prompt_tokens"`
-			CompletionTokens    int `json:"completion_tokens"`
-			PromptTokensDetails struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+		Usage *oaUsage `json:"usage"`
 		Error *struct {
 			Message string `json:"message"`
 			Type    string `json:"type"`
@@ -565,11 +628,7 @@ func parseOpenAIResponse(raw []byte, rawTools map[string]bool) (Message, string,
 	}
 	var usage Usage
 	if r.Usage != nil {
-		usage = Usage{
-			InputTokens:     r.Usage.PromptTokens,
-			OutputTokens:    r.Usage.CompletionTokens,
-			CacheReadTokens: r.Usage.PromptTokensDetails.CachedTokens,
-		}
+		usage = r.Usage.norm()
 	}
 	if len(r.Choices) == 0 {
 		return Message{}, "", usage, &IncompleteResponseError{Reason: IncompleteEmptyOutput, Diagnostics: StreamDiagnostics{StreamEnd: StreamEndEOF}}
@@ -606,10 +665,17 @@ func parseOpenAIResponse(raw []byte, rawTools map[string]bool) (Message, string,
 }
 
 func truncate(s string, max int) string {
+	if max <= 0 {
+		return "…"
+	}
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "…"
+	cut := max
+	for cut > 0 && max-cut < utf8.UTFMax && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // pickReasoning returns the thinking text a Chat Completions payload carries,
@@ -649,13 +715,7 @@ func parseOpenAIFrameDiagnostics(data string, started map[int]bool) (evs []Strea
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
-		Usage *struct {
-			PromptTokens        int `json:"prompt_tokens"`
-			CompletionTokens    int `json:"completion_tokens"`
-			PromptTokensDetails struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+		Usage *oaUsage `json:"usage"`
 		Error *struct {
 			Message string          `json:"message"`
 			Type    string          `json:"type"`
@@ -666,7 +726,7 @@ func parseOpenAIFrameDiagnostics(data string, started map[int]bool) (evs []Strea
 		return nil, "", Usage{}, false, true, nil
 	}
 	if f.Usage != nil {
-		usage = Usage{InputTokens: f.Usage.PromptTokens, OutputTokens: f.Usage.CompletionTokens, CacheReadTokens: f.Usage.PromptTokensDetails.CachedTokens}
+		usage = f.Usage.norm()
 		hasUsage = true
 	}
 	if f.Error != nil {

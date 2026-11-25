@@ -96,16 +96,13 @@ func RenderDeferredToolsBlock(names []string) string {
 	return b.String()
 }
 
-// NewSearchExtraTools builds the always-loaded discovery tool. deferred is the set
-// of tool names whose schemas are withheld; the tool searches those names in reg
-// and returns each match's name + description + params schema.
+// NewSearchExtraTools builds the always-loaded discovery tool. deferred is the
+// initial set of tool names whose schemas are withheld; every invocation also
+// dynamically includes tools registered later via reg.AddDeferred so lazily
+// loaded skill-gated MCP tools become immediately discoverable without mutating
+// reg.Schemas().
 func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
-	deferredSet := make(map[string]bool, len(deferred))
-	for _, n := range deferred {
-		deferredSet[n] = true
-	}
-	ordered := append([]string(nil), deferred...)
-	sort.Strings(ordered)
+	initial := append([]string(nil), deferred...)
 	return Build(Spec{
 		Name: SearchExtraToolsName,
 		Description: "Discover deferred tools (not in your tool list) and get their schemas, then invoke via " +
@@ -133,6 +130,23 @@ func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
 			if q == "" {
 				return Errorf("Error: query is required"), nil
 			}
+			dyn := reg.DeferredNames()
+			deferredSet := make(map[string]bool, len(initial)+len(dyn))
+			ordered := make([]string, 0, len(initial)+len(dyn))
+			for _, n := range initial {
+				if !deferredSet[n] {
+					deferredSet[n] = true
+					ordered = append(ordered, n)
+				}
+			}
+			for _, n := range dyn {
+				if !deferredSet[n] {
+					deferredSet[n] = true
+					ordered = append(ordered, n)
+				}
+			}
+			sort.Strings(ordered)
+
 			var matches []CoreTool
 			seen := map[string]bool{}
 			addByFullName := func(name string) {

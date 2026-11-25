@@ -13,16 +13,44 @@ import (
 
 type anthropicProvider struct{ cfg Config }
 
+const maxAnthropicCacheBreakpoints = 4
+
+func ephemeralCacheControl() map[string]any {
+	return map[string]any{"type": "ephemeral"}
+}
+
 type anthropicSystemBlock struct {
 	Type         string         `json:"type"`
 	Text         string         `json:"text"`
 	CacheControl map[string]any `json:"cache_control,omitempty"`
 }
 
+// anthropicContentBlock is the Anthropic wire representation of a ContentBlock,
+// keeping cache_control strictly at the adapter boundary while llm.Message stays
+// vendor-neutral.
+type anthropicContentBlock struct {
+	Type         BlockType               `json:"type"`
+	Text         string                  `json:"text,omitempty"`
+	Thinking     string                  `json:"thinking,omitempty"`
+	Signature    string                  `json:"signature,omitempty"`
+	ID           string                  `json:"id,omitempty"`
+	Name         string                  `json:"name,omitempty"`
+	Input        json.RawMessage         `json:"input,omitempty"`
+	ToolUseID    string                  `json:"tool_use_id,omitempty"`
+	Content      []anthropicContentBlock `json:"content,omitempty"`
+	IsError      bool                    `json:"is_error,omitempty"`
+	CacheControl map[string]any          `json:"cache_control,omitempty"`
+}
+
+type anthropicMessage struct {
+	Role    Role                    `json:"role"`
+	Content []anthropicContentBlock `json:"content"`
+}
+
 type anthropicReq struct {
 	Model         string                 `json:"model"`
 	System        []anthropicSystemBlock `json:"system,omitempty"`
-	Messages      []Message              `json:"messages"`
+	Messages      []anthropicMessage     `json:"messages"`
 	Tools         []anthropicTool        `json:"tools,omitempty"`
 	MaxTokens     int                    `json:"max_tokens"`
 	Temperature   *float64               `json:"temperature,omitempty"`
@@ -44,9 +72,10 @@ type anthropicOutputConfig struct {
 }
 
 type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	InputSchema  map[string]any `json:"input_schema"`
+	CacheControl map[string]any `json:"cache_control,omitempty"`
 }
 
 func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
@@ -59,22 +88,43 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 	// only when thinking is actively "enabled"; any other mode (incl. "disabled")
 	// strips them so Anthropic does not reject the request.
 	thinkingType := p.cfg.ThinkingType
-	thinkingEnabled := thinkingType != ""
 	if req.Thinking != "" {
 		thinkingType = req.Thinking
-		thinkingEnabled = req.Thinking == "enabled"
 	}
+	thinkingEnabled := thinkingType == "enabled"
+
+	usedBreakpoints := 0
+	var tools []anthropicTool
+	for _, t := range req.Tools {
+		tools = append(tools, anthropicTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
+	}
+	// Breakpoint 1: mark the last tool definition so the entire tools prefix is cached.
+	if len(tools) > 0 && usedBreakpoints < maxAnthropicCacheBreakpoints {
+		tools[len(tools)-1].CacheControl = ephemeralCacheControl()
+		usedBreakpoints++
+	}
+
+	// Breakpoint 2: static system prefix (via buildAnthropicSystem).
+	system := buildAnthropicSystem(req)
+	for _, sb := range system {
+		if sb.CacheControl != nil {
+			usedBreakpoints++
+		}
+	}
+
+	// Breakpoints 3–4: rolling message breakpoints within remaining budget (max 2).
+	msgBudget := min(2, max(0, maxAnthropicCacheBreakpoints-usedBreakpoints))
+	normalized := mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, thinkingEnabled))
+
 	body := anthropicReq{
 		Model:         p.cfg.Model,
-		Messages:      mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, thinkingEnabled)),
+		Messages:      buildAnthropicMessages(normalized, msgBudget),
+		Tools:         tools,
 		MaxTokens:     maxTok,
 		Temperature:   req.Temperature,
 		StopSequences: req.Stop,
 		Stream:        stream,
-		System:        buildAnthropicSystem(req),
-	}
-	for _, t := range req.Tools {
-		body.Tools = append(body.Tools, anthropicTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
+		System:        system,
 	}
 	if thinkingType != "" {
 		body.Thinking = &anthropicThinking{Type: thinkingType}
@@ -85,8 +135,90 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 	return json.Marshal(body)
 }
 
+// buildAnthropicMessages converts normalized vendor-neutral messages into
+// Anthropic wire messages and places up to budget rolling ephemeral cache
+// breakpoints: on the last cacheable block of the final message, and (when
+// budget >= 2 and len >= 3) on the previous turn boundary (firstIdx-2, walking
+// back if needed). Thinking blocks and empty text blocks are never marked.
+func buildAnthropicMessages(msgs []Message, budget int) []anthropicMessage {
+	out := make([]anthropicMessage, len(msgs))
+	for i, m := range msgs {
+		blocks := make([]anthropicContentBlock, len(m.Content))
+		for j, b := range m.Content {
+			blocks[j] = convertAnthropicBlock(b)
+		}
+		out[i] = anthropicMessage{Role: m.Role, Content: blocks}
+	}
+	if budget <= 0 || len(out) == 0 {
+		return out
+	}
+
+	firstIdx := -1
+	for i := len(out) - 1; i >= 0; i-- {
+		if bIdx := lastCacheableAnthropicBlock(out[i].Content); bIdx >= 0 {
+			out[i].Content[bIdx].CacheControl = ephemeralCacheControl()
+			firstIdx = i
+			break
+		}
+	}
+	if budget >= 2 && firstIdx >= 2 {
+		for i := firstIdx - 2; i >= 0; i-- {
+			if bIdx := lastCacheableAnthropicBlock(out[i].Content); bIdx >= 0 {
+				out[i].Content[bIdx].CacheControl = ephemeralCacheControl()
+				break
+			}
+		}
+	}
+	return out
+}
+
+func convertAnthropicBlock(b ContentBlock) anthropicContentBlock {
+	ab := anthropicContentBlock{
+		Type:      b.Type,
+		Text:      b.Text,
+		Thinking:  b.Thinking,
+		Signature: b.Signature,
+		ID:        b.ID,
+		Name:      b.Name,
+		Input:     b.Input,
+		ToolUseID: b.ToolUseID,
+		IsError:   b.IsError,
+	}
+	if len(b.Content) > 0 {
+		ab.Content = make([]anthropicContentBlock, len(b.Content))
+		for i, inner := range b.Content {
+			ab.Content[i] = convertAnthropicBlock(inner)
+		}
+	}
+	return ab
+}
+
+func lastCacheableAnthropicBlock(blocks []anthropicContentBlock) int {
+	for i := len(blocks) - 1; i >= 0; i-- {
+		if isAnthropicCacheableBlock(blocks[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+// isAnthropicCacheableBlock reports whether b may carry Anthropic's
+// cache_control marker. Thinking blocks and empty text blocks are rejected by
+// Anthropic if marked.
+func isAnthropicCacheableBlock(b anthropicContentBlock) bool {
+	switch b.Type {
+	case BlockThinking:
+		return false
+	case BlockText:
+		return b.Text != ""
+	default:
+		return b.Type != ""
+	}
+}
+
 // buildAnthropicSystem splits the system prompt at DynamicBoundary, placing a
-// cache breakpoint on the static prefix (FR-02.2).
+// cache breakpoint on the static prefix (FR-02.2). Empty/whitespace-only blocks
+// are skipped because Anthropic rejects empty text blocks in system.
 func buildAnthropicSystem(req CompletionRequest) []anthropicSystemBlock {
 	if len(req.System) == 0 {
 		return nil
@@ -94,17 +226,32 @@ func buildAnthropicSystem(req CompletionRequest) []anthropicSystemBlock {
 	b := req.DynamicBoundary
 	if b <= 0 {
 		// No boundary set → no cache breakpoint.
-		return []anthropicSystemBlock{{Type: "text", Text: joinSystem(req.System)}}
+		text := joinSystem(req.System)
+		if text == "" {
+			return nil
+		}
+		return []anthropicSystemBlock{{Type: "text", Text: text}}
 	}
 	if b >= len(req.System) {
 		// Boundary at/after the end → the whole system prompt is static; cache it
 		// all in one block (an all-static prompt should still be cacheable).
-		return []anthropicSystemBlock{{Type: "text", Text: joinSystem(req.System), CacheControl: map[string]any{"type": "ephemeral"}}}
+		text := joinSystem(req.System)
+		if text == "" {
+			return nil
+		}
+		return []anthropicSystemBlock{{Type: "text", Text: text, CacheControl: ephemeralCacheControl()}}
 	}
-	return []anthropicSystemBlock{
-		{Type: "text", Text: joinSystem(req.System[:b]), CacheControl: map[string]any{"type": "ephemeral"}},
-		{Type: "text", Text: joinSystem(req.System[b:])},
+	var out []anthropicSystemBlock
+	if staticText := joinSystem(req.System[:b]); staticText != "" {
+		out = append(out, anthropicSystemBlock{Type: "text", Text: staticText, CacheControl: ephemeralCacheControl()})
 	}
+	if dynamicText := joinSystem(req.System[b:]); dynamicText != "" {
+		out = append(out, anthropicSystemBlock{Type: "text", Text: dynamicText})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) iter.Seq2[StreamEvent, error] {
@@ -152,6 +299,11 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 					break
 				}
 				if serr != nil {
+					if errors.Is(serr, ErrSSEEventTooLarge) {
+						diagnostics.StreamEnd = StreamEndProtocolError
+						streamErr = serr
+						break
+					}
 					diagnostics.StreamEnd = StreamEndReadError
 					incomplete = IncompleteStreamRead
 					break
@@ -341,7 +493,7 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 		if err != nil {
 			return lastPartial, "", totalUsage, incompleteRetryRequestError(ctx, err, attempt)
 		}
-		raw, rerr := io.ReadAll(resp.Body)
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 		resp.Body.Close()
 		if rerr != nil {
 			if ctx.Err() != nil {

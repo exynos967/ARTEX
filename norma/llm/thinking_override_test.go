@@ -112,3 +112,56 @@ func TestOpenAIPerRequestThinkingOverride(t *testing.T) {
 		t.Fatalf("empty override should inherit config, got %q", thinkingType(m2))
 	}
 }
+
+// Config.ThinkingType=="disabled" without a per-request override must NOT replay
+// thinking blocks on Anthropic.
+func TestAnthropicConfigThinkingDisabledStripsBlocks(t *testing.T) {
+	stub := sse(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`, ``, `data: {"type":"message_stop"}`, ``)
+	req := CompletionRequest{
+		Messages: []Message{
+			UserText("hi"),
+			{Role: RoleAssistant, Content: []ContentBlock{
+				{Type: BlockThinking, Thinking: "DO_NOT_REPLAY", Signature: "sig"},
+				TextBlock("visible"),
+			}},
+		},
+	}
+	raw, m := captureReq(t, Config{Format: FormatAnthropic, ThinkingType: "disabled"}, req, stub)
+	if thinkingType(m) != "disabled" {
+		t.Fatalf("thinking=%q, want disabled", thinkingType(m))
+	}
+	if strings.Contains(raw, "DO_NOT_REPLAY") {
+		t.Fatal("Anthropic replayed thinking block when Config.ThinkingType == \"disabled\"")
+	}
+	if !strings.Contains(raw, "visible") {
+		t.Fatal("visible text missing")
+	}
+}
+
+// On OpenAI Chat Completions, req.Thinking=="disabled" (e.g. compaction summary):
+//   - omits reasoning_effort (matching openai-responses),
+//   - omits the non-standard thinking object when Config.ThinkingType == "",
+//   - does not inject reasoningElidedPlaceholder into assistant tool_calls turns.
+func TestOpenAIThinkingDisabledOmitsFieldsAndPlaceholder(t *testing.T) {
+	stub := sse(`data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}`, ``, `data: [DONE]`, ``)
+	req := CompletionRequest{
+		Thinking: "disabled",
+		Messages: []Message{
+			UserText("hi"),
+			{Role: RoleAssistant, Content: []ContentBlock{
+				{Type: BlockToolUse, ID: "c1", Name: "Read", Input: json.RawMessage(`{"path":"a"}`)},
+			}},
+			{Role: RoleUser, Content: []ContentBlock{ToolResultText("c1", "ok", false)}},
+		},
+	}
+	raw, m := captureReq(t, Config{Format: FormatOpenAI, ReasoningEffort: "high"}, req, stub)
+	if _, ok := m["thinking"]; ok {
+		t.Fatalf("standard OpenAI must omit thinking when Config.ThinkingType == \"\", got %v", m["thinking"])
+	}
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort must be omitted when req.Thinking == \"disabled\", got %v", m["reasoning_effort"])
+	}
+	if strings.Contains(raw, reasoningElidedPlaceholder) {
+		t.Fatal("reasoningElidedPlaceholder must not be injected when thinking is disabled")
+	}
+}

@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+// maxSpillFileBytes caps the on-disk overflow artifact written by captureWriter
+// so a runaway command cannot exhaust disk space.
+const maxSpillFileBytes int64 = 50 << 20 // 50 MiB
+
 // captureWriter is Capture for a process output stream. Keep the same head/tail,
 // notice and complete artifact without buffering the entire command output in
 // RAM first. Disk failures retain the existing best-effort truncation behavior.
@@ -17,14 +21,24 @@ import (
 type captureWriter struct {
 	tc              *ToolContext
 	limit           int
+	maxSpill        int64
 	head, tail      []byte
 	total, newlines int64
+	spilled         int64
 	file            *os.File
 	spillFailed     bool
+	spillTruncated  bool
 }
 
 func newCaptureWriter(tc *ToolContext) *captureWriter {
-	return &captureWriter{tc: tc, limit: maxOut(tc)}
+	return &captureWriter{tc: tc, limit: maxOut(tc), maxSpill: maxSpillFileBytes}
+}
+
+func (w *captureWriter) spillCap() int64 {
+	if w.maxSpill > 0 {
+		return w.maxSpill
+	}
+	return maxSpillFileBytes
 }
 
 func (w *captureWriter) failSpill() {
@@ -34,6 +48,27 @@ func (w *captureWriter) failSpill() {
 		os.Remove(w.file.Name())
 		w.file = nil
 	}
+}
+
+func (w *captureWriter) writeSpill(data []byte) {
+	if w.file == nil || len(data) == 0 {
+		return
+	}
+	rem := w.spillCap() - w.spilled
+	if rem <= 0 {
+		w.spillTruncated = true
+		return
+	}
+	chunk := data
+	if int64(len(chunk)) > rem {
+		chunk = trimUTF8PrefixBytes(data[:rem])
+		w.spillTruncated = true
+	}
+	if n, err := w.file.Write(chunk); err != nil || n != len(chunk) {
+		w.failSpill()
+		return
+	}
+	w.spilled += int64(len(chunk))
 }
 
 func (w *captureWriter) Write(p []byte) (int, error) {
@@ -47,16 +82,12 @@ func (w *captureWriter) Write(p []byte) (int, error) {
 				w.spillFailed = true
 			} else {
 				w.file = f
-				if n, err := f.Write(w.head); err != nil || n != len(w.head) {
-					w.failSpill()
-				}
+				w.writeSpill(w.head)
 			}
 		}
 	}
 	if w.file != nil {
-		if n, err := w.file.Write(p); err != nil || n != len(p) {
-			w.failSpill()
-		}
+		w.writeSpill(p)
 	}
 	if len(w.head) < w.limit {
 		w.head = append(w.head, p[:min(len(p), w.limit-len(w.head))]...)
@@ -86,14 +117,17 @@ func (w *captureWriter) finish() string {
 					ref = rel
 				}
 			}
-			return string(w.head) + fmt.Sprintf("\n\n... <persisted-output>[Output too large: full %d bytes / %d lines.Full output saved to  %s </persisted-output>", w.total, w.newlines+1, ref)
+			if w.spillTruncated {
+				return string(trimUTF8PrefixBytes(w.head)) + fmt.Sprintf("\n\n... <persisted-output>[Output too large: %d bytes / %d lines total; spill file truncated at %d bytes cap and saved to %s]</persisted-output>", w.total, w.newlines+1, w.spilled, ref)
+			}
+			return string(trimUTF8PrefixBytes(w.head)) + fmt.Sprintf("\n\n... <persisted-output>[Output too large: full %d bytes / %d lines.Full output saved to  %s </persisted-output>", w.total, w.newlines+1, ref)
 		}
 		w.failSpill()
 	}
 	if w.total <= int64(w.limit) {
 		return string(w.head)
 	}
-	return string(w.head[:w.limit/2]) + fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", w.total-int64(w.limit)) + string(w.tail)
+	return string(trimUTF8PrefixBytes(w.head[:w.limit/2])) + fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", w.total-int64(w.limit)) + string(trimUTF8SuffixBytes(w.tail))
 }
 
 var _ io.Writer = (*captureWriter)(nil)

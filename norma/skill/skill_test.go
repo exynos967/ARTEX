@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/RC-CHN/ARTEX/norma/llm"
 	"github.com/RC-CHN/ARTEX/norma/tool"
@@ -120,5 +121,18 @@ func TestLoadDir(t *testing.T) {
 	d, ok := r.Get("deploy")
 	if !ok || !strings.Contains(d.Instructions, "make deploy") {
 		t.Fatalf("deploy skill: %+v ok=%v", d, ok)
+	}
+}
+
+func TestListingTruncatesUTF8Safely(t *testing.T) {
+	// Place a 3-byte rune straddling maxSkillDescChars.
+	desc := strings.Repeat("a", maxSkillDescChars-1) + "中文说明"
+	r := NewRegistry(Skill{Name: "cn", Description: desc})
+	prompt := r.Tool().Prompt()
+	if !utf8.ValidString(prompt) {
+		t.Fatalf("skill listing split multi-byte UTF-8 rune: %q", prompt)
+	}
+	if !strings.HasSuffix(prompt, "…") {
+		t.Fatalf("expected ellipsis suffix: %q", prompt)
 	}
 }

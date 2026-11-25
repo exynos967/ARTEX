@@ -7,7 +7,10 @@
 // any model reachable through either wire format.
 package llm
 
-import "encoding/json"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Role identifies the author of a message.
 type Role string
@@ -152,4 +155,27 @@ type CompletionRequest struct {
 	// tokens on reasoning and never replays thinking blocks (which Anthropic
 	// rejects when thinking is off).
 	Thinking string
+	// PromptCacheKey is an optional sticky routing key for prompt-caching
+	// providers (e.g., OpenAI prompt_cache_key) and pool failover locality.
+	// When empty, providers may fall back to PromptCacheKeyFrom(ctx).
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
+}
+
+type promptCacheKeyCtxKey struct{}
+
+// WithPromptCacheKey attaches a session-stable prompt cache routing key to ctx.
+func WithPromptCacheKey(ctx context.Context, key string) context.Context {
+	if key == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, promptCacheKeyCtxKey{}, key)
+}
+
+// PromptCacheKeyFrom returns the prompt cache routing key attached to ctx, if any.
+func PromptCacheKeyFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(promptCacheKeyCtxKey{}).(string)
+	return v
 }

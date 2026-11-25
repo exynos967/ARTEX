@@ -42,10 +42,42 @@ func Enable(opts *agentcore.Options, o Options) error {
 
 	opts.Compactor = &Compactor{sess: sess}
 	opts.Tools = append(opts.Tools, newCompressTool(sess))
-	opts.AppendSystemPrompt = append(opts.AppendSystemPrompt, noa.BuildSystemPrompt(noa.Sections{}))
-	// The prompt section is fully static, so it belongs in the cacheable prefix.
-	// Left past the boundary it would be re-billed every single request.
-	opts.DynamicBoundary = len(opts.SystemPrompt) + len(opts.AppendSystemPrompt)
+	noaPrompt := noa.BuildSystemPrompt(noa.Sections{})
+	// The noa prompt section is fully static, so it belongs inside the cacheable
+	// prefix — WITHOUT pulling any post-boundary dynamic segments (such as
+	// <artex-dynamic-time>) across DynamicBoundary, and WITHOUT pushing
+	// pre-existing static AppendSystemPrompt segments past a newly invented
+	// boundary when opts.DynamicBoundary <= 0.
+	switch {
+	case opts.DynamicBoundary > 0 && opts.DynamicBoundary < len(opts.SystemPrompt):
+		b := opts.DynamicBoundary
+		sys := make([]string, 0, len(opts.SystemPrompt)+1)
+		sys = append(sys, opts.SystemPrompt[:b]...)
+		sys = append(sys, noaPrompt)
+		sys = append(sys, opts.SystemPrompt[b:]...)
+		opts.SystemPrompt = sys
+		opts.DynamicBoundary = b + 1
+	case opts.DynamicBoundary > len(opts.SystemPrompt) && opts.DynamicBoundary < len(opts.SystemPrompt)+len(opts.AppendSystemPrompt):
+		idx := opts.DynamicBoundary - len(opts.SystemPrompt)
+		app := make([]string, 0, len(opts.AppendSystemPrompt)+1)
+		app = append(app, opts.AppendSystemPrompt[:idx]...)
+		app = append(app, noaPrompt)
+		app = append(app, opts.AppendSystemPrompt[idx:]...)
+		opts.AppendSystemPrompt = app
+		opts.DynamicBoundary++
+	case opts.DynamicBoundary > 0 && opts.DynamicBoundary == len(opts.SystemPrompt) && len(opts.AppendSystemPrompt) > 0:
+		// Callers explicitly placed DynamicBoundary at the end of SystemPrompt
+		// so AppendSystemPrompt stays post-boundary; insert noaPrompt at the end
+		// of SystemPrompt so those dynamic segments stay post-boundary.
+		opts.SystemPrompt = append(append([]string(nil), opts.SystemPrompt...), noaPrompt)
+		opts.DynamicBoundary = len(opts.SystemPrompt)
+	default:
+		// Either DynamicBoundary <= 0 (all pre-existing SystemPrompt and
+		// AppendSystemPrompt segments are static) or DynamicBoundary already
+		// covers everything: append noaPrompt and cover the full static prefix.
+		opts.AppendSystemPrompt = append(opts.AppendSystemPrompt, noaPrompt)
+		opts.DynamicBoundary = len(opts.SystemPrompt) + len(opts.AppendSystemPrompt)
+	}
 	return nil
 }
 

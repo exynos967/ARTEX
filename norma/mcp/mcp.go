@@ -84,6 +84,7 @@ type conn struct {
 	mu      sync.Mutex
 	nextID  int
 	pending map[int]chan rpcResponse
+	closed  bool
 	closeCh chan struct{}
 	once    sync.Once
 }
@@ -117,32 +118,56 @@ func (c *conn) readLoop(r io.Reader) {
 			ch <- resp
 		}
 	}
+	c.mu.Lock()
+	c.closed = true
+	clear(c.pending)
+	c.mu.Unlock()
 	c.once.Do(func() { close(c.closeCh) })
 }
 
 func (c *conn) notify(method string, params any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return fmt.Errorf("mcp: connection closed")
+	}
 	return c.writeLocked(rpcRequest{JSONRPC: "2.0", Method: method, Params: params})
 }
 
 func (c *conn) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("mcp: connection closed")
+	}
 	c.nextID++
 	id := c.nextID
 	ch := make(chan rpcResponse, 1)
 	c.pending[id] = ch
 	err := c.writeLocked(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
-	c.mu.Unlock()
 	if err != nil {
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, err
 	}
+	c.mu.Unlock()
+
+	cleanup := true
+	defer func() {
+		if cleanup {
+			c.mu.Lock()
+			delete(c.pending, id)
+			c.mu.Unlock()
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.closeCh:
 		return nil, fmt.Errorf("mcp: connection closed")
 	case resp := <-ch:
+		cleanup = false
 		if resp.Error != nil {
 			return nil, resp.Error
 		}

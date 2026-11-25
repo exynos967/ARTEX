@@ -48,7 +48,7 @@ func TestLinePagerCompatibility(t *testing.T) {
 }
 
 func TestPTYWindowCompatibility(t *testing.T) {
-	s := &ptySession{notifyCh: make(chan struct{}, 1)}
+	s := &ptySession{}
 	rng := rand.New(rand.NewPCG(17, 23))
 	var want string
 	var total int64
@@ -189,7 +189,7 @@ func BenchmarkToolPrimitives(b *testing.B) {
 		}
 	})
 	b.Run("PTYAppend4KiB", func(b *testing.B) {
-		s := &ptySession{buf: make([]byte, sessRingCap), notifyCh: make(chan struct{}, 1)}
+		s := &ptySession{buf: make([]byte, sessRingCap)}
 		chunk := make([]byte, 4096)
 		b.ReportAllocs()
 		b.ResetTimer()

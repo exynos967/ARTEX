@@ -202,7 +202,7 @@ func NewShellSend() CoreTool {
 		if !s.running() {
 			return Errorf("会话已结束(exit " + fmtExit(s.exit()) + ")，用 shell_read 读取尾部输出或 shell_close"), nil
 		}
-		before := s.total
+		before := s.totalBytes()
 		// build & write input in order: text, submit(\r), keys, hex, paste
 		var payload []byte
 		if a.Text != "" {
@@ -229,7 +229,7 @@ func NewShellSend() CoreTool {
 		if len(payload) == 0 {
 			return Errorf("没有可发送的输入(text/submit/keys/hex/paste 至少给一个)"), nil
 		}
-		if _, err := s.ptmx.Write(payload); err != nil {
+		if _, err := s.writeInput(payload); err != nil {
 			return Errorf("写入失败: " + err.Error()), nil
 		}
 		wait := a.Wait == nil || *a.Wait

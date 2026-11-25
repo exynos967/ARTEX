@@ -119,7 +119,7 @@ func TestHexToBytes(t *testing.T) {
 }
 
 func TestReadSinceIncremental(t *testing.T) {
-	s := &ptySession{notifyCh: make(chan struct{}, 1)}
+	s := &ptySession{}
 	s.append([]byte("line1\nline2\n"))
 	out, cur, _ := s.readSince(0, 0, 8192, false)
 	if out != "line1\nline2\n" {
@@ -129,5 +129,68 @@ func TestReadSinceIncremental(t *testing.T) {
 	out2, _, _ := s.readSince(cur, 0, 8192, false)
 	if out2 != "line3\n" {
 		t.Fatalf("incremental got %q", out2)
+	}
+}
+
+// TestPTYSessionBroadcastNotifyNoStolenPings verifies that multiple concurrent
+// waiters (e.g. monitorWaiter and shell_send(wait)) each receive output
+// notifications without stealing pings from one another.
+func TestPTYSessionBroadcastNotifyNoStolenPings(t *testing.T) {
+	m := newTestManager(t)
+	s := &ptySession{id: "sh_bcast", command: "fake", state: "running", done: make(chan struct{})}
+
+	monDone := make(chan struct{})
+	go func() {
+		defer close(monDone)
+		m.monitorWaiter(s, []*regexp.Regexp{regexp.MustCompile("READY_PROMPT")})
+	}()
+
+	waitRes := make(chan string, 1)
+	go func() {
+		waitRes <- s.waitComplete(context.Background(), 2*time.Second, 0, 3*time.Second, regexp.MustCompile("READY_PROMPT"), "")
+	}()
+
+	// Allow both waiters to register their subscribers.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		n := len(s.subs)
+		s.mu.Unlock()
+		if n == 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s.append([]byte("booting...\nREADY_PROMPT> "))
+
+	select {
+	case reason := <-waitRes:
+		if reason != "prompt" {
+			t.Fatalf("waitComplete reason=%q, want prompt", reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitComplete missed broadcast notification")
+	}
+
+	found := false
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !found {
+		for _, n := range m.DrainNotifications() {
+			if strings.Contains(n.Summary, "READY_PROMPT") {
+				found = true
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("monitorWaiter missed broadcast notification (ping stolen by waitComplete)")
+	}
+	close(s.done)
+	select {
+	case <-monDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitorWaiter did not exit after s.done closed")
 	}
 }

@@ -12,6 +12,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+)
+
+const (
+	// Safety ceilings for ripgrep output buffering.
+	maxRipgrepLines     = 5000    // hard line ceiling when head_limit <= 0
+	maxRipgrepBytes     = 8 << 20 // 8 MiB total buffered output ceiling
+	maxRipgrepLineBytes = 64 << 10 // 64 KiB per buffered line
 )
 
 // Ripgrep integration: the Grep tool prefers the ripgrep binary when available
@@ -63,7 +71,10 @@ func installRipgrepViaNpm() string {
 	if _, err := exec.LookPath("npm"); err != nil {
 		return "" // no npm → Go fallback
 	}
-	cmd := exec.Command("npm", "install", "-g", "@vscode/ripgrep")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "npm", "install", "-g", "@vscode/ripgrep")
+	setDetached(cmd)
 	if err := cmd.Run(); err != nil {
 		return ""
 	}
@@ -76,7 +87,11 @@ func installRipgrepViaNpm() string {
 // npmGlobalRipgrep locates the rg binary vendored by @vscode/ripgrep in the npm
 // global root (it exposes no `rg` command, so we resolve the path directly).
 func npmGlobalRipgrep() string {
-	out, err := exec.Command("npm", "root", "-g").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "npm", "root", "-g")
+	setDetached(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -153,9 +168,22 @@ func runWithRipgrep(ctx context.Context, rg string, r ripgrepReq, tc *ToolContex
 	if r.headLimit != nil {
 		headLimit = *r.headLimit
 	}
-	page := &linePager{limit: headLimit, offset: max(r.offset, 0)}
+	page := newLinePager(headLimit, r.offset)
 	cmd.Stdout = page
-	err := cmd.Run()
+	cg := newCmdCgroup()
+	setDetachedWithCgroup(cmd, cg)
+
+	var err error
+	if startErr := cmd.Start(); startErr != nil {
+		cg.cleanup()
+		err = startErr
+	} else {
+		if cg != nil && !cg.attach(cmd.Process.Pid) {
+			cg = nil
+		}
+		err = cmd.Wait()
+		cg.cleanup()
+	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) && ee.ExitCode() == 1 {
@@ -172,7 +200,11 @@ func runWithRipgrep(ctx context.Context, rg string, r ripgrepReq, tc *ToolContex
 		res += "\n"
 	}
 	if more > 0 {
-		res += fmt.Sprintf("... [%d more result(s) — page with offset=%d, or head_limit=0 for all] ...\n", more, r.offset+len(kept))
+		if page.hitSafetyCap(more) {
+			res += fmt.Sprintf("... [%d more result(s) truncated by safety ceiling — page with offset=%d or narrow pattern/path] ...\n", more, max(r.offset, 0)+len(kept))
+		} else {
+			res += fmt.Sprintf("... [%d more result(s) — page with offset=%d, or head_limit=0 for all] ...\n", more, max(r.offset, 0)+len(kept))
+		}
 	}
 	return Text(Capture(tc, res)), true
 }
@@ -182,21 +214,56 @@ func runWithRipgrep(ctx context.Context, rg string, r ripgrepReq, tc *ToolContex
 // Trailing blank lines are dropped just like TrimRight(output, "\n").
 type linePager struct {
 	limit, offset   int
+	maxLines        int // safety ceiling when limit <= 0 (0 = uncapped)
+	maxBytes        int // safety ceiling on total buffered bytes (0 = uncapped)
+	maxLineBytes    int // safety ceiling on a single buffered line (0 = uncapped)
 	position, total int
 	lineBytes       int
+	bufferedBytes   int
+	lineTruncated   bool
+	byteCapped      bool
 	pending         strings.Builder
 	lines           []string
 }
 
+func newLinePager(limit, offset int) *linePager {
+	return &linePager{
+		limit:        limit,
+		offset:       max(offset, 0),
+		maxLines:     maxRipgrepLines,
+		maxBytes:     maxRipgrepBytes,
+		maxLineBytes: maxRipgrepLineBytes,
+	}
+}
+
 func (p *linePager) keeping() bool {
-	return p.position >= p.offset && (p.limit <= 0 || p.position-p.offset < p.limit)
+	if p.byteCapped || p.position < p.offset {
+		return false
+	}
+	if p.limit > 0 && p.position-p.offset >= p.limit {
+		return false
+	}
+	if p.limit <= 0 && p.maxLines > 0 && p.position-p.offset >= p.maxLines {
+		return false
+	}
+	if p.maxBytes > 0 && p.bufferedBytes >= p.maxBytes {
+		return false
+	}
+	return true
 }
 
 func (p *linePager) endLine() {
 	if p.keeping() {
-		p.lines = append(p.lines, p.pending.String())
+		line := p.pending.String()
+		if p.maxBytes > 0 && len(p.lines) > 0 && p.bufferedBytes+len(line)+1 > p.maxBytes {
+			p.byteCapped = true
+		} else {
+			p.lines = append(p.lines, line)
+			p.bufferedBytes += len(line) + 1
+		}
 	}
 	p.pending.Reset()
+	p.lineTruncated = false
 	p.position++
 	if p.lineBytes > 0 {
 		p.total = p.position
@@ -214,7 +281,21 @@ func (p *linePager) Write(data []byte) (int, error) {
 		}
 		p.lineBytes += end
 		if p.keeping() {
-			p.pending.Write(data[:end])
+			if p.maxLineBytes <= 0 {
+				p.pending.Write(data[:end])
+			} else {
+				rem := p.maxLineBytes - p.pending.Len()
+				if rem > 0 {
+					p.pending.Write(data[:min(end, rem)])
+					if end > rem && !p.lineTruncated {
+						p.pending.WriteString("...[truncated]")
+						p.lineTruncated = true
+					}
+				} else if end > 0 && !p.lineTruncated {
+					p.pending.WriteString("...[truncated]")
+					p.lineTruncated = true
+				}
+			}
 		}
 		if i < 0 {
 			break
@@ -234,4 +315,14 @@ func (p *linePager) finish() ([]string, int) {
 		p.lines = p.lines[:available]
 	}
 	return p.lines, available - len(p.lines)
+}
+
+func (p *linePager) hitSafetyCap(more int) bool {
+	if more <= 0 {
+		return false
+	}
+	if p.byteCapped || (p.maxBytes > 0 && p.bufferedBytes >= p.maxBytes) {
+		return true
+	}
+	return p.limit <= 0 && p.maxLines > 0
 }

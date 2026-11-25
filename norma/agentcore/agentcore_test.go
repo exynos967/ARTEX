@@ -93,3 +93,29 @@ func TestRunConvenience(t *testing.T) {
 		t.Fatalf("out=%q", out)
 	}
 }
+
+func TestSessionUsageAccumulatesAcrossPrompts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(sse(
+			`data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`, ``,
+			`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":25}}`, ``,
+			`data: [DONE]`, ``,
+		)))
+	}))
+	defer srv.Close()
+	prov, _ := llm.NewProvider(llm.Config{Format: llm.FormatOpenAI, BaseURL: srv.URL, APIKey: "k", Model: "m"})
+	s := NewSession(Options{Provider: prov, SystemPrompt: []string{"hi"}, Tools: []tool.CoreTool{}})
+	defer s.Close()
+
+	for _, prompt := range []string{"first", "second"} {
+		for _, err := range s.Prompt(context.Background(), prompt) {
+			if err != nil {
+				t.Fatalf("prompt %q err: %v", prompt, err)
+			}
+		}
+	}
+	want := llm.Usage{InputTokens: 200, OutputTokens: 50}
+	if got := s.Usage(); got != want {
+		t.Fatalf("Session.Usage()=%+v, want %+v (must accumulate across prompts)", got, want)
+	}
+}

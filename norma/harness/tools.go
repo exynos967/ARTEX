@@ -17,6 +17,59 @@ import (
 // the transport may deliver a partial call at all (see llm.ToolSchema.RawInput).
 func acceptsRawInput(t tool.CoreTool) bool { return tool.AcceptsRawInput(t) }
 
+const maxExtraToolDepth = 8
+
+type extraWrapFrame struct {
+	toolName string
+}
+
+// unwrapExtraTool peels ExecuteExtraTool wrapper envelopes (up to
+// maxExtraToolDepth) so settlement, permission evaluation, DisallowedTools,
+// ModePlan, and PreToolUse/PostToolUse hooks always inspect the real target
+// tool and its params.
+func unwrapExtraTool(name string, input json.RawMessage) (effName string, effInput json.RawMessage, frames []extraWrapFrame, depthExceeded bool) {
+	effName, effInput = name, input
+	for depth := 0; effName == tool.ExecuteExtraToolName; depth++ {
+		if depth >= maxExtraToolDepth {
+			return effName, effInput, frames, true
+		}
+		var a struct {
+			Name   string          `json:"tool_name"`
+			Params json.RawMessage `json:"params"`
+		}
+		if json.Unmarshal(effInput, &a) != nil || a.Name == "" {
+			return effName, effInput, frames, false
+		}
+		params := a.Params
+		if len(bytes.TrimSpace(params)) == 0 {
+			params = json.RawMessage("{}")
+		}
+		frames = append(frames, extraWrapFrame{toolName: a.Name})
+		effName, effInput = a.Name, params
+	}
+	return effName, effInput, frames, false
+}
+
+// rewrapExtraTool rebuilds nested ExecuteExtraTool JSON envelopes after a
+// permission decision or PreToolUse hook rewrites the target tool's params.
+func rewrapExtraTool(frames []extraWrapFrame, innerInput json.RawMessage) json.RawMessage {
+	cur := innerInput
+	for i := len(frames) - 1; i >= 0; i-- {
+		wrapped, err := json.Marshal(struct {
+			ToolName string          `json:"tool_name"`
+			Params   json.RawMessage `json:"params"`
+		}{
+			ToolName: frames[i].toolName,
+			Params:   cur,
+		})
+		if err != nil {
+			return cur
+		}
+		cur = wrapped
+	}
+	return cur
+}
+
 // execOne resolves, permission-checks, and runs a single tool call, returning a
 // tool_result block and any extra messages the tool injects after its result
 // (Result.Extra — e.g. the Skill tool's instructions message). It never panics;
@@ -25,18 +78,8 @@ func acceptsRawInput(t tool.CoreTool) bool { return tool.AcceptsRawInput(t) }
 // callbacks are the host's responsibility to make safe).
 func (l *loop) execOne(toolCtx context.Context, use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
 	if l.settling.Load() && l.in.Settlement != nil {
-		name, input := use.Name, use.Input
-		for depth := 0; name == tool.ExecuteExtraToolName && depth < 8; depth++ {
-			var a struct {
-				Name   string          `json:"tool_name"`
-				Params json.RawMessage `json:"params"`
-			}
-			if json.Unmarshal(input, &a) != nil {
-				break
-			}
-			name, input = a.Name, a.Params
-		}
-		blocked := name == tool.ExecuteExtraToolName
+		name, _, _, depthExceeded := unwrapExtraTool(use.Name, use.Input)
+		blocked := depthExceeded || name == tool.ExecuteExtraToolName
 		for _, disabled := range l.in.Settlement.DisabledTools {
 			if name == disabled {
 				blocked = true
@@ -96,11 +139,63 @@ func (l *loop) execOne(toolCtx context.Context, use llm.ContentBlock, emitProgre
 		Allowed:    l.in.Allowed,
 		Disallowed: l.in.Disallowed,
 	}
+
+	// Unwrap ExecuteExtraTool at the permission and hook choke point so target
+	// tool rules (DisallowedTools, CheckPermissions, ModePlan read-only checks,
+	// CanUseTool, PreToolUse, PostToolUse) always apply to the real target tool.
+	effName, effTool, effInput := use.Name, t, input
+	var wrapFrames []extraWrapFrame
+	if use.Name == tool.ExecuteExtraToolName {
+		// Honor an explicit Disallowed rule targeting ExecuteExtraTool itself
+		// without letting its non-read-only wrapper block read-only targets in ModePlan.
+		outerPC := pc
+		outerPC.Mode = permission.ModeBypass
+		if outerDec := permission.Evaluate(l.ctx, permission.Request{
+			ToolName:     use.Name,
+			Input:        input,
+			IsReadOnly:   false,
+			ToolDecision: t.CheckPermissions(l.ctx, input, outerPC),
+			Ctx:          outerPC,
+		}); outerDec.Behavior != permission.Allow {
+			msg := outerDec.Message
+			if msg == "" {
+				msg = "denied"
+			}
+			return llm.ToolResultText(use.ID, "Tool call was not permitted: "+msg, true), nil
+		}
+
+		unwrappedName, unwrappedInput, frames, depthExceeded := unwrapExtraTool(use.Name, input)
+		if depthExceeded {
+			return llm.ToolResultText(use.ID, "Tool call was not permitted: nested ExecuteExtraTool depth limit exceeded", true), nil
+		}
+		if len(frames) > 0 {
+			wrapFrames = frames
+			effName = unwrappedName
+			effInput = unwrappedInput
+			if target, found := l.in.Tools.Get(effName); found {
+				effTool = target
+				if !acceptsRawInput(effTool) && !json.Valid(effInput) {
+					return llm.ToolResultText(use.ID, invalidInputMessage, true), nil
+				}
+			} else {
+				effTool = nil
+			}
+		}
+	}
+
+	var isReadOnly bool
+	var toolDec permission.Decision
+	if effTool != nil {
+		isReadOnly = effTool.IsReadOnly(effInput)
+		toolDec = effTool.CheckPermissions(l.ctx, effInput, pc)
+	} else {
+		toolDec = permission.AskUser("run tool: " + effName)
+	}
 	dec := permission.Evaluate(l.ctx, permission.Request{
-		ToolName:     use.Name,
-		Input:        input,
-		IsReadOnly:   t.IsReadOnly(input),
-		ToolDecision: t.CheckPermissions(l.ctx, input, pc),
+		ToolName:     effName,
+		Input:        effInput,
+		IsReadOnly:   isReadOnly,
+		ToolDecision: toolDec,
 		Ctx:          pc,
 		Ask:          l.in.CanUseTool,
 	})
@@ -112,16 +207,21 @@ func (l *loop) execOne(toolCtx context.Context, use llm.ContentBlock, emitProgre
 		return llm.ToolResultText(use.ID, "Tool call was not permitted: "+msg, true), nil
 	}
 	if len(dec.UpdatedInput) > 0 {
-		input = dec.UpdatedInput
+		effInput = dec.UpdatedInput
 	}
 
 	// Pre-tool hook.
 	if l.in.Hooks != nil {
-		if block, msg, updated := l.in.Hooks.PreToolUse(l.ctx, use.Name, input); block {
+		if block, msg, updated := l.in.Hooks.PreToolUse(l.ctx, effName, effInput); block {
 			return llm.ToolResultText(use.ID, "Blocked by hook: "+msg, true), nil
 		} else if len(updated) > 0 {
-			input = updated
+			effInput = updated
 		}
+	}
+
+	callInput := effInput
+	if len(wrapFrames) > 0 {
+		callInput = rewrapExtraTool(wrapFrames, effInput)
 	}
 
 	tc := &tool.ToolContext{
@@ -138,25 +238,25 @@ func (l *loop) execOne(toolCtx context.Context, use llm.ContentBlock, emitProgre
 	// toolCtx carries the run's MaxDuration deadline, so a tool that overruns the
 	// wall-clock budget is interrupted here (the turn loop then enters wrap-up). During
 	// the wrap-up phase toolCtx is the live parent ctx, so settlement tools run freely.
-	res, err := t.Call(toolCtx, input, tc)
+	res, err := t.Call(toolCtx, callInput, tc)
 	if err != nil {
 		if tool.IsFatalExecution(err) && l.cancelRun != nil {
 			l.cancelRun(err)
 		}
 		res = tool.Errorf("Error: " + err.Error())
 	}
-	res = tool.NormalizeError(res, t.IsReadOnly(input))
+	res = tool.NormalizeError(res, isReadOnly)
 	// Global output cap at the single post-tool choke point: EVERY tool —
 	// built-in, MCP, custom, host — is bounded here regardless of whether it
 	// remembered to Capture itself, so no tool can overflow the context window
 	// (the failure mode that motivated this net). CaptureOnce is idempotent:
 	// output a tool already spilled/truncated carries a marker and is left
 	// untouched, so this never double-truncates or double-spills.
-	res = tool.CapToolResult(use.Name, tc, res)
+	res = tool.CapToolResult(effName, tc, res)
 
 	if l.in.Hooks != nil {
 		raw, _ := json.Marshal(res.Flatten())
-		l.in.Hooks.PostToolUse(l.ctx, use.Name, input, raw, res.IsError)
+		l.in.Hooks.PostToolUse(l.ctx, effName, effInput, raw, res.IsError)
 	}
 
 	content := res.Content

@@ -5,6 +5,7 @@ import (
 
 	"github.com/RC-CHN/ARTEX/norma/compaction"
 	"github.com/RC-CHN/ARTEX/norma/llm"
+	"github.com/RC-CHN/ARTEX/norma/noa"
 )
 
 // Compactor adapts a Session to the harness's context-manager interfaces.
@@ -29,9 +30,32 @@ func (c *Compactor) Pre(_ context.Context, msgs []llm.Message, lastInputTokens i
 	return msgs
 }
 
-// View builds the request's message array.
+// View delegates to Session.View so both entry points share one sticky-truncation
+// implementation under s.mu.
 func (c *Compactor) View(_ context.Context, msgs []llm.Message) []llm.Message {
 	return c.sess.View(msgs)
+}
+
+// measureSavedTokens computes the exact token reduction achieved on ids between
+// pre-ProcessTurn cores and post-ProcessTurn view messages.
+func measureSavedTokens(before, after []noa.CoreMessage, ids []string) int {
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	beforeTok := make(map[string]int, len(ids))
+	for _, m := range before {
+		if want[m.ID] {
+			beforeTok[m.ID] = noa.DefaultCountTokens(m.Text)
+		}
+	}
+	saved := 0
+	for _, m := range after {
+		if orig, ok := beforeTok[m.ID]; ok {
+			saved += max(0, orig-noa.DefaultCountTokens(m.Text))
+		}
+	}
+	return saved
 }
 
 // IsOverflow reports whether err is a context-overflow rejection. The built-in
@@ -60,6 +84,7 @@ func (c *Compactor) Reactive(ctx context.Context, msgs []llm.Message) ([]llm.Mes
 	// measuring against it would show progress on every attempt and never admit
 	// that arming changed nothing.
 	before := c.sess.sentTokens()
+	stickySnap, pendingSnap := c.sess.snapshotSticky()
 
 	c.overflow.arm(c.sess.Config().ModelContextLimit)
 	floor := c.overflow.armedFloor()
@@ -75,6 +100,7 @@ func (c *Compactor) Reactive(ctx context.Context, msgs []llm.Message) ([]llm.Mes
 		// rejection indefinitely; a clean prompt-too-long is the better outcome.
 		c.sess.setEmergencyFloor(0)
 		c.overflow.disarm()
+		c.sess.restoreSticky(stickySnap, pendingSnap)
 		return msgs, false
 	}
 	return msgs, true

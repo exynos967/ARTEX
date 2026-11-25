@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -36,14 +37,26 @@ func TestResponsesStreaming(t *testing.T) {
 	p, _ := NewProvider(Config{Format: FormatOpenAIResponses, BaseURL: srv.URL, APIKey: "k", Model: "m"})
 	acc := NewAccumulator()
 	var usage Usage
+	var stopReason string
+	sawStop := false
 	for ev, err := range p.Stream(context.Background(), CompletionRequest{Messages: []Message{UserText("go")}}) {
 		if err != nil {
 			t.Fatalf("stream err: %v", err)
 		}
 		if ev.Type == SEMessageDelta {
 			usage = ev.Usage
+			stopReason = ev.StopReason
+		}
+		if ev.Type == SEMessageStop {
+			sawStop = true
 		}
 		acc.Add(ev)
+	}
+	if !sawStop {
+		t.Fatal("missing SEMessageStop after response.completed")
+	}
+	if stopReason != "tool_use" {
+		t.Fatalf("stopReason=%q, want tool_use when function_call was emitted", stopReason)
 	}
 	// stateless wire: store must be false, and the system prompt is top-level.
 	if gotBody["store"] != false {
@@ -164,6 +177,106 @@ func TestToResponsesInput(t *testing.T) {
 		if strings.Contains(it.Content, "dropped") {
 			t.Fatalf("thinking leaked: %+v", it)
 		}
+	}
+}
+
+// TestResponsesStreamingParallelToolCallsAndStop verifies interleaved parallel
+// function_call deltas are attributed by item_id / output_index, StopReason is
+// "tool_use", and SEMessageStop is emitted after response.completed / incomplete.
+func TestResponsesStreamingParallelToolCallsAndStop(t *testing.T) {
+	body := sse2(
+		event("response.created", `{"type":"response.created"}`),
+		event("response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_0","type":"function_call","call_id":"call_a","name":"Read"}}`),
+		event("response.output_item.added", `{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_b","name":"Bash"}}`),
+		// Interleave deltas: item 1 by item_id, item 0 by output_index, item 1 by output_index, item 0 by item_id.
+		event("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"{\"command\":"}`),
+		event("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":"}`),
+		event("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","output_index":1,"delta":"\"ls\"}"}`),
+		event("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","item_id":"fc_0","delta":"\"a.go\"}"}`),
+		event("response.completed", `{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":20,"output_tokens":10}}}`),
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p, _ := NewProvider(Config{Format: FormatOpenAIResponses, BaseURL: srv.URL, APIKey: "k", Model: "m"})
+	acc := NewAccumulator()
+	var events []StreamEvent
+	for ev, err := range p.Stream(context.Background(), CompletionRequest{Messages: []Message{UserText("go")}}) {
+		if err != nil {
+			t.Fatalf("stream err: %v", err)
+		}
+		events = append(events, ev)
+		acc.Add(ev)
+	}
+	if len(events) == 0 || events[len(events)-1].Type != SEMessageStop {
+		t.Fatalf("last event=%+v, want SEMessageStop", events)
+	}
+	if acc.StopReason != "tool_use" {
+		t.Fatalf("StopReason=%q, want tool_use", acc.StopReason)
+	}
+	// Verify every SEToolInputJSON carries the right ToolID and Index.
+	for _, ev := range events {
+		if ev.Type != SEToolInputJSON {
+			continue
+		}
+		switch ev.ToolID {
+		case "call_a":
+			if ev.Index != 0 {
+				t.Fatalf("call_a delta has Index=%d, want 0", ev.Index)
+			}
+		case "call_b":
+			if ev.Index != 1 {
+				t.Fatalf("call_b delta has Index=%d, want 1", ev.Index)
+			}
+		default:
+			t.Fatalf("unexpected ToolID %q on SEToolInputJSON %+v", ev.ToolID, ev)
+		}
+	}
+	uses := acc.Message().ToolUses()
+	if len(uses) != 2 {
+		t.Fatalf("tool_uses=%d, want 2: %+v", len(uses), uses)
+	}
+	if uses[0].ID != "call_a" || string(uses[0].Input) != `{"path":"a.go"}` {
+		t.Fatalf("call 0 wrong: %+v (%s)", uses[0], uses[0].Input)
+	}
+	if uses[1].ID != "call_b" || string(uses[1].Input) != `{"command":"ls"}` {
+		t.Fatalf("call 1 wrong: %+v (%s)", uses[1], uses[1].Input)
+	}
+}
+
+// TestResponsesStreamingEOFWithoutTerminalReturnsIncompleteError verifies that a
+// truncated SSE stream without response.completed / response.incomplete yields
+// an IncompleteResponseError instead of succeeding silently.
+func TestResponsesStreamingEOFWithoutTerminalReturnsIncompleteError(t *testing.T) {
+	body := sse2(
+		event("response.created", `{"type":"response.created"}`),
+		event("response.output_text.delta", `{"type":"response.output_text.delta","delta":"partial"}`),
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p, _ := NewProvider(Config{Format: FormatOpenAIResponses, BaseURL: srv.URL, APIKey: "k", Model: "m"})
+	var gotErr error
+	sawStop := false
+	for ev, err := range p.Stream(context.Background(), CompletionRequest{Messages: []Message{UserText("go")}}) {
+		if err != nil {
+			gotErr = err
+			break
+		}
+		if ev.Type == SEMessageStop {
+			sawStop = true
+		}
+	}
+	if sawStop {
+		t.Fatal("must not emit SEMessageStop when stream ends without terminal event")
+	}
+	var inc *IncompleteResponseError
+	if !errors.As(gotErr, &inc) || inc.Reason != IncompleteMissingTerminal {
+		t.Fatalf("err=%v, want IncompleteResponseError(%q)", gotErr, IncompleteMissingTerminal)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/RC-CHN/ARTEX/norma/llm"
 	"github.com/RC-CHN/ARTEX/norma/permission"
@@ -184,7 +185,11 @@ func (r *Registry) listing() string {
 			desc = s.WhenToUse
 		}
 		if len(desc) > maxSkillDescChars {
-			desc = desc[:maxSkillDescChars] + "…"
+			cut := maxSkillDescChars
+			for cut > 0 && maxSkillDescChars-cut < utf8.UTFMax && !utf8.RuneStart(desc[cut]) {
+				cut--
+			}
+			desc = desc[:cut] + "…"
 		}
 		line := "\n- " + s.Name
 		if !namesOnly {

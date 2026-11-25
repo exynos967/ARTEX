@@ -71,3 +71,20 @@ func TestRecursionDepthGuard(t *testing.T) {
 		t.Fatalf("expected depth guard, got %q", res.Flatten())
 	}
 }
+
+func TestNewToolSortsAgentNamesDeterministically(t *testing.T) {
+	cfg := Config{
+		Provider: fakeProvider{reply: "ok"},
+		Agents: map[string]Definition{
+			"zeta":  {Description: "z"},
+			"alpha": {Description: "a"},
+			"mid":   {Description: "m"},
+		},
+	}
+	want := "Available agent_type values:\n- alpha: a\n- mid: m\n- zeta: z"
+	for range 20 {
+		if got := NewTool(cfg).Prompt(); got != want {
+			t.Fatalf("Prompt()=%q, want deterministic sorted %q", got, want)
+		}
+	}
+}

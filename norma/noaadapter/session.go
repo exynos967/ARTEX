@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,6 +91,14 @@ type Session struct {
 	// providerTokensAt is the compression count when providerTokens was
 	// reported, so a figure that predates a compression can be recognised.
 	providerTokensAt int
+	// stickyTruncated remembers CoreMessage IDs already shortened by
+	// emergency-truncate so subsequent View calls re-apply the exact same
+	// truncations instead of flipping different early tool outputs each turn.
+	// pendingSaved tracks tokens reclaimed by sticky truncations since the last
+	// provider token report so repeated View calls before the next Pre do not
+	// over-truncate.
+	stickyTruncated map[string]bool
+	pendingSaved    int
 
 	cfg      noa.Config
 	store    *StateStore
@@ -168,7 +177,10 @@ func (s *Session) State() noa.CompressionState {
 	return noa.CloneState(s.state)
 }
 
-// View projects the history for one request.
+// View projects the history for one request with batch/hysteresis-stable
+// emergency truncation: once a tool result is truncated, its shortened form is
+// re-applied consistently on subsequent turns so the prompt-cache prefix stays
+// byte-identical until usage grows back to the trigger threshold.
 //
 // Pure with respect to msgs: the returned slice is for this request only and is
 // never written back. Message identity is a content hash, so writing a tagged
@@ -178,6 +190,12 @@ func (s *Session) View(msgs []llm.Message) []llm.Message {
 	defer s.mu.Unlock()
 
 	cores, sc := Project(msgs)
+
+	if len(s.stickyTruncated) > 0 {
+		applied := noa.ApplyStickyTruncations(cores, s.stickyTruncated, nil)
+		cores = applied.Messages
+	}
+
 	tokens := s.resolveTokenCount(cores)
 	s.lastTokenCount = tokens
 
@@ -200,13 +218,41 @@ func (s *Session) View(msgs []llm.Message) []llm.Message {
 	})
 	s.state = res.State
 	s.sidecar = sc
-	s.lastTruncatedCount = res.TruncatedCount
+
+	// Persist any newly truncated CoreMessage IDs so subsequent turns keep the
+	// exact same truncated prefix instead of flipping early tool outputs.
+	visibleTruncated := 0
+	var newlyTruncated []string
+	for _, m := range res.Messages {
+		if m.ContentType == noa.CTToolResult && strings.Contains(m.Text, noa.TruncationMarker) {
+			visibleTruncated++
+			if m.ID != "" && !s.stickyTruncated[m.ID] {
+				newlyTruncated = append(newlyTruncated, m.ID)
+			}
+		}
+	}
+	if len(newlyTruncated) > 0 {
+		saved := measureSavedTokens(cores, res.Messages, newlyTruncated)
+		if s.stickyTruncated == nil {
+			s.stickyTruncated = make(map[string]bool, len(newlyTruncated))
+		}
+		for _, id := range newlyTruncated {
+			s.stickyTruncated[id] = true
+		}
+		if s.providerTokens > 0 {
+			s.pendingSaved += saved
+		}
+	}
+	if res.TruncatedCount > 0 {
+		s.lastTruncatedCount = res.TruncatedCount
+	} else {
+		s.lastTruncatedCount = visibleTruncated
+	}
 
 	view := res.Messages
 	s.nudgedLastTurn = false
 	if res.Nudge != nil && s.nudgeAllowed(tokens) {
-		voice, text := noa.RenderNudgeText(*res.Nudge, noa.NudgeSections{})
-		_ = voice
+		_, text := noa.RenderNudgeText(*res.Nudge, noa.NudgeSections{})
 		view = append(view, noa.CoreMessage{
 			ID: noa.NudgeMessageID, Role: noa.RoleUser, ContentType: noa.CTText, Text: text,
 		})
@@ -220,6 +266,26 @@ func (s *Session) View(msgs []llm.Message) []llm.Message {
 	out := Reassemble(view, msgs, sc, ReassembleOptions{State: &s.state, Tag: true})
 	s.lastSentTokens = estimateMessages(out)
 	return out
+}
+
+func (s *Session) snapshotSticky() (map[string]bool, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var cp map[string]bool
+	if len(s.stickyTruncated) > 0 {
+		cp = make(map[string]bool, len(s.stickyTruncated))
+		for id := range s.stickyTruncated {
+			cp[id] = true
+		}
+	}
+	return cp, s.pendingSaved
+}
+
+func (s *Session) restoreSticky(snap map[string]bool, pendingSaved int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stickyTruncated = snap
+	s.pendingSaved = pendingSaved
 }
 
 // nudgeAllowed gates injection on the failure ladder.
@@ -338,7 +404,8 @@ func (s *Session) resolveTokenCount(cores []noa.CoreMessage) int {
 	if s.providerTokensAt < s.lastCompressAt {
 		return est
 	}
-	return max(est, p)
+	adj := max(0, p-s.pendingSaved)
+	return max(est, adj)
 }
 
 // estimateProjectedTokens sizes the view that will actually be SENT: the pruned
@@ -426,12 +493,14 @@ func (s *Session) noteFailedAttempt() {
 	}
 }
 
-// noteProviderTokens records the input size the provider reported.
+// noteProviderTokens records the input size the provider reported and resets
+// pendingSaved since the new report already reflects prior sticky truncations.
 func (s *Session) noteProviderTokens(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.providerTokens = n
 	s.providerTokensAt = s.state.Stats.CompressionCount
+	s.pendingSaved = 0
 }
 
 // setEmergencyFloor arms or clears the post-overflow ceiling.

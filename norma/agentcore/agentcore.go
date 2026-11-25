@@ -245,8 +245,9 @@ type Session struct {
 	messages  []llm.Message
 	usage     llm.Usage
 
-	sessionID string
-	store     *transcript.Store
+	sessionID   string
+	sessionDate string // frozen on NewSession/Resume so crossing midnight never mutates msgs[0]
+	store       *transcript.Store
 	writer    *transcript.Writer
 	tasks     *tool.Manager
 	closeOnce sync.Once
@@ -269,19 +270,9 @@ func NewSession(opts Options) *Session {
 	if opts.PermissionMode == "" {
 		opts.PermissionMode = permission.ModeDefault
 	}
-	s := &Session{opts: opts}
-	// Exactly one context manager. Compactor (host-supplied) wins over the
-	// built-in Compaction: a session holds a single compactor, so the two can
-	// never both run — which matters because they have incompatible contracts
-	// (Compaction rewrites l.messages in place; a ContextView must not).
-	if opts.Compactor != nil {
-		if opts.Compaction != nil {
-			s.warn("both Compactor and Compaction are set — Compaction is IGNORED. " +
-				"They are mutually exclusive context managers; set only one.")
-		}
-		s.compactor = opts.Compactor
-	} else if opts.Compaction != nil {
-		s.compactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizer(opts.Provider, opts.MaxTokens, opts.NonStreaming))
+	s := &Session{
+		opts:        opts,
+		sessionDate: time.Now().Format("2006-01-02"),
 	}
 	if opts.Plan != nil {
 		start := opts.PermissionMode
@@ -335,14 +326,41 @@ func NewSession(opts Options) *Session {
 	s.registry = tool.NewRegistry(tools...)
 	// Deferred tools: withhold their schemas (harness filters by opts.DeferredTools)
 	// but keep them callable via the two always-loaded access tools. Both close over
-	// the registry (which already holds the deferred tools) and are added to it.
-	if len(opts.DeferredTools) > 0 {
+	// the registry and are added from turn 0 whenever static DeferredTools exist OR
+	// a host-provided UnlockSet is supplied (e.g. skill-gated lazy MCPs), keeping
+	// req.Tools cache-stable across all turns even before any skill loads.
+	if len(opts.DeferredTools) > 0 || opts.UnlockSet != nil {
 		s.unlock = opts.UnlockSet
 		if s.unlock == nil {
 			s.unlock = tool.NewUnlockSet(opts.DeferredTools...)
 		}
 		s.registry.Add(tool.NewSearchExtraTools(s.registry, opts.DeferredTools))
 		s.registry.Add(tool.NewExecuteExtraTool(s.registry, s.unlock))
+	}
+	// Exactly one context manager. Compactor (host-supplied) wins over the
+	// built-in Compaction: a session holds a single compactor, so the two can
+	// never both run — which matters because they have incompatible contracts
+	// (Compaction rewrites l.messages in place; a ContextView must not).
+	// Built after s.registry so the built-in compactor receives the exact
+	// System, DynamicBoundary, and visible ToolSchemas for cache-safe summary forks.
+	if opts.Compactor != nil {
+		if opts.Compaction != nil {
+			s.warn("both Compactor and Compaction are set — Compaction is IGNORED. " +
+				"They are mutually exclusive context managers; set only one.")
+		}
+		s.compactor = opts.Compactor
+	} else if opts.Compaction != nil {
+		cfg := *opts.Compaction
+		if len(cfg.System) == 0 {
+			cfg.System = s.system()
+			if cfg.DynamicBoundary == 0 {
+				cfg.DynamicBoundary = s.opts.DynamicBoundary
+			}
+		}
+		if len(cfg.Tools) == 0 {
+			cfg.Tools = s.visibleToolSchemas()
+		}
+		s.compactor = compaction.New(cfg, compaction.ProviderSummarizer(opts.Provider, opts.MaxTokens, opts.NonStreaming))
 	}
 	if opts.Transcript != nil {
 		s.store = opts.Transcript
@@ -392,23 +410,71 @@ func (s *Session) SessionID() string { return s.sessionID }
 // tools). Hosts Add() to it to unlock skill-gated tools at runtime.
 func (s *Session) UnlockSet() *tool.UnlockSet { return s.unlock }
 
+// AddDeferredTool registers a deferred-only tool into the session's registry
+// without altering model-visible tool schemas (preserving LLM prompt cache).
+// Once registered, the tool is discoverable via SearchExtraTools and callable
+// via ExecuteExtraTool after being unlocked in UnlockSet.
+func (s *Session) AddDeferredTool(t tool.CoreTool) {
+	if s == nil || s.registry == nil || t == nil {
+		return
+	}
+	if s.opts.Runtime != nil {
+		t = tool.BindExecutionRuntime([]tool.CoreTool{t}, s.opts.Runtime)[0]
+	}
+	s.registry.AddDeferred(t)
+}
+
 // Resume reloads a prior conversation from the transcript store, rebuilding the
-// message history and cumulative usage so the next Prompt continues it. Requires
+// active post-boundary working set and cumulative usage so the next Prompt
+// continues it without scanning pre-boundary history. Requires
 // Options.Transcript to be set. Subsequent messages append to the same file.
 func (s *Session) Resume(sessionID string) error {
 	if s.store == nil {
 		return errors.New("agentcore: Resume requires Options.Transcript")
 	}
-	recs, err := s.store.Load(s.store.MainPath(sessionID))
+	active, err := s.store.LoadActive(s.store.MainPath(sessionID))
 	if err != nil {
 		return err
 	}
-	msgs, usage := transcript.Messages(recs)
+	msgs, _ := transcript.Messages(active.Records)
 	s.messages = cleanResumed(msgs)
-	s.usage = usage
+	s.usage = active.TotalUsage
 	s.sessionID = sessionID
-	s.writer = s.store.ResumeWriter(sessionID, transcript.LastUUID(recs))
+	if d := parseRecordDate(active.FirstTimestamp); d != "" {
+		s.sessionDate = d
+	} else if d := firstRecordDate(active.Records); d != "" {
+		s.sessionDate = d
+	}
+	s.writer = s.store.ResumeWriter(sessionID, active.LastUUID)
+	s.writer.SeedRefs(active)
 	return nil
+}
+
+// parseRecordDate formats an RFC3339/RFC3339Nano transcript timestamp as the
+// local YYYY-MM-DD session date, or "" if empty/invalid.
+func parseRecordDate(ts string) string {
+	if ts == "" {
+		return ""
+	}
+	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+		return t.In(time.Local).Format("2006-01-02")
+	}
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		return t.In(time.Local).Format("2006-01-02")
+	}
+	return ""
+}
+
+// firstRecordDate extracts the local YYYY-MM-DD date from the first transcript
+// record carrying a valid RFC3339 timestamp, preserving the session's original
+// <system-reminder> date across resume and midnight boundaries.
+func firstRecordDate(recs []transcript.Record) string {
+	for _, r := range recs {
+		if d := parseRecordDate(r.Timestamp); d != "" {
+			return d
+		}
+	}
+	return ""
 }
 
 // cleanResumed drops trailing assistant tool calls whose results were never
@@ -426,10 +492,13 @@ func cleanResumed(msgs []llm.Message) []llm.Message {
 	return msgs
 }
 
-// buildSystemReminder assembles the <system-reminder> content. Today's date is
-// always included; extra is appended when non-empty.
-func buildSystemReminder(extra string) string {
-	date := time.Now().Format("2006-01-02")
+// buildSystemReminder assembles the <system-reminder> content using the
+// session's frozen date (falling back to today if empty); extra is appended
+// when non-empty.
+func buildSystemReminder(date, extra string) string {
+	if date == "" {
+		date = time.Now().Format("2006-01-02")
+	}
 	var b strings.Builder
 	b.WriteString("<system-reminder>\n# currentDate\nToday's date is ")
 	b.WriteString(date)
@@ -440,6 +509,30 @@ func buildSystemReminder(extra string) string {
 	}
 	b.WriteString("\n</system-reminder>")
 	return b.String()
+}
+
+// visibleToolSchemas returns the schemas advertised to the model (matching
+// harness.Query's DeferredTools filtering) so compaction summarization mirrors
+// the exact parent tool prefix.
+func (s *Session) visibleToolSchemas() []llm.ToolSchema {
+	if s.registry == nil {
+		return nil
+	}
+	schemas := s.registry.Schemas()
+	if len(s.opts.DeferredTools) == 0 {
+		return schemas
+	}
+	hidden := make(map[string]bool, len(s.opts.DeferredTools))
+	for _, name := range s.opts.DeferredTools {
+		hidden[name] = true
+	}
+	out := make([]llm.ToolSchema, 0, len(schemas))
+	for _, sc := range schemas {
+		if !hidden[sc.Name] {
+			out = append(out, sc)
+		}
+	}
+	return out
 }
 
 // warn reports a configuration warning to the host, if it asked for them.
@@ -512,16 +605,32 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		s.writer.RecordMessage(userMsg, llm.Usage{})
 		ctx = transcript.WithSessionID(ctx, s.sessionID)
 	}
+	if s.sessionID != "" && llm.PromptCacheKeyFrom(ctx) == "" {
+		ctx = llm.WithPromptCacheKey(ctx, s.sessionID)
+	}
 	var reminderExtra string
 	if s.opts.SystemReminderFunc != nil {
 		reminderExtra = s.opts.SystemReminderFunc()
 	}
+	sys := s.system()
+	reminder := buildSystemReminder(s.sessionDate, reminderExtra)
+	if c, ok := s.compactor.(*compaction.Compactor); ok {
+		var prefix compaction.SummaryPrefix
+		if s.opts.Compaction == nil || len(s.opts.Compaction.System) == 0 {
+			prefix.System = sys
+			prefix.DynamicBoundary = s.opts.DynamicBoundary
+		}
+		if s.opts.Compaction == nil || s.opts.Compaction.SystemReminder == "" {
+			prefix.SystemReminder = reminder
+		}
+		c.SetSummaryPrefix(prefix)
+	}
 	in := harness.QueryInput{
 		Provider:                s.opts.Provider,
-		System:                  s.system(),
+		System:                  sys,
 		DynamicBoundary:         s.opts.DynamicBoundary,
 		Messages:                s.messages,
-		SystemReminder:          buildSystemReminder(reminderExtra),
+		SystemReminder:          reminder,
 		Tools:                   s.registry,
 		DeferredTools:           s.opts.DeferredTools,
 		MaxTokens:               s.opts.MaxTokens,
@@ -561,7 +670,7 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		for ev, err := range inner {
 			if ev.Kind == harness.KindResult && ev.Terminal != nil {
 				s.messages = ev.Terminal.Messages
-				s.usage = ev.Terminal.Usage
+				s.usage.Add(ev.Terminal.Usage)
 			}
 			if !yield(ev, err) {
 				return

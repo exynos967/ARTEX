@@ -19,7 +19,7 @@ func NewTaskOutput() CoreTool {
 			"type": "object",
 			"properties": map[string]any{
 				"task_id":    map[string]any{"type": "string", "description": "The task id (e.g. task_1)."},
-				"max_bytes":  map[string]any{"type": "integer", "description": "Max bytes of output to return from the tail (default 30000)."},
+				"max_bytes":  map[string]any{"type": "integer", "description": "Max bytes of output to return from the tail (default 30000, max 1048576)."},
 				"block":      map[string]any{"type": "boolean", "description": "Wait until the task finishes before returning (default false)."},
 				"timeout_ms": map[string]any{"type": "integer", "description": "Max wait when block=true (default 30000)."},
 			},
@@ -59,7 +59,11 @@ func runTaskOutput(ctx context.Context, input json.RawMessage, tc *ToolContext) 
 		}
 		info, _ = tc.Tasks.Wait(ctx, in.TaskID, timeout)
 	}
-	out, err := tc.Tasks.Output(in.TaskID, in.MaxBytes)
+	maxBytes := in.MaxBytes
+	if maxBytes > maxTailReadBytes {
+		maxBytes = maxTailReadBytes
+	}
+	out, err := tc.Tasks.Output(in.TaskID, maxBytes)
 	if err != nil {
 		return Errorf("Error: " + err.Error()), nil
 	}

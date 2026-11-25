@@ -37,8 +37,8 @@ func TestFinalTextRecoveryBoundedAndNeverReplaysTools(t *testing.T) {
 					if calls == 2 {
 						return thinking, "end_turn", u, nil
 					}
-					if len(r.Tools) != 0 {
-						t.Fatal("recovery advertises tools")
+					if len(r.Tools) != 1 || r.Tools[0].Name != "probe" {
+						t.Fatalf("recovery mutated req.Tools (breaks prompt cache): %+v", r.Tools)
 					}
 					raw, _ := json.Marshal(r.Messages)
 					if !strings.Contains(string(raw), "saved fixture #1") {

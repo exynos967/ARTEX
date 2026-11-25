@@ -16,7 +16,9 @@ import (
 func pressureSession(t *testing.T) (*Session, []llm.Message) {
 	t.Helper()
 	opts := baseOptions()
-	cfg := noa.DefaultConfig(20000) // a small window makes the fixture manageable
+	// Place the fixture (~19k tokens) cleanly inside the [75%, 95%) pressure
+	// band without tripping the 95% emergency sticky-truncation valve.
+	cfg := noa.DefaultConfig(22000)
 	sess, err := EnableWithSession(&opts, Options{
 		ArchiveBaseDir: t.TempDir(), SessionID: "s", Config: &cfg,
 	})

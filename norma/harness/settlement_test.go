@@ -15,8 +15,9 @@ import (
 )
 
 // On hitting MaxTurns with a Settlement configured, the loop injects the wrap-up
-// prompt, hides DisabledTools during wrap-up, and finishes with the ORIGINAL
-// budget reason (not ReasonCompleted).
+// prompt, keeps req.Tools stable for prompt-cache preservation (enforcing
+// DisabledTools at execution time), and finishes with the ORIGINAL budget
+// reason (not ReasonCompleted).
 func TestSettlementOnBudgetHit(t *testing.T) {
 	var toolsSeen [][]string
 	turns := [][]llm.StreamEvent{
@@ -69,8 +70,8 @@ func TestSettlementOnBudgetHit(t *testing.T) {
 	if !contains(toolsSeen[0], "Bash") {
 		t.Fatalf("主阶段应能看到 Bash: %v", toolsSeen[0])
 	}
-	if contains(toolsSeen[1], "Bash") {
-		t.Fatalf("收尾阶段应屏蔽 Bash: %v", toolsSeen[1])
+	if !contains(toolsSeen[1], "Bash") {
+		t.Fatalf("收尾阶段应保持 req.Tools 稳定以复用 KV cache（执行层拦截 Bash）: %v", toolsSeen[1])
 	}
 }
 

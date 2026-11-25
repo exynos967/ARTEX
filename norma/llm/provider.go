@@ -2,6 +2,8 @@ package llm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"iter"
 	"net/http"
@@ -125,7 +127,7 @@ type Config struct {
 	// each empty-response retry with this FIXED wait. 0 keeps the ladder.
 	EmptyResponseInterval time.Duration
 	// RateLimit, when set, bounds the request rate shared across every caller of
-	// the built Provider (per-second and/or per-minute). Retries do not count.
+	// the built Provider (per-second and/or per-minute), including retries.
 	RateLimit *RateLimit
 
 	// ThinkingType toggles extended/reasoning mode via the request's
@@ -255,6 +257,9 @@ func NewProvider(cfg Config) (Provider, error) {
 // http.DefaultTransport so it keeps the standard timeouts and connection pool.
 func defaultHTTPClient(proxy string) (*http.Client, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConnsPerHost = 32
+	tr.IdleConnTimeout = 60 * time.Second
+	tr.TLSHandshakeTimeout = 10 * time.Second
 	if proxy == "" {
 		tr.Proxy = http.ProxyFromEnvironment
 		return &http.Client{Transport: tr}, nil
@@ -290,4 +295,30 @@ func joinSystem(segs []string) string {
 		}
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+const maxPromptCacheKeyLen = 64
+
+// resolvePromptCacheKey picks the sticky prompt-cache key from req or ctx and
+// bounds it to OpenAI's 64-character limit.
+func resolvePromptCacheKey(ctx context.Context, req CompletionRequest) string {
+	key := req.PromptCacheKey
+	if strings.TrimSpace(key) == "" {
+		key = PromptCacheKeyFrom(ctx)
+	}
+	return normalizePromptCacheKey(key)
+}
+
+// normalizePromptCacheKey trims key and, if it exceeds 64 bytes or contains
+// control whitespace, deterministically hashes it to a 64-char hex digest.
+func normalizePromptCacheKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	if len(key) <= maxPromptCacheKeyLen && !strings.ContainsAny(key, "\r\n\t") {
+		return key
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
 }

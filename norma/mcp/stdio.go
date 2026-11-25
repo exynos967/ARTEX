@@ -10,23 +10,67 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
+)
+
+const (
+	stdioEOFGraceTimeout  = 200 * time.Millisecond
+	stdioWaitCloseTimeout = 3 * time.Second
 )
 
 // stdioCloser shuts down a spawned MCP server process and its pipes.
+// A single owner goroutine calls cmd.Wait() and closes done so Close() never
+// races with Wait() and remains idempotent across concurrent or repeated calls.
 type stdioCloser struct {
-	cmd   *exec.Cmd
-	stdin io.Closer
-	once  sync.Once
+	cmd    *exec.Cmd
+	stdin  io.Closer
+	stdout io.Closer
+	done   <-chan struct{}
+	once   sync.Once
 }
 
 func (s *stdioCloser) Close() error {
 	s.once.Do(func() {
-		if s.stdin != nil {
-			s.stdin.Close()
+		// Check whether cmd.Wait() has already reaped the process BEFORE closing
+		// stdin or signalling anything so a recycled PID is never signalled.
+		exited := false
+		if s.done != nil {
+			select {
+			case <-s.done:
+				exited = true
+			default:
+			}
 		}
-		if s.cmd != nil && s.cmd.Process != nil {
-			_ = killStdioProcess(s.cmd)
-			_ = s.cmd.Wait()
+		// 1. Close stdin first so well-behaved stdio MCP servers receive EOF and exit cleanly.
+		if s.stdin != nil {
+			_ = s.stdin.Close()
+		}
+		// 2. Briefly wait for a clean EOF-driven exit before signalling the process/group.
+		if !exited && s.done != nil {
+			timer := time.NewTimer(stdioEOFGraceTimeout)
+			select {
+			case <-s.done:
+				exited = true
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+		// 3. Only signal the process group / child tree while the child is still
+		// unreaped (done not closed), avoiding any post-reap PID-reuse kill hazard.
+		if !exited && s.cmd != nil && s.cmd.Process != nil {
+			_ = killStdioProcess(s.cmd, s.done)
+		}
+		// 4. Wait up to 3s for the single Wait() owner goroutine to reap the process.
+		if !exited && s.done != nil {
+			timer := time.NewTimer(stdioWaitCloseTimeout)
+			select {
+			case <-s.done:
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+		if s.stdout != nil {
+			_ = s.stdout.Close()
 		}
 	})
 	return nil
@@ -54,7 +98,8 @@ type StdioOptions struct {
 }
 
 // NewStdioClientWithOptions binds the process lifetime to ctx and terminates its
-// process group on Linux. The compatibility constructor retains inherited env.
+// process group / child tree cleanly across Unix and Windows. The compatibility
+// constructor retains inherited env.
 func NewStdioClientWithOptions(ctx context.Context, server, command string, opts StdioOptions, args ...string) (*Client, error) {
 	env := make([]string, 0, len(opts.Env))
 	if opts.InheritEnv {
@@ -68,22 +113,44 @@ func NewStdioClientWithOptions(ctx context.Context, server, command string, opts
 	cmd := exec.CommandContext(ctx, resolved, args...)
 	cmd.Dir = opts.WorkingDir
 	cmd.Env = env
-	configureStdioProcess(cmd)
-	stdin, err := cmd.StdinPipe()
+	cmd.WaitDelay = 3 * time.Second
+	done := make(chan struct{})
+	configureStdioProcessWithDone(cmd, done)
+
+	// Manage stdio pipes directly instead of StdinPipe/StdoutPipe so the single
+	// cmd.Wait() owner goroutine can start immediately after cmd.Start() without
+	// racing with conn.readLoop or conn.writeLocked on pipe close.
+	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
 		return nil, err
 	}
+	cmd.Stdin = stdinR
+	cmd.Stdout = stdoutW
 	if err := cmd.Start(); err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return nil, err
 	}
+	_ = stdinR.Close()
+	_ = stdoutW.Close()
+
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+
 	c := &Client{
 		server: server,
-		conn:   newConn(stdout, stdin),
-		closer: &stdioCloser{cmd: cmd, stdin: stdin},
+		conn:   newConn(stdoutR, stdinW),
+		closer: &stdioCloser{cmd: cmd, stdin: stdinW, stdout: stdoutR, done: done},
 	}
 	if err := c.initialize(ctx); err != nil {
 		c.Close()

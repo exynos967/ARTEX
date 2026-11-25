@@ -19,16 +19,17 @@ func TestRetryDefaultsUnchanged(t *testing.T) {
 	if got := c.emptyRetries(); got != emptyResponseRetries {
 		t.Fatalf("emptyRetries=%d, want %d", got, emptyResponseRetries)
 	}
-	for attempt, want := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 8 * time.Second} {
+	for attempt, wantMax := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 8 * time.Second} {
 		a := attempt
 		if a == 3 {
 			a = 5 // past the cap
 		}
-		if got := c.retryDelay(a); got != want {
-			t.Fatalf("retryDelay(%d)=%v, want %v", a, got, want)
+		wantMin := wantMax / 2
+		if got := c.retryDelay(a); got < wantMin || got > wantMax {
+			t.Fatalf("retryDelay(%d)=%v, want in [%v, %v]", a, got, wantMin, wantMax)
 		}
-		if got := c.emptyRetryDelay(a); got != want {
-			t.Fatalf("emptyRetryDelay(%d)=%v, want %v", a, got, want)
+		if got := c.emptyRetryDelay(a); got < wantMin || got > wantMax {
+			t.Fatalf("emptyRetryDelay(%d)=%v, want in [%v, %v]", a, got, wantMin, wantMax)
 		}
 	}
 }

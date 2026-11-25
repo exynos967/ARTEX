@@ -245,8 +245,8 @@ func TestFinalTextContinueSettlementStillDisablesTools(t *testing.T) {
 				if calls == 2 {
 					return finalContinueThinking(), "", llm.Usage{}, nil
 				}
-				if calls == 3 && len(req.Tools) != 0 {
-					t.Fatal("budget settlement recovery advertised tools")
+				if calls == 3 && (len(req.Tools) != 1 || req.Tools[0].Name != "probe") {
+					t.Fatalf("budget settlement recovery mutated req.Tools: %+v", req.Tools)
 				}
 				return finalContinueCall(fmt.Sprint(calls), "probe", `{}`), "tool_use", llm.Usage{}, nil
 			}))
@@ -326,12 +326,13 @@ func TestFinalTextContinueBudgetExpiresBeforeRecovery(t *testing.T) {
 					}
 					return finalContinueCall("checkpoint", "probe", `{}`), "tool_use", llm.Usage{}, nil
 				}
-				if len(req.Tools) != 0 {
-					t.Error("empty settlement reply entered ordinary continuation instead of text-only recovery")
+				if len(req.Tools) != 1 || req.Tools[0].Name != "probe" {
+					t.Errorf("text-only settlement recovery mutated req.Tools: %+v", req.Tools)
 				}
 				return finalContinueCall("must-not-run", "probe", `{}`), "tool_use", llm.Usage{}, nil
 			}))
-			if calls != 4 || effects.Load() != 1 || budget.accounted != 4 || term.Reason != ReasonMaxTurns || !term.SummaryRecoveryAttempted {
+			raw, _ := json.Marshal(term.Messages)
+			if calls != 4 || effects.Load() != 1 || budget.accounted != 4 || term.Reason != ReasonMaxTurns || !term.SummaryRecoveryAttempted || term.SummaryRecoveryMode != "text_only" || !strings.Contains(string(raw), "summary_only") {
 				t.Fatalf("calls=%d effects=%d budget=%+v terminal=%+v", calls, effects.Load(), budget, term)
 			}
 		})
@@ -407,18 +408,18 @@ func TestFinalTextContinueConcurrentModesAreIsolated(t *testing.T) {
 					return finalContinueThinking(), "", llm.Usage{}, nil
 				}
 				if calls == 2 {
-					if (len(req.Tools) > 0) != continueWork {
-						t.Fatal("another query's recovery policy changed this request")
+					if len(req.Tools) != 1 || req.Tools[0].Name != "probe" {
+						t.Fatalf("recovery mutated req.Tools: %+v", req.Tools)
 					}
 					return finalContinueCall("probe-once", "probe", `{}`), "tool_use", llm.Usage{}, nil
 				}
 				return finalContinueText("done"), "end_turn", llm.Usage{}, nil
 			}))
-			wantCalls, wantEffects := 2, int32(0)
+			wantCalls, wantEffects, wantMode := 2, int32(0), "text_only"
 			if continueWork {
-				wantCalls, wantEffects = 3, 1
+				wantCalls, wantEffects, wantMode = 3, 1, "continue"
 			}
-			if calls != wantCalls || effects.Load() != wantEffects || !term.SummaryRecoveryAttempted || term.SummaryMissing == continueWork {
+			if calls != wantCalls || effects.Load() != wantEffects || !term.SummaryRecoveryAttempted || term.SummaryRecoveryMode != wantMode || term.SummaryMissing == continueWork {
 				t.Fatalf("calls=%d effects=%d terminal=%+v", calls, effects.Load(), term)
 			}
 		})

@@ -130,7 +130,7 @@ func TestBashAutoBackgroundOnTimeout(t *testing.T) {
 	m := newTestManager(t)
 	tc := &ToolContext{Tasks: m}
 	res := runTC(t, NewBash(), tc, map[string]any{
-		"command":    "while true; do echo tick; sleep 0.1; done",
+		"command":    "tail -f /dev/null",
 		"timeout_ms": 300,
 	})
 	if res.IsError || !strings.Contains(res.Flatten(), "background") {

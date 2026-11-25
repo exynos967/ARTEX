@@ -12,8 +12,10 @@ import (
 // the same Provider instance (one limiter per provider), so any number of
 // concurrent agents using one Provider are bounded by a single limit.
 //
-// Only the logical request is counted: retries inside a single Stream call do
-// not consume additional tokens.
+// For built-in providers configured via Config.RateLimit, every HTTP attempt
+// (including establishment retries in doStream) consumes one token so retry
+// traffic respects the shared upstream budget. The RateLimited wrapper for
+// custom providers gates each logical Stream/Complete call.
 type RateLimit struct {
 	PerSecond float64 // max requests per second (0 = unlimited)
 	PerMinute float64 // max requests per minute (0 = unlimited)

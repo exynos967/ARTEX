@@ -2,17 +2,21 @@ package tool
 
 import (
 	"bytes"
+	"container/list"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RC-CHN/ARTEX/norma/permission"
@@ -66,36 +70,189 @@ func NewWebFetch(cfg WebFetchConfig) CoreTool {
 	})
 }
 
-const maxFetchBytes = 2 << 20 // 2 MiB
+const (
+	maxFetchBytes            = 2 << 20 // 2 MiB
+	maxFetchTransportEntries = 64
+	maxFetchDrainBytes       = 4096
+)
+
+type fetchClientOpts struct {
+	Proxy                 string
+	CACert                string
+	InsecureTLS           bool
+	DisableProxy          bool
+	ResponseHeaderTimeout time.Duration
+}
+
+type fetchTransportKey struct {
+	proxy                 string
+	caCert                string
+	caHash                [sha256.Size]byte
+	insecureTLS           bool
+	disableProxy          bool
+	responseHeaderTimeout time.Duration
+}
+
+type fetchTransportEntry struct {
+	key fetchTransportKey
+	tr  *http.Transport
+}
+
+var fetchTransportPool = struct {
+	mu      sync.Mutex
+	order   *list.List
+	entries map[fetchTransportKey]*list.Element
+}{
+	order:   list.New(),
+	entries: make(map[fetchTransportKey]*list.Element),
+}
+
+// sharedFetchTransport returns a package-local cached *http.Transport cloned
+// from http.DefaultTransport with bounded timeouts and pool limits, preventing
+// per-tool Transport/goroutine leaks across WebFetch and web_search instances.
+func sharedFetchTransport(opts fetchClientOpts) *http.Transport {
+	hdrTimeout := opts.ResponseHeaderTimeout
+	if hdrTimeout <= 0 {
+		hdrTimeout = 30 * time.Second
+	}
+	key := fetchTransportKey{
+		insecureTLS:           opts.InsecureTLS,
+		disableProxy:          opts.DisableProxy,
+		responseHeaderTimeout: hdrTimeout,
+	}
+
+	var proxyU *url.URL
+	if !opts.DisableProxy {
+		if raw := strings.TrimSpace(opts.Proxy); raw != "" {
+			if pu, err := url.Parse(raw); err == nil && pu.Scheme != "" && pu.Host != "" {
+				key.proxy = raw
+				proxyU = pu
+			}
+		}
+	}
+
+	var pemData []byte
+	if !opts.InsecureTLS {
+		if caPath := strings.TrimSpace(opts.CACert); caPath != "" {
+			if data, err := os.ReadFile(caPath); err == nil {
+				key.caCert = caPath
+				key.caHash = sha256.Sum256(data)
+				pemData = data
+			}
+		}
+	}
+
+	fetchTransportPool.mu.Lock()
+	if elem, ok := fetchTransportPool.entries[key]; ok {
+		fetchTransportPool.order.MoveToFront(elem)
+		tr := elem.Value.(*fetchTransportEntry).tr
+		fetchTransportPool.mu.Unlock()
+		return tr
+	}
+	fetchTransportPool.mu.Unlock()
+
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+	tr.DialContext = (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	tr.TLSHandshakeTimeout = 10 * time.Second
+	tr.ResponseHeaderTimeout = hdrTimeout
+	tr.IdleConnTimeout = 60 * time.Second
+	tr.MaxIdleConns = 128
+	tr.MaxIdleConnsPerHost = 32
+	tr.ForceAttemptHTTP2 = true
+
+	switch {
+	case key.disableProxy:
+		// Explicitly nil so environment HTTP(S)_PROXY is bypassed on direct fallback.
+		tr.Proxy = nil
+	case proxyU != nil:
+		tr.Proxy = http.ProxyURL(proxyU)
+	default:
+		tr.Proxy = http.ProxyFromEnvironment
+	}
+
+	switch {
+	case key.insecureTLS:
+		var tlsCfg *tls.Config
+		if tr.TLSClientConfig != nil {
+			tlsCfg = tr.TLSClientConfig.Clone()
+		} else {
+			tlsCfg = &tls.Config{}
+		}
+		tlsCfg.InsecureSkipVerify = true
+		tr.TLSClientConfig = tlsCfg
+	case len(pemData) > 0:
+		// Trust the proxy's CA in addition to the system roots, so certs it
+		// re-signs verify while every other connection stays fully checked.
+		pool, _ := x509.SystemCertPool()
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if pool.AppendCertsFromPEM(pemData) {
+			var tlsCfg *tls.Config
+			if tr.TLSClientConfig != nil {
+				tlsCfg = tr.TLSClientConfig.Clone()
+			} else {
+				tlsCfg = &tls.Config{}
+			}
+			tlsCfg.RootCAs = pool
+			tr.TLSClientConfig = tlsCfg
+		}
+	}
+
+	var evicted *http.Transport
+	fetchTransportPool.mu.Lock()
+	if elem, ok := fetchTransportPool.entries[key]; ok {
+		fetchTransportPool.order.MoveToFront(elem)
+		existing := elem.Value.(*fetchTransportEntry).tr
+		fetchTransportPool.mu.Unlock()
+		tr.CloseIdleConnections()
+		return existing
+	}
+	elem := fetchTransportPool.order.PushFront(&fetchTransportEntry{key: key, tr: tr})
+	fetchTransportPool.entries[key] = elem
+	if fetchTransportPool.order.Len() > maxFetchTransportEntries {
+		if oldest := fetchTransportPool.order.Back(); oldest != nil {
+			fetchTransportPool.order.Remove(oldest)
+			ent := oldest.Value.(*fetchTransportEntry)
+			delete(fetchTransportPool.entries, ent.key)
+			evicted = ent.tr
+		}
+	}
+	fetchTransportPool.mu.Unlock()
+
+	if evicted != nil {
+		evicted.CloseIdleConnections()
+	}
+	return tr
+}
+
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxFetchDrainBytes))
+	_ = body.Close()
+}
 
 // newFetchClient returns an HTTP client honoring the proxy / TLS config.
 func newFetchClient(cfg WebFetchConfig) *http.Client {
-	if cfg.Proxy == "" && !cfg.InsecureTLS && cfg.CACert == "" {
-		return &http.Client{}
-	}
-	tr := &http.Transport{}
-	if cfg.Proxy != "" {
-		if pu, err := url.Parse(cfg.Proxy); err == nil {
-			tr.Proxy = http.ProxyURL(pu)
-		}
-	}
-	switch {
-	case cfg.InsecureTLS:
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	case cfg.CACert != "":
-		// Trust the proxy's CA in addition to the system roots, so certs it
-		// re-signs verify while every other connection stays fully checked.
-		if pem, err := os.ReadFile(cfg.CACert); err == nil {
-			pool, _ := x509.SystemCertPool()
-			if pool == nil {
-				pool = x509.NewCertPool()
-			}
-			if pool.AppendCertsFromPEM(pem) {
-				tr.TLSClientConfig = &tls.Config{RootCAs: pool}
-			}
-		}
-	}
-	return &http.Client{Transport: tr}
+	return newFetchClientOpts(fetchClientOpts{
+		Proxy:       cfg.Proxy,
+		CACert:      cfg.CACert,
+		InsecureTLS: cfg.InsecureTLS,
+	})
+}
+
+func newFetchClientOpts(opts fetchClientOpts) *http.Client {
+	return &http.Client{Transport: sharedFetchTransport(opts)}
 }
 
 // proxyLikelyErr reports whether a fetch error is the kind a recording/MITM proxy
@@ -164,7 +321,10 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 	// otherwise-reachable URL. nil when no proxy is configured (nothing to bypass).
 	var direct *http.Client
 	if cfg.Proxy != "" {
-		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS})
+		direct = newFetchClientOpts(fetchClientOpts{
+			InsecureTLS:  cfg.InsecureTLS,
+			DisableProxy: true,
+		})
 	}
 	return func(ctx context.Context, input json.RawMessage, _ *ToolContext) (Result, error) {
 		var in struct {
@@ -204,7 +364,7 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 		if err != nil {
 			return Errorf("Error fetching URL: " + err.Error()), nil
 		}
-		defer resp.Body.Close()
+		defer drainAndClose(resp.Body)
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
 
 		header := fmt.Sprintf("[%d %s] %s\n", resp.StatusCode, http.StatusText(resp.StatusCode), in.URL)
@@ -456,7 +616,7 @@ func textOnly(b *strings.Builder, n *html.Node) {
 func oneLine(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > max {
-		return s[:max] + "…"
+		return trimUTF8Prefix(s, max) + "…"
 	}
 	return s
 }

@@ -17,6 +17,16 @@ import (
 
 var skipDirs = map[string]bool{".git": true, "node_modules": true, "vendor": true}
 
+const (
+	// maxGrepFileBytes skips giant files/dumps in the Go grep fallback so
+	// os.ReadFile cannot cause OOM.
+	maxGrepFileBytes = 8 << 20 // 8 MiB
+	// maxGrepLineBytes caps single-line buffering in scanLineCount.
+	maxGrepLineBytes = 256 << 10 // 256 KiB
+	// maxGlobMatches caps collected files in Glob before returning a truncation notice.
+	maxGlobMatches = 10000
+)
+
 // NewGlob builds the Glob tool: find files by pattern, newest first.
 func NewGlob() CoreTool {
 	return Build(Spec{
@@ -38,7 +48,14 @@ func NewGlob() CoreTool {
 	})
 }
 
-func runGlob(_ context.Context, input json.RawMessage, tc *ToolContext) (Result, error) {
+func runGlob(ctx context.Context, input json.RawMessage, tc *ToolContext) (Result, error) {
+	return runGlobWithCap(ctx, input, tc, maxGlobMatches)
+}
+
+func runGlobWithCap(ctx context.Context, input json.RawMessage, tc *ToolContext, capMatches int) (Result, error) {
+	if capMatches <= 0 {
+		capMatches = maxGlobMatches
+	}
 	var in struct {
 		Pattern string `json:"pattern"`
 		Path    string `json:"path"`
@@ -58,8 +75,12 @@ func runGlob(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 		mod  int64
 	}
 	var matches []match
+	truncated := false
 	matchPath := compileGlob(in.Pattern)
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
 			return nil
 		}
@@ -74,6 +95,10 @@ func runGlob(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 			rel = p
 		}
 		if matchPath(rel) {
+			if len(matches) >= capMatches {
+				truncated = true
+				return fs.SkipAll
+			}
 			var mod int64
 			if info, e := d.Info(); e == nil {
 				mod = info.ModTime().UnixNano()
@@ -82,6 +107,9 @@ func runGlob(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 		}
 		return nil
 	})
+	if walkErr != nil && ctx.Err() != nil {
+		return Result{}, ctx.Err()
+	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].mod > matches[j].mod })
 	if len(matches) == 0 {
 		return Text("No files found"), nil
@@ -90,6 +118,9 @@ func runGlob(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 	for _, m := range matches {
 		b.WriteString(m.path)
 		b.WriteByte('\n')
+	}
+	if truncated {
+		fmt.Fprintf(&b, "... [results truncated at %d matches — narrow pattern or path] ...\n", capMatches)
 	}
 	return Text(Capture(tc, b.String())), nil
 }
@@ -252,7 +283,7 @@ func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 	typeGlobs := rgTypeGlobs(in.Type)
 	var results []grepHit
 	scan := func(p, base string) {
-		fh := scanFile(p, base, re, mode, showLines, in.Multiline, before, after)
+		fh := scanFileContext(ctx, p, base, re, mode, showLines, in.Multiline, before, after)
 		if fh != nil {
 			results = append(results, *fh)
 		}
@@ -262,7 +293,10 @@ func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 		return Errorf(fmt.Sprintf("Error: %v", statErr)), nil
 	}
 	if info.IsDir() {
-		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if err != nil {
 				return nil
 			}
@@ -284,7 +318,13 @@ func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 			scan(p, root)
 			return nil
 		})
+		if walkErr != nil && ctx.Err() != nil {
+			return Result{}, ctx.Err()
+		}
 	} else {
+		if ctx.Err() != nil {
+			return Result{}, ctx.Err()
+		}
 		scan(root, filepath.Dir(root))
 	}
 	if len(results) == 0 {
@@ -397,12 +437,23 @@ type grepHit struct {
 }
 
 func scanFile(path, base string, re *regexp.Regexp, mode string, showLines, multiline bool, before, after int) *grepHit {
+	return scanFileContext(context.Background(), path, base, re, mode, showLines, multiline, before, after)
+}
+
+func scanFileContext(ctx context.Context, path, base string, re *regexp.Regexp, mode string, showLines, multiline bool, before, after int) *grepHit {
+	if ctx.Err() != nil {
+		return nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.IsDir() || fi.Size() > maxGrepFileBytes {
+		return nil
+	}
 	rel := path
 	if r, e := filepath.Rel(base, path); e == nil {
 		rel = r
 	}
 	if !multiline && mode != "content" {
-		count := scanLineCount(path, re)
+		count := scanLineCountCtx(ctx, path, re)
 		if count == 0 {
 			return nil
 		}
@@ -503,9 +554,13 @@ func scanFile(path, base string, re *regexp.Regexp, mode string, showLines, mult
 }
 
 // Count line matches without retaining the whole file or all match indices.
-// ReadSlice handles ordinary lines without allocating; only unusually long
-// lines need a temporary buffer. There is no new line-length limit.
+// ReadSlice handles ordinary lines without allocating; unusually long lines are
+// buffered up to maxGrepLineBytes (256 KiB) and absurdly long lines are skipped.
 func scanLineCount(path string, re *regexp.Regexp) int {
+	return scanLineCountCtx(context.Background(), path, re)
+}
+
+func scanLineCountCtx(ctx context.Context, path string, re *regexp.Regexp) int {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0
@@ -518,16 +573,42 @@ func scanLineCount(path string, re *regexp.Regexp) int {
 	}
 	count := 0
 	var long []byte
+	oversized := false
 	for {
+		if ctx.Err() != nil {
+			return count
+		}
 		line, err := r.ReadSlice('\n')
 		if err == bufio.ErrBufferFull {
-			long = append(long, line...)
+			if !oversized {
+				if len(long)+len(line) > maxGrepLineBytes {
+					oversized = true
+					long = long[:0]
+				} else {
+					long = append(long, line...)
+				}
+			}
 			continue
 		}
 		if err != nil && err != io.EOF {
 			return 0
 		}
+		if oversized {
+			oversized = false
+			long = long[:0]
+			if err == io.EOF {
+				return count
+			}
+			continue
+		}
 		if len(long) > 0 {
+			if len(long)+len(line) > maxGrepLineBytes {
+				long = long[:0]
+				if err == io.EOF {
+					return count
+				}
+				continue
+			}
 			long = append(long, line...)
 			line = long
 		}

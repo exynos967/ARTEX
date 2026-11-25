@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"strings"
 
@@ -21,10 +22,39 @@ const (
 // offered; the no-tools guardrails live in the user prompt (§7).
 const summarySystemPrompt = "You are a helpful AI assistant tasked with summarizing conversations."
 
+// SummaryPrefix carries the parent conversation's static request prefix so
+// compaction summarization can reuse the parent's KV cache (system + tools +
+// leading reminder + message head) instead of cold-prefilling under a different
+// system prompt and empty tool list.
+type SummaryPrefix struct {
+	System          []string
+	DynamicBoundary int
+	Tools           []llm.ToolSchema
+	SystemReminder  string
+}
+
+type summaryPrefixCtxKey struct{}
+
+// WithSummaryPrefix attaches a parent request prefix to ctx for ProviderSummarizer.
+func WithSummaryPrefix(ctx context.Context, prefix SummaryPrefix) context.Context {
+	return context.WithValue(ctx, summaryPrefixCtxKey{}, prefix)
+}
+
+func summaryPrefixFrom(ctx context.Context) (SummaryPrefix, bool) {
+	if ctx == nil {
+		return SummaryPrefix{}, false
+	}
+	p, ok := ctx.Value(summaryPrefixCtxKey{}).(SummaryPrefix)
+	return p, ok
+}
+
 // ProviderSummarizer builds a Summarizer backed by an llm.Provider. It replays
 // the real conversation messages (not a rendered text transcript) followed by the
 // summary-request user message, with thinking disabled and output capped at
-// min(20000, maxOutputTokens). It retries transient stream failures
+// min(20000, maxOutputTokens). When a parent SummaryPrefix is attached via
+// WithSummaryPrefix (or Compactor Config), the same System, DynamicBoundary,
+// Tools, and leading SystemReminder are forwarded so providers can reuse the
+// parent conversation's KV cache. It retries transient stream failures
 // (MAX_COMPACT_STREAMING_RETRIES) and, if the summary request itself overflows,
 // drops the oldest API-round groups and retries (MAX_PTL_RETRIES).
 func ProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) Summarizer {
@@ -36,7 +66,7 @@ func ProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) 
 		work := pairForReplay(msgs)
 		var lastErr error
 		for attempt := 0; attempt <= maxPTLRetries; attempt++ {
-			raw, err := streamSummary(ctx, p, maxOut, work, nonStreaming)
+			raw, err := streamSummary(ctx, p, maxOut, work, nonStreaming, attempt > 0)
 			if err == nil {
 				return formatCompactSummary(raw), nil
 			}
@@ -57,26 +87,80 @@ func ProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) 
 // streamSummary issues one summary request (head + summary-request message),
 // retrying transient (non-overflow) stream failures. Overflow is returned
 // immediately so the caller can truncate and retry at a coarser granularity.
-func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message, nonStreaming bool) (string, error) {
-	reqMsgs := make([]llm.Message, 0, len(head)+1)
+// If the model emits tool calls or empty/blank summary text while parent tools
+// were offered for cache reuse, it retries once with Tools=nil and the
+// standalone summary system prompt; persistent empty/tool-only replies return
+// an error so autoCompact never replaces history with a blank summary.
+func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message, nonStreaming bool, ptlTruncated bool) (string, error) {
+	prefix, hasPrefix := summaryPrefixFrom(ctx)
+	system := []string{summarySystemPrompt}
+	dynamicBoundary := 0
+	var tools []llm.ToolSchema
+	if hasPrefix {
+		if len(prefix.System) > 0 {
+			system = prefix.System
+			dynamicBoundary = prefix.DynamicBoundary
+		}
+		if len(prefix.Tools) > 0 {
+			tools = prefix.Tools
+		}
+	}
+	reqMsgs := make([]llm.Message, 0, len(head)+2)
+	if hasPrefix && !ptlTruncated && prefix.SystemReminder != "" {
+		reqMsgs = append(reqMsgs, llm.UserText(prefix.SystemReminder))
+	}
 	reqMsgs = append(reqMsgs, head...)
 	reqMsgs = append(reqMsgs, llm.UserText(compactPrompt))
 	req := llm.CompletionRequest{
-		System:    []string{summarySystemPrompt},
-		Messages:  reqMsgs,
-		MaxTokens: maxOut,
-		Thinking:  "disabled",
+		System:          system,
+		DynamicBoundary: dynamicBoundary,
+		Messages:        reqMsgs,
+		Tools:           tools,
+		MaxTokens:       maxOut,
+		Thinking:        "disabled",
 	}
+
+	msg, err := runSummaryWithRetries(ctx, p, req, nonStreaming)
+	if err != nil {
+		return "", err
+	}
+	if reason := invalidSummaryReason(msg); reason != "" {
+		if len(req.Tools) == 0 {
+			return "", errors.New(reason)
+		}
+		// Cache-safe forked call offered parent tools and the model tried to call
+		// a tool or produced blank output: retry once without tools using the
+		// standalone summary system prompt.
+		fallbackMsgs := make([]llm.Message, 0, len(head)+1)
+		fallbackMsgs = append(fallbackMsgs, head...)
+		fallbackMsgs = append(fallbackMsgs, llm.UserText(compactPrompt))
+		fallbackReq := llm.CompletionRequest{
+			System:    []string{summarySystemPrompt},
+			Messages:  fallbackMsgs,
+			MaxTokens: maxOut,
+			Thinking:  "disabled",
+		}
+		msg, err = runSummaryWithRetries(ctx, p, fallbackReq, nonStreaming)
+		if err != nil {
+			return "", err
+		}
+		if reason2 := invalidSummaryReason(msg); reason2 != "" {
+			return "", errors.New(reason2)
+		}
+	}
+	return msg.Text(), nil
+}
+
+func runSummaryWithRetries(ctx context.Context, p llm.Provider, req llm.CompletionRequest, nonStreaming bool) (llm.Message, error) {
 	var lastErr error
 	for range maxStreamingRetries {
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return llm.Message{}, ctx.Err()
 		}
-		var text string
+		var msg llm.Message
 		var callErr error
 		if nonStreaming {
-			msg, _, _, err := p.Complete(ctx, req)
-			text, callErr = msg.Text(), err
+			msg, _, _, callErr = p.Complete(ctx, req)
 		} else {
 			acc := llm.NewAccumulator()
 			for ev, err := range p.Stream(ctx, req) {
@@ -87,18 +171,29 @@ func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.M
 				acc.Add(ev)
 			}
 			if callErr == nil {
-				text = acc.Message().Text()
+				msg = acc.Message()
 			}
 		}
 		if callErr == nil {
-			return text, nil
+			return msg, nil
 		}
 		if IsOverflow(callErr) {
-			return "", callErr // PTL — let the caller truncate, don't burn streaming retries
+			return llm.Message{}, callErr // PTL — let the caller truncate, don't burn streaming retries
 		}
 		lastErr = callErr // transient — retry
 	}
-	return "", lastErr
+	return llm.Message{}, lastErr
+}
+
+func invalidSummaryReason(msg llm.Message) string {
+	if len(msg.ToolUses()) > 0 {
+		return "compaction: summarizer returned tool_use instead of text summary"
+	}
+	text := msg.Text()
+	if strings.TrimSpace(text) == "" || strings.TrimSpace(formatCompactSummary(text)) == "" {
+		return "compaction: summarizer returned empty summary"
+	}
+	return ""
 }
 
 // pairForReplay drops dangling tool_use / tool_result blocks so the replayed head
@@ -210,7 +305,11 @@ var (
 func formatCompactSummary(raw string) string {
 	s := analysisRe.ReplaceAllString(raw, "")
 	if m := summaryRe.FindStringSubmatch(s); m != nil {
-		s = "Summary:\n" + strings.TrimSpace(m[1])
+		body := strings.TrimSpace(m[1])
+		if body == "" {
+			return ""
+		}
+		s = "Summary:\n" + body
 	}
 	s = blankRe.ReplaceAllString(s, "\n\n")
 	return strings.TrimSpace(s)

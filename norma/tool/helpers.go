@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const defaultMaxOutput = 30000
@@ -43,7 +44,7 @@ func Capture(tc *ToolContext, s string) string {
 				}
 			}
 			lines := strings.Count(s, "\n") + 1
-			return s[:max] + fmt.Sprintf(
+			return trimUTF8Prefix(s, max) + fmt.Sprintf(
 				"\n\n... <persisted-output>[Output too large: full %d bytes / %d lines.Full output saved to  %s </persisted-output>",
 				len(s), lines, ref)
 		}
@@ -106,11 +107,70 @@ func resolvePath(tc *ToolContext, p string) string {
 	return filepath.Join(tc.WorkingDir, p)
 }
 
-// truncate trims s to max characters, keeping head and tail.
+// truncate trims s to max bytes on UTF-8 rune boundaries, keeping head and tail.
 func truncate(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
 	}
 	half := max / 2
-	return s[:half] + fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", len(s)-max) + s[len(s)-half:]
+	return trimUTF8Prefix(s, half) + fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", len(s)-max) + trimUTF8Suffix(s, half)
+}
+
+// trimUTF8Prefix returns the longest prefix of s up to max bytes without
+// splitting a multi-byte UTF-8 rune.
+func trimUTF8Prefix(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && max-cut < utf8.UTFMax && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// trimUTF8Suffix returns up to the last max bytes of s starting on a valid
+// UTF-8 rune boundary.
+func trimUTF8Suffix(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	tail := s[len(s)-max:]
+	skipped := 0
+	for len(tail) > 0 && skipped < utf8.UTFMax-1 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+		skipped++
+	}
+	return tail
+}
+
+// trimUTF8PrefixBytes drops any incomplete trailing UTF-8 sequence from an
+// already-sliced byte buffer.
+func trimUTF8PrefixBytes(b []byte) []byte {
+	n := len(b)
+	for i := n - 1; i >= 0 && n-i < utf8.UTFMax; i-- {
+		if utf8.RuneStart(b[i]) {
+			if utf8.FullRune(b[i:]) {
+				return b
+			}
+			return b[:i]
+		}
+	}
+	return b
+}
+
+// trimUTF8SuffixBytes drops leading UTF-8 continuation bytes from a tail buffer.
+func trimUTF8SuffixBytes(b []byte) []byte {
+	skipped := 0
+	for len(b) > 0 && skipped < utf8.UTFMax-1 && !utf8.RuneStart(b[0]) {
+		b = b[1:]
+		skipped++
+	}
+	return b
 }
