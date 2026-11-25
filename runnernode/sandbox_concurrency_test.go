@@ -21,6 +21,7 @@ func TestSandboxConcurrencyCapsCallsWithoutBlockingCancelOrHeartbeat(t *testing.
 
 	var inFlight, maxObserved atomic.Int32
 	started := make(chan struct{}, 8)
+	exited := make(chan struct{}, 8)
 	release := make(chan struct{})
 
 	mcpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +49,10 @@ func TestSandboxConcurrencyCapsCallsWithoutBlockingCancelOrHeartbeat(t *testing.
 					break
 				}
 			}
-			defer inFlight.Add(-1)
+			defer func() {
+				inFlight.Add(-1)
+				exited <- struct{}{}
+			}()
 			started <- struct{}{}
 			select {
 			case <-r.Context().Done():
@@ -151,6 +155,13 @@ func TestSandboxConcurrencyCapsCallsWithoutBlockingCancelOrHeartbeat(t *testing.
 	sendReq(SandboxRequest{ID: "cancel-c1", Method: "cancel", CancelID: "c1"})
 	if r := nextReply(); r.ID != "c1" || (r.Error == "" && !r.Result.IsError) {
 		t.Fatalf("cancelled c1 reply = %+v, want cancellation error", r)
+	}
+	// Wait for the HTTP server handler to observe TCP disconnect and decrement
+	// inFlight before starting c4, avoiding a transient server-side count of 3.
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelled c1 handler did not exit on MCP server")
 	}
 
 	// Freed slot must immediately admit c4.
