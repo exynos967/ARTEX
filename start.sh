@@ -27,17 +27,20 @@ RESTART_CODE=75
 MAX_DELAY=60
 
 child=0
+sleep_pid=0
 stopping=0
 
 # 转发停止信号给 artex 本体。
 #
-# Docker 下这是必需的：docker stop 只把 SIGTERM 发给 PID 1（也就是本脚本），
-# 不会发给子进程。不转发的话 artex 收不到信号、做不了优雅关闭，10 秒后被 SIGKILL
-# 硬杀，正在跑的任务直接断在半路。
+# Docker 下由 tini 担任 PID 1 回收僵尸进程并将 SIGTERM 转发给本脚本；本脚本再转发给
+# artex（以及退避等待中的 sleep），避免 artex 收不到信号而在 10 秒后被 SIGKILL 硬杀。
 forward() {
 	stopping=1
 	if [ "$child" -ne 0 ]; then
 		kill -TERM "$child" 2>/dev/null || true
+	fi
+	if [ "$sleep_pid" -ne 0 ]; then
+		kill -TERM "$sleep_pid" 2>/dev/null || true
 	fi
 }
 trap forward INT TERM
@@ -47,14 +50,14 @@ while :; do
 	"$BIN" "$@" &
 	child=$!
 
-	# 信号会打断 wait 并让它返回 >128。此时子进程其实还在做优雅关闭，
-	# 必须再 wait 一次才能拿到它真正的退出码。
+	# 收到 INT/TERM 时 trap 会打断 wait，此时子进程可能仍在优雅关闭，需继续 wait 到退出；
+	# 若子进程本身被外部信号/OOM 杀死（stopping=0），不得二次 wait，保留真实退出码（如 137）。
 	wait "$child"
 	code=$?
-	if [ "$code" -gt 128 ]; then
+	while [ "$stopping" -eq 1 ] && kill -0 "$child" 2>/dev/null; do
 		wait "$child"
 		code=$?
-	fi
+	done
 	child=0
 
 	if [ "$stopping" -eq 1 ]; then
@@ -74,7 +77,14 @@ while :; do
 			;;
 		*)
 			echo "[artex] 异常退出 (code=$code)，${delay}s 后重启" >&2
-			sleep "$delay"
+			sleep "$delay" &
+			sleep_pid=$!
+			wait "$sleep_pid" 2>/dev/null || true
+			sleep_pid=0
+			if [ "$stopping" -eq 1 ]; then
+				echo "[artex] 已停止"
+				exit 0
+			fi
 			delay=$((delay * 2))
 			[ "$delay" -gt "$MAX_DELAY" ] && delay=$MAX_DELAY
 			;;

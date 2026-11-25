@@ -11,6 +11,8 @@ legacy = re.compile(r"(?:github\.com/)?(?:Autumn-27/(?:artex|norma)|mhtsec/ARTEX
 errors = []
 for name in files:
     path = root / name
+    if not path.is_file():
+        continue
     if path.suffix not in {".go", ".mod", ".sum", ".sh", ".bat", ".yml", ".yaml", ".json", ".md", ".ts", ".tsx", ".js", ".cjs", ".mjs"} and name not in {"Dockerfile", ".env.example"}:
         continue
     # Preserve historical measurements and original authorship, not live endpoints.

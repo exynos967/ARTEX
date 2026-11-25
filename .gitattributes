@@ -1,2 +1,10 @@
 *.bat text eol=crlf
 *.sh  text eol=lf
+*.py  text eol=lf
+*.js  text eol=lf
+*.cjs text eol=lf
+*.mjs text eol=lf
+Dockerfile text eol=lf
+start.sh text eol=lf
+deploy/tool-guard/* text eol=lf
+deploy/container-tools/artex-kit text eol=lf

@@ -1,13 +1,13 @@
 # 追加到 docker-compose.override.yml（该文件被 .git/info/exclude 排除，不入库）
-# 作用：给 artex 容器加资源硬上限，并在 PATH 前置 katana 护栏 shim。
+# 作用：为旧镜像或自定义环境外挂整套 tool-guard 护栏目录（含 guard-common.sh），并对齐默认资源预算。
 services:
   artex:
-    mem_limit: 10g
-    memswap_limit: 10g      # 与 mem_limit 相等 = 容器内禁用 swap，避免内存抖动拖死宿主
-    pids_limit: 4096
+    mem_limit: 2g
+    memswap_limit: 2g      # 与 mem_limit 相等 = 容器内禁用 swap，避免内存抖动拖死宿主
+    pids_limit: 512
     environment:
       PATH: /opt/artex-shim:/opt/artex-tools/node_modules/.bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
-      KATANA_SHIM_LOG: /opt/artex-shim/logs/katana.log
+      ARTEX_TOOL_GUARD_LOG: /var/log/artex-guard/tool-guard.log
     volumes:
-      - ./deploy/tool-guard/katana:/opt/artex-shim/katana:ro
-      - ./shim-logs:/opt/artex-shim/logs
+      - ./deploy/tool-guard:/opt/artex-shim:ro
+      - ./shim-logs:/var/log/artex-guard

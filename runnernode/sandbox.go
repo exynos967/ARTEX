@@ -266,6 +266,12 @@ type SandboxReply struct {
 	Executed         bool                    `json:"executed,omitempty"`
 }
 
+const defaultMaxConcurrentSandboxCalls = 16
+
+// maxConcurrentSandboxCalls caps simultaneous in-flight "call" RPCs per
+// sandbox session. Kept as a package var so unit tests can lower it cheaply.
+var maxConcurrentSandboxCalls = defaultMaxConcurrentSandboxCalls
+
 // ServeSandbox runs a single session until EOF or close. stdout must be reserved
 // for JSON lines; all diagnostics belong on stderr.
 func ServeSandbox(ctx context.Context, in io.Reader, out io.Writer) error {
@@ -296,6 +302,11 @@ func ServeSandboxWithHeartbeat(ctx context.Context, in io.Reader, out io.Writer,
 	send := func(r SandboxReply) { writes.Lock(); defer writes.Unlock(); _ = enc.Encode(r) }
 	var calls sync.Mutex
 	running := map[string]context.CancelFunc{}
+	callLimit := maxConcurrentSandboxCalls
+	if callLimit <= 0 {
+		callLimit = defaultMaxConcurrentSandboxCalls
+	}
+	callSem := make(chan struct{}, callLimit)
 	requests := make(chan SandboxRequest, 128)
 	readErrors := make(chan error, 1)
 	go func() {
@@ -360,16 +371,36 @@ func ServeSandboxWithHeartbeat(ctx context.Context, in io.Reader, out io.Writer,
 				send(SandboxReply{ID: req.ID, Error: "session is not open"})
 				continue
 			}
+			// Non-blocking admission keeps the dispatch loop responsive to "cancel",
+			// "notifications", and "close" even when all tool-call slots are busy.
+			select {
+			case callSem <- struct{}{}:
+			default:
+				send(SandboxReply{ID: req.ID, Error: "sandbox concurrent tool-call limit reached"})
+				continue
+			}
 			callCtx, stop := context.WithCancel(ctx)
 			calls.Lock()
 			running[req.ID] = stop
 			calls.Unlock()
 			go func(req SandboxRequest) {
+				released := false
+				release := func() {
+					if released {
+						return
+					}
+					released = true
+					stop()
+					calls.Lock()
+					delete(running, req.ID)
+					calls.Unlock()
+					<-callSem
+				}
+				defer release()
 				r := session.Call(callCtx, *req.Call)
-				stop()
-				calls.Lock()
-				delete(running, req.ID)
-				calls.Unlock()
+				// Free the slot before sending the reply so a client that reacts
+				// immediately to completion never races against slot release.
+				release()
 				r.ID = req.ID
 				send(r)
 			}(req)

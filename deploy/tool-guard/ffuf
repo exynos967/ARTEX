@@ -1,0 +1,124 @@
+#!/bin/sh
+# ffuf 网络与资源护栏包装器（POSIX /bin/sh，LF 换行）
+#
+# 强制上限（均可通过 ARTEX_FFUF_MAX_* 覆盖）：
+#   -t       <= 16 (缺省注入 -t 10)
+#   -rate    <= 40 (缺省注入 -rate 30；注意 -rate 0 在 ffuf 中表示无限制，会被夹逼回默认值)
+#   -timeout <= 10 (缺省注入 -timeout 10)
+set -u
+
+_self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+if [ -n "${ARTEX_TOOL_GUARD_COMMON:-}" ] && [ -r "$ARTEX_TOOL_GUARD_COMMON" ]; then
+  . "$ARTEX_TOOL_GUARD_COMMON"
+elif [ -r "/usr/local/lib/artex-guard/guard-common.sh" ]; then
+  . "/usr/local/lib/artex-guard/guard-common.sh"
+elif [ -r "$_self_dir/guard-common.sh" ]; then
+  . "$_self_dir/guard-common.sh"
+else
+  printf 'tool-guard(ffuf): guard-common.sh not found\n' >&2
+  exit 127
+fi
+
+DEBUG="${ARTEX_TOOL_GUARD_DEBUG:-}"
+LOG="${ARTEX_TOOL_GUARD_LOG:-}"
+
+for _a in "$@"; do
+  case "$_a" in
+    --) break ;;
+    -V|-version|--version|-h|-help|--help)
+      REAL=""
+      [ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin ffuf "$0") || exit $?; }
+      guard_exec ffuf "$REAL" "$LOG" "$DEBUG" "$@"
+      ;;
+  esac
+done
+
+MAX_T=$(guard_env_max "${ARTEX_FFUF_MAX_THREADS:-}" 16 1)
+DEF_T=$(guard_effective_default 10 "$MAX_T")
+MAX_RATE=$(guard_env_max "${ARTEX_FFUF_MAX_RATE:-}" 40 1)
+DEF_RATE=$(guard_effective_default 30 "$MAX_RATE")
+MAX_TIMEOUT=$(guard_env_max "${ARTEX_FFUF_MAX_TIMEOUT:-}" 10 1)
+DEF_TIMEOUT=$(guard_effective_default 10 "$MAX_TIMEOUT")
+
+seen_t=0
+seen_rate=0
+seen_timeout=0
+passthrough_rest=0
+
+_rem=$#
+while [ "$_rem" -gt 0 ]; do
+  _arg="$1"
+  shift
+  _rem=$((_rem - 1))
+
+  if [ "$passthrough_rest" = 1 ]; then
+    set -- "$@" "$_arg"
+    continue
+  fi
+
+  case "$_arg" in
+    --)
+      passthrough_rest=1
+      set -- "$@" "$_arg"
+      ;;
+    -t|--t)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_T" "$DEF_T" 1)
+        set -- "$@" "-t" "$_clamped"
+        seen_t=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -t=*|--t=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_T" "$DEF_T" 1)
+      set -- "$@" "-t=$_clamped"
+      seen_t=1
+      ;;
+    -rate|--rate)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RATE" "$DEF_RATE" 1)
+        set -- "$@" "-rate" "$_clamped"
+        seen_rate=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -rate=*|--rate=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RATE" "$DEF_RATE" 1)
+      set -- "$@" "-rate=$_clamped"
+      seen_rate=1
+      ;;
+    -timeout|--timeout)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT" 1)
+        set -- "$@" "-timeout" "$_clamped"
+        seen_timeout=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -timeout=*|--timeout=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT" 1)
+      set -- "$@" "-timeout=$_clamped"
+      seen_timeout=1
+      ;;
+    *)
+      set -- "$@" "$_arg"
+      ;;
+  esac
+done
+
+[ "$seen_timeout" = 0 ] && set -- -timeout "$DEF_TIMEOUT" "$@"
+[ "$seen_rate" = 0 ]    && set -- -rate "$DEF_RATE" "$@"
+[ "$seen_t" = 0 ]       && set -- -t "$DEF_T" "$@"
+
+REAL=""
+[ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin ffuf "$0") || exit $?; }
+guard_exec ffuf "$REAL" "$LOG" "$DEBUG" "$@"

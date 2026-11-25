@@ -1,0 +1,196 @@
+#!/bin/sh
+# naabu 网络与资源护栏包装器（POSIX /bin/sh，LF 换行）
+#
+# 强制上限（均可通过 ARTEX_NAABU_MAX_* 覆盖）：
+#   -rate    <= 300    (缺省注入 -rate 200)
+#   -c       <= 15     (缺省注入 -c 10)
+#   -timeout <= 5000ms (缺省注入 -timeout 5000ms；naabu v2.6.1 裸整数按秒解析，
+#                       护栏统一解析 ms/s/m/h 与裸秒数并输出显式 ms 单位)
+#   -retries <= 1      (缺省注入 -retries 1)
+#   UID 0 且缺失 CAP_NET_RAW 时，未指定 -s/-scan-type 则自动注入 -s c（TCP connect）
+set -u
+
+_self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+if [ -n "${ARTEX_TOOL_GUARD_COMMON:-}" ] && [ -r "$ARTEX_TOOL_GUARD_COMMON" ]; then
+  . "$ARTEX_TOOL_GUARD_COMMON"
+elif [ -r "/usr/local/lib/artex-guard/guard-common.sh" ]; then
+  . "/usr/local/lib/artex-guard/guard-common.sh"
+elif [ -r "$_self_dir/guard-common.sh" ]; then
+  . "$_self_dir/guard-common.sh"
+else
+  printf 'tool-guard(naabu): guard-common.sh not found\n' >&2
+  exit 127
+fi
+
+DEBUG="${ARTEX_TOOL_GUARD_DEBUG:-}"
+LOG="${ARTEX_TOOL_GUARD_LOG:-}"
+
+naabu_needs_connect_scan() {
+  if [ "${ARTEX_NAABU_NO_NET_RAW:-}" = "1" ]; then
+    return 0
+  fi
+  if [ "${ARTEX_NAABU_NO_NET_RAW:-}" = "0" ]; then
+    return 1
+  fi
+  [ "$(id -u 2>/dev/null || printf '1')" = "0" ] || return 1
+  [ -r /proc/self/status ] || return 1
+  _capeff=""
+  while IFS= read -r _line; do
+    case "$_line" in
+      CapEff:*)
+        _capeff="${_line#CapEff:}"
+        while :; do
+          case "$_capeff" in
+            ' '*|'	'*) _capeff="${_capeff#?}" ;;
+            *) break ;;
+          esac
+        done
+        break
+        ;;
+    esac
+  done < /proc/self/status
+  [ -n "$_capeff" ] || return 1
+  # CAP_NET_RAW 为 bit 13 (0x2000)，对应十六进制右数第 4 位的 bit 1。
+  case "$_capeff" in
+    *[2367abefABEF]???) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+for _a in "$@"; do
+  case "$_a" in
+    --) break ;;
+    -version|--version|-h|-help|--help)
+      REAL=""
+      [ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin naabu "$0") || exit $?; }
+      guard_exec naabu "$REAL" "$LOG" "$DEBUG" "$@"
+      ;;
+  esac
+done
+
+MAX_RATE=$(guard_env_max "${ARTEX_NAABU_MAX_RATE:-}" 300 1)
+DEF_RATE=$(guard_effective_default 200 "$MAX_RATE")
+MAX_C=$(guard_env_max "${ARTEX_NAABU_MAX_CONCURRENCY:-}" 15 1)
+DEF_C=$(guard_effective_default 10 "$MAX_C")
+MAX_TIMEOUT_MS=$(guard_env_max_duration_ms "${ARTEX_NAABU_MAX_TIMEOUT:-}" 5000 1)
+DEF_TIMEOUT_MS=$(guard_effective_default 5000 "$MAX_TIMEOUT_MS")
+MAX_RETRIES=$(guard_env_max "${ARTEX_NAABU_MAX_RETRIES:-}" 1 0)
+DEF_RETRIES=$(guard_effective_default 1 "$MAX_RETRIES")
+
+seen_rate=0
+seen_c=0
+seen_timeout=0
+seen_retries=0
+seen_scan_type=0
+passthrough_rest=0
+
+_rem=$#
+while [ "$_rem" -gt 0 ]; do
+  _arg="$1"
+  shift
+  _rem=$((_rem - 1))
+
+  if [ "$passthrough_rest" = 1 ]; then
+    set -- "$@" "$_arg"
+    continue
+  fi
+
+  case "$_arg" in
+    --)
+      passthrough_rest=1
+      set -- "$@" "$_arg"
+      ;;
+    -s|--s|-scan-type|--scan-type)
+      seen_scan_type=1
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        set -- "$@" "$_arg" "$_val"
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -s=*|--s=*|-scan-type=*|--scan-type=*)
+      seen_scan_type=1
+      set -- "$@" "$_arg"
+      ;;
+    -rate|--rate)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RATE" "$DEF_RATE" 1)
+        set -- "$@" "-rate" "$_clamped"
+        seen_rate=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -rate=*|--rate=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RATE" "$DEF_RATE" 1)
+      set -- "$@" "-rate=$_clamped"
+      seen_rate=1
+      ;;
+    -c|--c|-concurrency|--concurrency)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_C" "$DEF_C" 1)
+        set -- "$@" "-c" "$_clamped"
+        seen_c=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -c=*|--c=*|-concurrency=*|--concurrency=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_C" "$DEF_C" 1)
+      set -- "$@" "-c=$_clamped"
+      seen_c=1
+      ;;
+    -timeout|--timeout)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_duration_ms "$_val" "$MAX_TIMEOUT_MS" "$DEF_TIMEOUT_MS")
+        set -- "$@" "-timeout" "$_clamped"
+        seen_timeout=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -timeout=*|--timeout=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_duration_ms "$_val" "$MAX_TIMEOUT_MS" "$DEF_TIMEOUT_MS")
+      set -- "$@" "-timeout=$_clamped"
+      seen_timeout=1
+      ;;
+    -retries|--retries)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RETRIES" "$DEF_RETRIES" 0)
+        set -- "$@" "-retries" "$_clamped"
+        seen_retries=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -retries=*|--retries=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RETRIES" "$DEF_RETRIES" 0)
+      set -- "$@" "-retries=$_clamped"
+      seen_retries=1
+      ;;
+    *)
+      set -- "$@" "$_arg"
+      ;;
+  esac
+done
+
+if [ "$seen_scan_type" = 0 ] && naabu_needs_connect_scan; then
+  set -- -s c "$@"
+fi
+[ "$seen_retries" = 0 ] && set -- -retries "$DEF_RETRIES" "$@"
+[ "$seen_timeout" = 0 ] && set -- -timeout "${DEF_TIMEOUT_MS}ms" "$@"
+[ "$seen_c" = 0 ]       && set -- -c "$DEF_C" "$@"
+[ "$seen_rate" = 0 ]    && set -- -rate "$DEF_RATE" "$@"
+
+REAL=""
+[ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin naabu "$0") || exit $?; }
+guard_exec naabu "$REAL" "$LOG" "$DEBUG" "$@"

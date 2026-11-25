@@ -27,6 +27,8 @@ web/next-env.d.ts
 # docs
 /docs/*
 !/docs/experimental-runners.md
+!/docs/resource-stability-plan.md
+!/docs/host-containment.md
 !/docs/worker-main-consultation.md
 !/docs/owned-resources.md
 !/docs/worker-budgets-and-record-export.md

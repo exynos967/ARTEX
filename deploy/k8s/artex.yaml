@@ -45,6 +45,10 @@ spec:
           command: [sh, -ec]
           args:
             - until pg_isready -h postgres -U artex -d artex; do sleep 2; done
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
               cpu: 10m
@@ -57,6 +61,11 @@ spec:
           command: [sh, -ec]
           args:
             - mkdir -p /data/skills; cp -an /app/skills/. /data/skills/
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["DAC_OVERRIDE", "FOWNER"]
           resources:
             requests:
               cpu: 10m
@@ -72,6 +81,11 @@ spec:
           image: ghcr.io/rc-chn/artex:latest
           imagePullPolicy: IfNotPresent
           args: [-addr, ":8787", -proxy, ":8788"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["DAC_OVERRIDE", "FOWNER"]
           env:
             - name: POSTGRES_PASSWORD
               valueFrom:

@@ -95,7 +95,7 @@ ENV npm_config_registry=$NPM_REGISTRY \
 RUN sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update \
     && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
-      ca-certificates libatomic1 libstdc++6 ripgrep curl wget vim git jq unzip \
+      ca-certificates tini libatomic1 libstdc++6 ripgrep curl wget vim git jq unzip \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
       openssh-client sshpass openssl procps iproute2 net-tools file socat \
       rsync tcpdump traceroute mtr-tiny psmisc strace lsof busybox-static \
@@ -176,6 +176,14 @@ RUN --mount=type=bind,source=deploy/container-tools/download-cache,target=/tool-
 COPY --chmod=755 deploy/container-tools/artex-kit /usr/local/bin/artex-kit
 RUN --mount=type=bind,source=deploy/container-tools/download-cache,target=/tool-downloads,readonly \
     ARTEX_TOOL_ARCHIVES=/tool-downloads artex-kit ipdb install --data-dir /opt/artex-kit/ip-data
+# 不可绕过的扫描工具网络与资源护栏：真实二进制迁至 /usr/lib/artex-bins，
+# /usr/local/bin/<tool> 统一安装护栏包装器（nuclei 已通过 /usr/local/bin/nuclei 包装）。
+RUN mkdir -p /usr/lib/artex-bins /usr/local/lib/artex-guard \
+    && for tool in katana httpx ffuf naabu sqlmap; do \
+         mv "/usr/local/bin/${tool}" "/usr/lib/artex-bins/${tool}"; \
+       done
+COPY --chmod=755 deploy/tool-guard/guard-common.sh /usr/local/lib/artex-guard/guard-common.sh
+COPY --chmod=755 deploy/tool-guard/katana deploy/tool-guard/httpx deploy/tool-guard/ffuf deploy/tool-guard/naabu deploy/tool-guard/sqlmap /usr/local/bin/
 
 ########## Runner 管理客户端：仅管理进程持有 socket/API 凭据 ##########
 FROM docker:29.1.3-cli@sha256:4fa0ee1f3a7e4354c4ea34558b6d4ee32859baf4973d4c8ccc8e7fe3dd730c04 AS runner-clients
@@ -204,8 +212,8 @@ COPY --from=gobuild /out/artex-runner /usr/local/bin/artex-runner
 COPY --from=runner-clients /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=runner-clients /usr/local/bin/kubectl /usr/local/bin/kubectl
 # 守护启动脚本：进程退出后按退出码决定是否重新拉起，页面一键更新靠它完成换装。
-# 它同时负责把 SIGTERM 转发给 artex —— docker stop 只把信号发给 PID 1，
-# 不转发的话 artex 收不到、做不了优雅关闭，10 秒后被 SIGKILL 硬杀。
+# 容器入口由 tini 担任 PID 1 负责回收孤儿/僵尸子进程并向 start.sh 转发 SIGTERM，
+# 再由 start.sh 转发给 artex 做优雅关闭，避免 10 秒后被 SIGKILL 硬杀。
 COPY start.sh /app/start.sh
 RUN chmod +x /app/artex /app/start.sh
 COPY skills/ /app/skills/
@@ -221,5 +229,5 @@ LABEL org.opencontainers.image.source="https://github.com/RC-CHN/ARTEX" \
 # data/（流量 blob、会话记录及旧索引备份）持久化点
 VOLUME ["/app/data"]
 EXPOSE 8787 8788
-ENTRYPOINT ["/app/start.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/start.sh"]
 CMD ["-addr", ":8787", "-proxy", ":8788"]

@@ -86,11 +86,19 @@ func (s *Store) Lease(m Mount, p, owner string, ttl time.Duration) (string, erro
 	defer unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if l, ok := s.leases[k]; ok && s.Now().Before(l.Until) {
+	now := s.Now()
+	if len(s.leases) > 256 {
+		for key, lease := range s.leases {
+			if !now.Before(lease.Until) {
+				delete(s.leases, key)
+			}
+		}
+	}
+	if l, ok := s.leases[k]; ok && now.Before(l.Until) {
 		return "", ErrLocked
 	}
 	token := randomID()
-	s.leases[k] = fileLease{owner, token, s.Now().Add(ttl)}
+	s.leases[k] = fileLease{owner, token, now.Add(ttl)}
 	return token, nil
 }
 func (s *Store) Unlock(m Mount, p, owner, token string) error {

@@ -169,14 +169,28 @@ func (k *KubernetesExecutor) Pod(id string, spec runner.RunSpec, plan runnerfile
 	if gid == 0 {
 		gid = 10001
 	}
+	cpu, mem := spec.Resources.CPUMillis, spec.Resources.MemoryMiB
+	if cpu <= 0 {
+		cpu = 1000
+	}
+	if mem <= 0 {
+		mem = 1024
+	}
+	// Keep /tmp and /home/runner disk-backed so scratch writes do not consume the
+	// container's memory cgroup and OOMKill a 1 GiB Pod; only /dev/shm uses Memory.
 	volumes := []any{
-		map[string]any{"name": "home", "emptyDir": map[string]any{"medium": "Memory", "sizeLimit": "256Mi"}},
-		map[string]any{"name": "tmp", "emptyDir": map[string]any{"medium": "Memory", "sizeLimit": "512Mi"}},
+		map[string]any{"name": "home", "emptyDir": map[string]any{"sizeLimit": "256Mi"}},
+		map[string]any{"name": "tmp", "emptyDir": map[string]any{"sizeLimit": "512Mi"}},
+		map[string]any{"name": "shm", "emptyDir": map[string]any{"medium": "Memory", "sizeLimit": fmt.Sprintf("%dMi", sandboxShmSizeMiB(mem))}},
 	}
 	if plan.Mode != runnerfiles.SharedMode {
 		volumes = append(volumes, map[string]any{"name": "cache", "persistentVolumeClaim": map[string]any{"claimName": k.Config.WorkspacePVC}})
 	}
-	mounts := []any{map[string]any{"name": "home", "mountPath": "/home/runner"}, map[string]any{"name": "tmp", "mountPath": "/tmp"}}
+	mounts := []any{
+		map[string]any{"name": "home", "mountPath": "/home/runner"},
+		map[string]any{"name": "tmp", "mountPath": "/tmp"},
+		map[string]any{"name": "shm", "mountPath": "/dev/shm"},
+	}
 	if !inMounts("/workspace", plan) {
 		volumes = append(volumes, map[string]any{"name": "scratch", "emptyDir": map[string]any{"sizeLimit": "512Mi"}})
 		mounts = append(mounts, map[string]any{"name": "scratch", "mountPath": "/workspace"})
@@ -239,13 +253,6 @@ func (k *KubernetesExecutor) Pod(id string, spec runner.RunSpec, plan runnerfile
 		name, value, _ := strings.Cut(pair, "=")
 		vars = append(vars, map[string]string{"name": name, "value": value})
 	}
-	cpu, mem := spec.Resources.CPUMillis, spec.Resources.MemoryMiB
-	if cpu <= 0 {
-		cpu = 1000
-	}
-	if mem <= 0 {
-		mem = 1024
-	}
 	limits := map[string]string{"cpu": fmt.Sprintf("%dm", cpu), "memory": fmt.Sprintf("%dMi", mem), "ephemeral-storage": "1Gi"}
 	binary := k.SandboxBinary
 	if binary == "" {
@@ -260,7 +267,9 @@ func (k *KubernetesExecutor) Pod(id string, spec runner.RunSpec, plan runnerfile
 	}
 	ps := map[string]any{
 		"restartPolicy": "Never", "automountServiceAccountToken": false, "enableServiceLinks": false,
-		"serviceAccountName": cfg.ServiceAccount, "terminationGracePeriodSeconds": 5,
+		// Share the Pod PID namespace so the pause container acts as PID 1 zombie reaper.
+		"shareProcessNamespace": true,
+		"serviceAccountName":    cfg.ServiceAccount, "terminationGracePeriodSeconds": 5,
 		"securityContext": map[string]any{"runAsNonRoot": true, "runAsUser": uid, "runAsGroup": gid, "fsGroup": gid, "fsGroupChangePolicy": "OnRootMismatch", "seccompProfile": map[string]string{"type": "RuntimeDefault"}},
 		"containers":      []any{container}, "volumes": volumes,
 	}

@@ -1,6 +1,31 @@
+# 宿主预算与离线核对见 docs/host-containment.md。
+x-container-logging: &container-logging
+  driver: json-file
+  options:
+    max-size: "8m"
+    max-file: "3"
+
 services:
   postgres:
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 128
+    logging: *container-logging
     image: postgres:16.14-alpine
+    command:
+      - postgres
+      - -c
+      - max_connections=40
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=48MB
+      - -c
+      - max_parallel_workers=2
+      - -c
+      - max_parallel_workers_per_gather=1
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-artex}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 设置 POSTGRES_PASSWORD}
@@ -17,9 +42,14 @@ services:
   # 实验功能：docker compose --profile runners up -d runner-manager
   # 一个管理进程按任务创建临时容器，无需预置多个常驻 worker。
   runner-manager:
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 192
+    init: true
+    logging: *container-logging
     profiles: [runners]
     image: ${ARTEX_IMAGE:-ghcr.io/rc-chn/artex}:${ARTEX_TAG:-latest}
-    entrypoint: [/usr/local/bin/artex-runner]
+    entrypoint: ["/bin/sh", "-ec", "mkdir -p /var/lib/artex-runner/tmp && exec /usr/local/bin/artex-runner \"$$@\"", "--"]
     command: [-config, /etc/artex-runner/runner.json, -token-file, /run/secrets/runner_enrollment]
     depends_on:
       artex:
@@ -29,9 +59,11 @@ services:
       ARTEX_RUNNER_DOCKER_HOST_DATA_DIR: ${ARTEX_RUNNER_DATA_DIR:-/var/lib/artex-runner}
       ARTEX_RUNNER_DOCKER_NETWORK: ${ARTEX_RUNNER_NETWORK:-artex-runners}
       DOCKER_CONFIG: /var/lib/artex-runner/docker-config
+      TMPDIR: /var/lib/artex-runner/tmp
     networks: [runners]
     read_only: true
     cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, FOWNER]
     security_opt: [no-new-privileges:true]
     tmpfs: [/tmp:size=64m]
     volumes:
@@ -43,6 +75,21 @@ services:
     restart: unless-stopped
 
   artex:
+    mem_limit: 2g
+    memswap_limit: 2g
+    pids_limit: 512
+    cpus: "4.0"
+    init: true
+    shm_size: 256m
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
+    stop_grace_period: 45s
+    logging: *container-logging
     # 本仓库的 GitHub Actions 发布到 GHCR。
     # 正常部署直接拉取本镜像；拉取失败（或想改代码）时本地构建：
     #   docker compose build

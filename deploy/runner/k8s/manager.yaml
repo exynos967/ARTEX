@@ -105,4 +105,4 @@ spec:
             claimName: artex-runner-workspace
         - name: tmp
           emptyDir:
-            sizeLimit: 64Mi
+            sizeLimit: 1536Mi

@@ -1,0 +1,124 @@
+#!/bin/sh
+# sqlmap 网络与资源护栏包装器（POSIX /bin/sh，LF 换行）
+#
+# 强制上限（均可通过 ARTEX_SQLMAP_MAX_* 覆盖）：
+#   --threads <= 4  (缺省注入 --threads=3)
+#   --timeout <= 15 (缺省注入 --timeout=15)
+#   --retries <= 1  (缺省注入 --retries=1)
+set -u
+
+_self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+if [ -n "${ARTEX_TOOL_GUARD_COMMON:-}" ] && [ -r "$ARTEX_TOOL_GUARD_COMMON" ]; then
+  . "$ARTEX_TOOL_GUARD_COMMON"
+elif [ -r "/usr/local/lib/artex-guard/guard-common.sh" ]; then
+  . "/usr/local/lib/artex-guard/guard-common.sh"
+elif [ -r "$_self_dir/guard-common.sh" ]; then
+  . "$_self_dir/guard-common.sh"
+else
+  printf 'tool-guard(sqlmap): guard-common.sh not found\n' >&2
+  exit 127
+fi
+
+DEBUG="${ARTEX_TOOL_GUARD_DEBUG:-}"
+LOG="${ARTEX_TOOL_GUARD_LOG:-}"
+
+for _a in "$@"; do
+  case "$_a" in
+    --) break ;;
+    --version|-version|-h|-hh|--help|-help)
+      REAL=""
+      [ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin sqlmap "$0") || exit $?; }
+      guard_exec sqlmap "$REAL" "$LOG" "$DEBUG" "$@"
+      ;;
+  esac
+done
+
+MAX_THREADS=$(guard_env_max "${ARTEX_SQLMAP_MAX_THREADS:-}" 4 1)
+DEF_THREADS=$(guard_effective_default 3 "$MAX_THREADS")
+MAX_TIMEOUT=$(guard_env_max "${ARTEX_SQLMAP_MAX_TIMEOUT:-}" 15 1)
+DEF_TIMEOUT=$(guard_effective_default 15 "$MAX_TIMEOUT")
+MAX_RETRIES=$(guard_env_max "${ARTEX_SQLMAP_MAX_RETRIES:-}" 1 0)
+DEF_RETRIES=$(guard_effective_default 1 "$MAX_RETRIES")
+
+seen_threads=0
+seen_timeout=0
+seen_retries=0
+passthrough_rest=0
+
+_rem=$#
+while [ "$_rem" -gt 0 ]; do
+  _arg="$1"
+  shift
+  _rem=$((_rem - 1))
+
+  if [ "$passthrough_rest" = 1 ]; then
+    set -- "$@" "$_arg"
+    continue
+  fi
+
+  case "$_arg" in
+    --)
+      passthrough_rest=1
+      set -- "$@" "$_arg"
+      ;;
+    --threads|-threads)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_THREADS" "$DEF_THREADS" 1)
+        set -- "$@" "--threads=$_clamped"
+        seen_threads=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    --threads=*|-threads=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_THREADS" "$DEF_THREADS" 1)
+      set -- "$@" "--threads=$_clamped"
+      seen_threads=1
+      ;;
+    --timeout|-timeout)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_decimal "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT")
+        set -- "$@" "--timeout=$_clamped"
+        seen_timeout=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    --timeout=*|-timeout=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_decimal "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT")
+      set -- "$@" "--timeout=$_clamped"
+      seen_timeout=1
+      ;;
+    --retries|-retries)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RETRIES" "$DEF_RETRIES" 0)
+        set -- "$@" "--retries=$_clamped"
+        seen_retries=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    --retries=*|-retries=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RETRIES" "$DEF_RETRIES" 0)
+      set -- "$@" "--retries=$_clamped"
+      seen_retries=1
+      ;;
+    *)
+      set -- "$@" "$_arg"
+      ;;
+  esac
+done
+
+[ "$seen_retries" = 0 ] && set -- "--retries=$DEF_RETRIES" "$@"
+[ "$seen_timeout" = 0 ] && set -- "--timeout=$DEF_TIMEOUT" "$@"
+[ "$seen_threads" = 0 ] && set -- "--threads=$DEF_THREADS" "$@"
+
+REAL=""
+[ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin sqlmap "$0") || exit $?; }
+guard_exec sqlmap "$REAL" "$LOG" "$DEBUG" "$@"

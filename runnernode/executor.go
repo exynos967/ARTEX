@@ -39,6 +39,46 @@ type DockerExecutor struct {
 	Log           io.Writer
 }
 
+// dockerTmpfsSizes bounds total RAM-backed tmpfs mounts to at most 25% of the
+// container memory limit, with per-mount ceilings (/tmp <= 128m, /home/runner <= 64m,
+// optional /workspace <= 128m) so tmpfs writes cannot exhaust container memory.
+func dockerTmpfsSizes(memoryMiB int64, includeWorkspace bool) (tmpMiB, homeMiB, workspaceMiB int64) {
+	budget := memoryMiB / 4
+	if includeWorkspace {
+		tmpMiB = max(min(budget*2/5, 128), 1)
+		homeMiB = max(min(budget/5, 64), 1)
+		workspaceMiB = max(min(budget*2/5, 128), 1)
+		return tmpMiB, homeMiB, workspaceMiB
+	}
+	tmpMiB = max(min(budget*2/3, 128), 1)
+	homeMiB = max(min(budget/3, 64), 1)
+	return tmpMiB, homeMiB, 0
+}
+
+// sandboxShmSizeMiB scales /dev/shm with the container memory limit while
+// keeping it bounded to [16, 128] MiB so small sandboxes cannot over-commit
+// Memory-backed tmpfs and larger sandboxes stay capped for Chromium/IPC.
+func sandboxShmSizeMiB(memoryMiB int64) int64 {
+	return min(int64(128), max(memoryMiB/8, int64(16)))
+}
+
+// dockerSandboxUser maps UID/GID 0 to the unprivileged 10001:10001 account
+// whenever no host bind mounts exist under the manager's UID. When host bind
+// mounts exist (mode 0700 owned by the manager), keeping the manager's UID/GID
+// preserves mount access while --cap-drop=ALL, --read-only and
+// --security-opt=no-new-privileges still strip all container privileges.
+func dockerSandboxUser(uid, gid int, hasMounts bool) (string, string) {
+	if !hasMounts {
+		if uid == 0 {
+			uid = 10001
+		}
+		if gid == 0 {
+			gid = 10001
+		}
+	}
+	return strconv.Itoa(uid), strconv.Itoa(gid)
+}
+
 // DockerArgs keeps all host-side authority in the daemon. The session receives
 // no socket, credentials, host PID namespace, privileged mode or host network.
 func (d *DockerExecutor) DockerArgs(id string, spec runner.RunSpec, plan runnerfiles.Plan, roots map[string]string, gpus []string) ([]string, error) {
@@ -46,11 +86,26 @@ func (d *DockerExecutor) DockerArgs(id string, spec runner.RunSpec, plan runnerf
 		return nil, fmt.Errorf("Docker runtime image is not digest-pinned")
 	}
 	name := containerName(d.NodeID, id)
-	uid := strconv.Itoa(os.Getuid())
-	gid := strconv.Itoa(os.Getgid())
-	args := []string{"run", "--rm", "-i", "--init", "--name", name, "--label", "site.artex.runner=" + safeID(d.NodeID), "--label", "site.artex.session=" + safeID(id), "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user", uid + ":" + gid, "--workdir", spec.WorkingDir, "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m,mode=1777", "--tmpfs", "/home/runner:rw,nosuid,nodev,size=256m,mode=0700,uid=" + uid + ",gid=" + gid}
-	if !inMounts("/workspace", plan) {
-		args = append(args, "--tmpfs", "/workspace:rw,nosuid,nodev,size=512m,mode=0700,uid="+uid+",gid="+gid)
+	uid, gid := dockerSandboxUser(os.Getuid(), os.Getgid(), len(plan.Mounts) > 0)
+	memory := spec.Resources.MemoryMiB
+	if memory <= 0 {
+		memory = 1024
+	}
+	shmMiB := sandboxShmSizeMiB(memory)
+	includeWorkspace := !inMounts("/workspace", plan)
+	tmpMiB, homeMiB, workspaceMiB := dockerTmpfsSizes(memory, includeWorkspace)
+	args := []string{
+		"run", "--rm", "-i", "--init", "--name", name,
+		"--label", "site.artex.runner=" + safeID(d.NodeID),
+		"--label", "site.artex.session=" + safeID(id),
+		"--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+		fmt.Sprintf("--shm-size=%dm", shmMiB), "--ulimit=nofile=8192:8192",
+		"--user", uid + ":" + gid, "--workdir", spec.WorkingDir,
+		"--tmpfs", fmt.Sprintf("/tmp:rw,nosuid,nodev,size=%dm,mode=1777", tmpMiB),
+		"--tmpfs", fmt.Sprintf("/home/runner:rw,nosuid,nodev,size=%dm,mode=0700,uid=%s,gid=%s", homeMiB, uid, gid),
+	}
+	if includeWorkspace {
+		args = append(args, "--tmpfs", fmt.Sprintf("/workspace:rw,nosuid,nodev,size=%dm,mode=0700,uid=%s,gid=%s", workspaceMiB, uid, gid))
 	}
 	if d.Network != "" {
 		args = append(args, "--network", d.Network)
@@ -65,10 +120,6 @@ func (d *DockerExecutor) DockerArgs(id string, spec runner.RunSpec, plan runnerf
 		cpus = 1000
 	}
 	args = append(args, "--cpus", strconv.FormatFloat(float64(cpus)/1000, 'f', 3, 64))
-	memory := spec.Resources.MemoryMiB
-	if memory <= 0 {
-		memory = 1024
-	}
 	args = append(args, "--memory", strconv.FormatInt(memory, 10)+"m", "--memory-swap", strconv.FormatInt(memory, 10)+"m")
 	if len(gpus) > 0 {
 		for _, id := range gpus {
@@ -312,6 +363,10 @@ func startRPC(cmd *exec.Cmd, stop func() error, log io.Writer) (*rpcSandbox, err
 		for sc.Scan() {
 			var r SandboxReply
 			if e := json.Unmarshal(sc.Bytes(), &r); e != nil {
+				_ = stdout.Close()
+				_ = s.stdin.Close()
+				s.killOnce.Do(func() { _ = killProcess(cmd) })
+				_ = cmd.Wait()
 				s.finish(fmt.Errorf("sandbox emitted invalid JSON"))
 				return
 			}

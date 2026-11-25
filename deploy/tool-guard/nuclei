@@ -1,0 +1,178 @@
+#!/bin/sh
+# nuclei 网络与资源护栏包装器（POSIX /bin/sh，LF 换行）
+#
+# 容器内 /usr/local/bin/nuclei 由 deploy/container-tools/nuclei.py 实现同等护栏；
+# 本脚本供非容器部署或宿主机 PATH 覆盖使用，与 nuclei.py 保持完全一致的参数限制。
+#
+# 强制上限（均可通过 ARTEX_NUCLEI_MAX_* 覆盖）：
+#   -rl/-rate-limit  <= 30 (缺省注入 -rl 25)
+#   -c/-concurrency  <= 10 (缺省注入 -c 10)
+#   -bs/-bulk-size   <= 10 (缺省注入 -bs 10)
+#   -timeout         <= 10 (缺省注入 -timeout 10)
+#   -retries         <= 1  (缺省注入 -retries 1)
+#   -headless/-hl    禁止（除非 ARTEX_ALLOW_NUCLEI_HEADLESS=1）
+set -u
+
+_self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+if [ -n "${ARTEX_TOOL_GUARD_COMMON:-}" ] && [ -r "$ARTEX_TOOL_GUARD_COMMON" ]; then
+  . "$ARTEX_TOOL_GUARD_COMMON"
+elif [ -r "/usr/local/lib/artex-guard/guard-common.sh" ]; then
+  . "/usr/local/lib/artex-guard/guard-common.sh"
+elif [ -r "$_self_dir/guard-common.sh" ]; then
+  . "$_self_dir/guard-common.sh"
+else
+  printf 'tool-guard(nuclei): guard-common.sh not found\n' >&2
+  exit 127
+fi
+
+DEBUG="${ARTEX_TOOL_GUARD_DEBUG:-}"
+LOG="${ARTEX_TOOL_GUARD_LOG:-}"
+
+for _a in "$@"; do
+  case "$_a" in
+    --) break ;;
+    -version|--version|-h|-help|--help)
+      REAL=""
+      [ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin nuclei "$0" "/usr/local/libexec/artex/nuclei") || exit $?; }
+      guard_exec nuclei "$REAL" "$LOG" "$DEBUG" "$@"
+      ;;
+  esac
+done
+
+MAX_RL=$(guard_env_max "${ARTEX_NUCLEI_MAX_RL:-}" 30 1)
+DEF_RL=$(guard_effective_default 25 "$MAX_RL")
+MAX_C=$(guard_env_max "${ARTEX_NUCLEI_MAX_CONCURRENCY:-}" 10 1)
+DEF_C=$(guard_effective_default 10 "$MAX_C")
+MAX_BS=$(guard_env_max "${ARTEX_NUCLEI_MAX_BULK_SIZE:-}" 10 1)
+DEF_BS=$(guard_effective_default 10 "$MAX_BS")
+MAX_TIMEOUT=$(guard_env_max "${ARTEX_NUCLEI_MAX_TIMEOUT:-}" 10 1)
+DEF_TIMEOUT=$(guard_effective_default 10 "$MAX_TIMEOUT")
+MAX_RETRIES=$(guard_env_max "${ARTEX_NUCLEI_MAX_RETRIES:-}" 1 0)
+DEF_RETRIES=$(guard_effective_default 1 "$MAX_RETRIES")
+ALLOW_HEADLESS="${ARTEX_ALLOW_NUCLEI_HEADLESS:-0}"
+
+seen_rl=0
+seen_c=0
+seen_bs=0
+seen_timeout=0
+seen_retries=0
+passthrough_rest=0
+
+_rem=$#
+while [ "$_rem" -gt 0 ]; do
+  _arg="$1"
+  shift
+  _rem=$((_rem - 1))
+
+  if [ "$passthrough_rest" = 1 ]; then
+    set -- "$@" "$_arg"
+    continue
+  fi
+
+  case "$_arg" in
+    --)
+      passthrough_rest=1
+      set -- "$@" "$_arg"
+      ;;
+    -headless|--headless|-headless=*|--headless=*|-hl|--hl|-hl=*|--hl=*)
+      if [ "$ALLOW_HEADLESS" != "1" ]; then
+        printf '%s\n' "nuclei headless mode is disabled by resource guard; use Browser MCP" >&2
+        exit 2
+      fi
+      set -- "$@" "$_arg"
+      ;;
+    -rl|--rl|-rate-limit|--rate-limit)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RL" "$DEF_RL" 1)
+        set -- "$@" "-rl" "$_clamped"
+        seen_rl=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -rl=*|--rl=*|-rate-limit=*|--rate-limit=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RL" "$DEF_RL" 1)
+      set -- "$@" "-rl=$_clamped"
+      seen_rl=1
+      ;;
+    -c|--c|-concurrency|--concurrency)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_C" "$DEF_C" 1)
+        set -- "$@" "-c" "$_clamped"
+        seen_c=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -c=*|--c=*|-concurrency=*|--concurrency=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_C" "$DEF_C" 1)
+      set -- "$@" "-c=$_clamped"
+      seen_c=1
+      ;;
+    -bs|--bs|-bulk-size|--bulk-size)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_BS" "$DEF_BS" 1)
+        set -- "$@" "-bs" "$_clamped"
+        seen_bs=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -bs=*|--bs=*|-bulk-size=*|--bulk-size=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_BS" "$DEF_BS" 1)
+      set -- "$@" "-bs=$_clamped"
+      seen_bs=1
+      ;;
+    -timeout|--timeout)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT" 1)
+        set -- "$@" "-timeout" "$_clamped"
+        seen_timeout=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -timeout=*|--timeout=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT" 1)
+      set -- "$@" "-timeout=$_clamped"
+      seen_timeout=1
+      ;;
+    -retries|--retries)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RETRIES" "$DEF_RETRIES" 0)
+        set -- "$@" "-retries" "$_clamped"
+        seen_retries=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -retries=*|--retries=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RETRIES" "$DEF_RETRIES" 0)
+      set -- "$@" "-retries=$_clamped"
+      seen_retries=1
+      ;;
+    *)
+      set -- "$@" "$_arg"
+      ;;
+  esac
+done
+
+[ "$seen_retries" = 0 ] && set -- -retries "$DEF_RETRIES" "$@"
+[ "$seen_timeout" = 0 ] && set -- -timeout "$DEF_TIMEOUT" "$@"
+[ "$seen_bs" = 0 ]      && set -- -bs "$DEF_BS" "$@"
+[ "$seen_c" = 0 ]       && set -- -c "$DEF_C" "$@"
+[ "$seen_rl" = 0 ]      && set -- -rl "$DEF_RL" "$@"
+
+REAL=""
+[ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin nuclei "$0" "/usr/local/libexec/artex/nuclei") || exit $?; }
+guard_exec nuclei "$REAL" "$LOG" "$DEBUG" "$@"

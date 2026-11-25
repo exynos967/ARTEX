@@ -37,6 +37,22 @@ spec:
         - name: postgres
           image: postgres:16.14-alpine
           imagePullPolicy: IfNotPresent
+          args:
+            - postgres
+            - -c
+            - max_connections=40
+            - -c
+            - shared_buffers=128MB
+            - -c
+            - work_mem=4MB
+            - -c
+            - maintenance_work_mem=48MB
+            - -c
+            - max_parallel_workers=2
+            - -c
+            - max_parallel_workers_per_gather=1
+          securityContext:
+            allowPrivilegeEscalation: false
           env:
             - name: POSTGRES_USER
               value: artex

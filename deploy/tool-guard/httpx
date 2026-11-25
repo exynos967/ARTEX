@@ -1,0 +1,145 @@
+#!/bin/sh
+# httpx 网络与资源护栏包装器（POSIX /bin/sh，LF 换行）
+#
+# 强制上限（均可通过 ARTEX_HTTPX_MAX_* 覆盖）：
+#   -rl/-rate-limit <= 50 (缺省注入 -rl 40)
+#   -t/-threads     <= 20 (缺省注入 -t 15)
+#   -timeout        <= 10 (缺省注入 -timeout 10)
+#   -retries        <= 1  (缺省注入 -retries 1)
+set -u
+
+_self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+if [ -n "${ARTEX_TOOL_GUARD_COMMON:-}" ] && [ -r "$ARTEX_TOOL_GUARD_COMMON" ]; then
+  . "$ARTEX_TOOL_GUARD_COMMON"
+elif [ -r "/usr/local/lib/artex-guard/guard-common.sh" ]; then
+  . "/usr/local/lib/artex-guard/guard-common.sh"
+elif [ -r "$_self_dir/guard-common.sh" ]; then
+  . "$_self_dir/guard-common.sh"
+else
+  printf 'tool-guard(httpx): guard-common.sh not found\n' >&2
+  exit 127
+fi
+
+DEBUG="${ARTEX_TOOL_GUARD_DEBUG:-}"
+LOG="${ARTEX_TOOL_GUARD_LOG:-}"
+
+for _a in "$@"; do
+  case "$_a" in
+    --) break ;;
+    -version|--version|-h|-help|--help)
+      REAL=""
+      [ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin httpx "$0") || exit $?; }
+      guard_exec httpx "$REAL" "$LOG" "$DEBUG" "$@"
+      ;;
+  esac
+done
+
+MAX_RL=$(guard_env_max "${ARTEX_HTTPX_MAX_RL:-}" 50 1)
+DEF_RL=$(guard_effective_default 40 "$MAX_RL")
+MAX_T=$(guard_env_max "${ARTEX_HTTPX_MAX_THREADS:-}" 20 1)
+DEF_T=$(guard_effective_default 15 "$MAX_T")
+MAX_TIMEOUT=$(guard_env_max "${ARTEX_HTTPX_MAX_TIMEOUT:-}" 10 1)
+DEF_TIMEOUT=$(guard_effective_default 10 "$MAX_TIMEOUT")
+MAX_RETRIES=$(guard_env_max "${ARTEX_HTTPX_MAX_RETRIES:-}" 1 0)
+DEF_RETRIES=$(guard_effective_default 1 "$MAX_RETRIES")
+
+seen_rl=0
+seen_t=0
+seen_timeout=0
+seen_retries=0
+passthrough_rest=0
+
+_rem=$#
+while [ "$_rem" -gt 0 ]; do
+  _arg="$1"
+  shift
+  _rem=$((_rem - 1))
+
+  if [ "$passthrough_rest" = 1 ]; then
+    set -- "$@" "$_arg"
+    continue
+  fi
+
+  case "$_arg" in
+    --)
+      passthrough_rest=1
+      set -- "$@" "$_arg"
+      ;;
+    -rl|--rl|-rate-limit|--rate-limit)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RL" "$DEF_RL" 1)
+        set -- "$@" "-rl" "$_clamped"
+        seen_rl=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -rl=*|--rl=*|-rate-limit=*|--rate-limit=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RL" "$DEF_RL" 1)
+      set -- "$@" "-rl=$_clamped"
+      seen_rl=1
+      ;;
+    -t|--t|-threads|--threads)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_T" "$DEF_T" 1)
+        set -- "$@" "-t" "$_clamped"
+        seen_t=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -t=*|--t=*|-threads=*|--threads=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_T" "$DEF_T" 1)
+      set -- "$@" "-t=$_clamped"
+      seen_t=1
+      ;;
+    -timeout|--timeout)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT" 1)
+        set -- "$@" "-timeout" "$_clamped"
+        seen_timeout=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -timeout=*|--timeout=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT" 1)
+      set -- "$@" "-timeout=$_clamped"
+      seen_timeout=1
+      ;;
+    -retries|--retries)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RETRIES" "$DEF_RETRIES" 0)
+        set -- "$@" "-retries" "$_clamped"
+        seen_retries=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -retries=*|--retries=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RETRIES" "$DEF_RETRIES" 0)
+      set -- "$@" "-retries=$_clamped"
+      seen_retries=1
+      ;;
+    *)
+      set -- "$@" "$_arg"
+      ;;
+  esac
+done
+
+[ "$seen_retries" = 0 ] && set -- -retries "$DEF_RETRIES" "$@"
+[ "$seen_timeout" = 0 ] && set -- -timeout "$DEF_TIMEOUT" "$@"
+[ "$seen_t" = 0 ]       && set -- -t "$DEF_T" "$@"
+[ "$seen_rl" = 0 ]      && set -- -rl "$DEF_RL" "$@"
+
+REAL=""
+[ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin httpx "$0") || exit $?; }
+guard_exec httpx "$REAL" "$LOG" "$DEBUG" "$@"

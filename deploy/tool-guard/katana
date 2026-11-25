@@ -1,41 +1,190 @@
-#!/usr/bin/bash
-# katana 资源护栏 shim
+#!/bin/sh
+# katana 网络与资源护栏包装器（POSIX /bin/sh，LF 换行）
 #
-# 作用：无论调用方（LLM 规划、脚本、人工）传入什么参数，都会在真正执行前强制：
-#   -concurrency/-c  -> 3
-#   -depth/-d        -> 2
-#   -jsluice         -> 剥离（该参数会把每个 JS 响应体留在内存中）
-#
-# 背景：katana -jsluice -d 3 -c 10 曾在 31GB 宿主上单进程占用 25.8GB RSS，
-#       导致内存耗尽、整机失去响应，只能硬断电恢复。
-#       详见同目录 README.md。
+# 强制上限（均可通过 ARTEX_KATANA_MAX_* 覆盖）：
+#   -c/-concurrency <= 4  (缺省注入 -c 3)
+#   -p/-parallelism <= 4  (缺省注入 -p 3)
+#   -d/-depth       <= 2  (缺省注入 -d 2)
+#   -rl/-rate-limit <= 20 (缺省注入 -rl 15)
+#   -timeout        <= 10 (缺省注入 -timeout 10)
+#   -headless/-hl/-system-chrome 禁止（除非 ARTEX_ALLOW_KATANA_HEADLESS=1）
+#   -jsluice 剥离（除非 ARTEX_ALLOW_KATANA_JSLUICE=1，避免单进程 OOM）
 set -u
 
-LOG="${KATANA_SHIM_LOG:-/opt/artex-shim/logs/katana.log}"
-REAL=/usr/local/bin/katana
-MAX_CONCURRENCY=3
-MAX_DEPTH=2
+_self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+if [ -n "${ARTEX_TOOL_GUARD_COMMON:-}" ] && [ -r "$ARTEX_TOOL_GUARD_COMMON" ]; then
+  . "$ARTEX_TOOL_GUARD_COMMON"
+elif [ -r "/usr/local/lib/artex-guard/guard-common.sh" ]; then
+  . "/usr/local/lib/artex-guard/guard-common.sh"
+elif [ -r "$_self_dir/guard-common.sh" ]; then
+  . "$_self_dir/guard-common.sh"
+else
+  printf 'tool-guard(katana): guard-common.sh not found\n' >&2
+  exit 127
+fi
 
-args=()
-skip=0
-for a in "$@"; do
-  if [ "$skip" = "1" ]; then skip=0; continue; fi
-  case "$a" in
-    -c|-concurrency)      args+=("-c" "$MAX_CONCURRENCY"); skip=1 ;;
-    -d|-depth)            args+=("-d" "$MAX_DEPTH"); skip=1 ;;
-    -c=*|-concurrency=*)  args+=("-c=$MAX_CONCURRENCY") ;;
-    -d=*|-depth=*)        args+=("-d=$MAX_DEPTH") ;;
-    -jsluice|--jsluice)   ;;
-    *)                    args+=("$a") ;;
+DEBUG="${ARTEX_TOOL_GUARD_DEBUG:-${KATANA_SHIM_DEBUG:-}}"
+LOG="${ARTEX_TOOL_GUARD_LOG:-${KATANA_SHIM_LOG:-}}"
+
+# 1) 帮助/版本查询直接透传（仅扫描 -- 之前的选项）
+for _a in "$@"; do
+  case "$_a" in
+    --) break ;;
+    -version|--version|-h|-help|--help)
+      REAL=""
+      [ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin katana "$0") || exit $?; }
+      guard_exec katana "$REAL" "$LOG" "$DEBUG" "$@"
+      ;;
   esac
 done
 
-if [ -n "${KATANA_SHIM_DEBUG:-}" ]; then
-  printf 'katana.shim argv:'
-  printf ' %s' "${args[@]}"
-  printf '\n'
-  exit 0
-fi
+# 2) 计算生效上限与默认注入值
+MAX_C=$(guard_env_max "${ARTEX_KATANA_MAX_CONCURRENCY:-}" 4 1)
+DEF_C=$(guard_effective_default 3 "$MAX_C")
+MAX_P=$(guard_env_max "${ARTEX_KATANA_MAX_PARALLELISM:-}" 4 1)
+DEF_P=$(guard_effective_default 3 "$MAX_P")
+MAX_D=$(guard_env_max "${ARTEX_KATANA_MAX_DEPTH:-}" 2 1)
+DEF_D=$(guard_effective_default 2 "$MAX_D")
+MAX_RL=$(guard_env_max "${ARTEX_KATANA_MAX_RL:-}" 20 1)
+DEF_RL=$(guard_effective_default 15 "$MAX_RL")
+MAX_TIMEOUT=$(guard_env_max "${ARTEX_KATANA_MAX_TIMEOUT:-}" 10 1)
+DEF_TIMEOUT=$(guard_effective_default 10 "$MAX_TIMEOUT")
 
-{ date -u +%FT%TZ; printf '  '; printf '%s ' "${args[@]}"; printf '\n'; } >> "$LOG" 2>/dev/null || true
-exec "$REAL" "${args[@]}"
+ALLOW_HEADLESS="${ARTEX_ALLOW_KATANA_HEADLESS:-0}"
+ALLOW_JSLUICE="${ARTEX_ALLOW_KATANA_JSLUICE:-0}"
+
+# 3) POSIX 无数组环形队列参数改写：完整保留空格/引号/通配符
+seen_c=0
+seen_p=0
+seen_d=0
+seen_rl=0
+seen_timeout=0
+passthrough_rest=0
+
+_rem=$#
+while [ "$_rem" -gt 0 ]; do
+  _arg="$1"
+  shift
+  _rem=$((_rem - 1))
+
+  if [ "$passthrough_rest" = 1 ]; then
+    set -- "$@" "$_arg"
+    continue
+  fi
+
+  case "$_arg" in
+    --)
+      passthrough_rest=1
+      set -- "$@" "$_arg"
+      ;;
+    -headless|--headless|-headless=*|--headless=*|-hl|--hl|-hl=*|--hl=*|-system-chrome|--system-chrome|-system-chrome=*|--system-chrome=*)
+      if [ "$ALLOW_HEADLESS" != "1" ]; then
+        printf '%s\n' "katana headless mode is disabled by resource guard; use Browser MCP" >&2
+        exit 2
+      fi
+      set -- "$@" "$_arg"
+      ;;
+    -jsluice|--jsluice|-jsluice=*|--jsluice=*)
+      if [ "$ALLOW_JSLUICE" = "1" ]; then
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -c|--c|-concurrency|--concurrency)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_C" "$DEF_C" 1)
+        set -- "$@" "-c" "$_clamped"
+        seen_c=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -c=*|--c=*|-concurrency=*|--concurrency=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_C" "$DEF_C" 1)
+      set -- "$@" "-c=$_clamped"
+      seen_c=1
+      ;;
+    -p|--p|-parallelism|--parallelism)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_P" "$DEF_P" 1)
+        set -- "$@" "-p" "$_clamped"
+        seen_p=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -p=*|--p=*|-parallelism=*|--parallelism=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_P" "$DEF_P" 1)
+      set -- "$@" "-p=$_clamped"
+      seen_p=1
+      ;;
+    -d|--d|-depth|--depth)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_D" "$DEF_D" 1)
+        set -- "$@" "-d" "$_clamped"
+        seen_d=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -d=*|--d=*|-depth=*|--depth=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_D" "$DEF_D" 1)
+      set -- "$@" "-d=$_clamped"
+      seen_d=1
+      ;;
+    -rl|--rl|-rate-limit|--rate-limit)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_RL" "$DEF_RL" 1)
+        set -- "$@" "-rl" "$_clamped"
+        seen_rl=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -rl=*|--rl=*|-rate-limit=*|--rate-limit=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_RL" "$DEF_RL" 1)
+      set -- "$@" "-rl=$_clamped"
+      seen_rl=1
+      ;;
+    -timeout|--timeout)
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        _clamped=$(guard_clamp_int "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT" 1)
+        set -- "$@" "-timeout" "$_clamped"
+        seen_timeout=1
+      else
+        set -- "$@" "$_arg"
+      fi
+      ;;
+    -timeout=*|--timeout=*)
+      _val="${_arg#*=}"
+      _clamped=$(guard_clamp_int "$_val" "$MAX_TIMEOUT" "$DEF_TIMEOUT" 1)
+      set -- "$@" "-timeout=$_clamped"
+      seen_timeout=1
+      ;;
+    *)
+      set -- "$@" "$_arg"
+      ;;
+  esac
+done
+
+# 4) 缺失参数前置注入安全默认值（位于任何位置参数与 -- 之前），
+#    并在禁用 headless/jsluice 时显式传入 =false，防止 -config YAML 静默重开。
+[ "$ALLOW_JSLUICE" != "1" ]  && set -- -jsluice=false "$@"
+[ "$ALLOW_HEADLESS" != "1" ] && set -- -headless=false "$@"
+[ "$seen_timeout" = 0 ] && set -- -timeout "$DEF_TIMEOUT" "$@"
+[ "$seen_rl" = 0 ]      && set -- -rl "$DEF_RL" "$@"
+[ "$seen_d" = 0 ]       && set -- -d "$DEF_D" "$@"
+[ "$seen_p" = 0 ]       && set -- -p "$DEF_P" "$@"
+[ "$seen_c" = 0 ]       && set -- -c "$DEF_C" "$@"
+
+REAL=""
+[ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin katana "$0") || exit $?; }
+guard_exec katana "$REAL" "$LOG" "$DEBUG" "$@"
