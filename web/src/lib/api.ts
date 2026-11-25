@@ -3,11 +3,12 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import { mutationInvalidationKeys } from "@/lib/api-cache";
+import { apiCache, clearApiCache, invalidateApiData, syncApiSession } from "@/lib/api-refresh";
 import type { ChatMention } from "@/lib/chat-mentions";
 import type { MainChatStatus } from "@/lib/main-sessions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
-import { apiCache, clearApiCache, invalidateApiData, syncApiSession } from "@/lib/api-refresh";
 import type {
   MainRequest,
   ActiveFindingRetest,
@@ -64,6 +65,7 @@ import type {
   LLMRetryOverride,
   LLMRetryPolicy,
   LLMTask,
+  LogLine,
   MCPServer,
   MCPTool,
   MissingSkill,
@@ -114,6 +116,13 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
+export { mutationInvalidationKeys };
+
+function invalidateMutation(path: string): void {
+  const keys = mutationInvalidationKeys(path);
+  if (keys === undefined || keys.length > 0) invalidateApiData(keys);
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getToken();
   syncApiSession(token);
@@ -121,7 +130,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const load = async (): Promise<T> => {
     if (MOCK) {
       const data = await mockHandle<T>(method, path, init?.body ?? null);
-      if (method !== "GET" && method !== "HEAD") invalidateApiData();
+      if (method !== "GET" && method !== "HEAD") invalidateMutation(path);
       return data;
     }
     const r = await fetch(`/api${path}`, {
@@ -154,7 +163,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       }
       throw new Error(message);
     }
-    if (method !== "GET" && method !== "HEAD") invalidateApiData();
+    if (method !== "GET" && method !== "HEAD") invalidateMutation(path);
     if (r.status === 204) return undefined as T;
     return r.json();
   };
@@ -331,7 +340,15 @@ export const api = {
       llm_profile_ids: llmProfileIds,
       active_llm_profile_id: activeLLMProfileId ?? null,
     }),
-  deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
+  deleteTask: (id: string, options: DeleteTaskOptions) =>
+    del<DeleteTaskResult>(`/tasks/${id}`, options).then((result) => {
+      const extra: string[] = [];
+      if (options.delete_assets) extra.push("/assets", "/companies");
+      if (options.delete_traffic) extra.push("/traffic");
+      if (options.delete_llm_records) extra.push("/llm/records", "/tokens");
+      if (extra.length > 0) invalidateApiData(extra);
+      return result;
+    }),
   controlTask: (id: string, action: "pause" | "resume") =>
     post<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/control`, { action }),
   mainRequests: (id: string) => get<MainRequest[]>(`/tasks/${id}/main-requests`),
@@ -753,8 +770,9 @@ export const api = {
       cursor: r.cursor ?? 0,
     }));
   },
-  activityDetail: (id: number, task?: string) => get<{ detail: string }>(`/exploration/activity/${id}${tq(task)}`),
-  // Reverse-paginated session history. session = "main" | "plan" | "intent:<id>".
+  activityDetail: (id: number, task?: string) =>
+    http<{ detail: string }>(`/exploration/activity/${id}${tq(task)}`, { cache: "no-store" }),
+  // Reverse-paginated session history. session = "main" | "main:<seg>" | "plan" | "system" | "intent:<id>".
   // before=0 → latest page; before=<id> → the older page ending before that id.
   // snapshotCursor is the TASK-level max id at query time — open the task SSE at
   // since=snapshotCursor so history (id≤cursor) and the live tail (id>cursor) meet
@@ -830,7 +848,8 @@ export const api = {
         (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
         (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
     ),
-  trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
+  trafficExchange: (id: string) =>
+    http<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`, { cache: "no-store" }),
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
@@ -1065,7 +1084,7 @@ export const api = {
     ).then((r) => ({ items: arr(r.items), cursor: r.cursor ?? 0, running: !!r.running, hasMore: !!r.hasMore }));
   },
   conversationMsgDetail: (id: number, seq: number) =>
-    get<{ detail: string }>(`/conversations/${id}/messages/${seq}`).then((r) => r.detail ?? ""),
+    http<{ detail: string }>(`/conversations/${id}/messages/${seq}`, { cache: "no-store" }).then((r) => r.detail ?? ""),
   sendConversationMessage: (id: number, message: string, attachments?: ChatAttachment[]) =>
     post<{ status: string }>(`/conversations/${id}/messages`, { message, attachments }),
   stopConversation: (id: number) => post<{ status: string }>(`/conversations/${id}/stop`, {}),
@@ -1266,6 +1285,10 @@ export const api = {
     })),
   interceptTask: (taskId: string) =>
     get<{ items: InterceptApprovalRow[] }>(`/intercept/task/${taskId}`).then((r) => arr(r.items)),
+  interceptTaskPending: (taskId: string) =>
+    get<{ items: InterceptApprovalRow[]; total?: number; page?: number; page_size?: number }>(
+      `/intercept/task/${encodeURIComponent(taskId)}?status=pending&page=1&size=100`,
+    ).then((r) => arr(r.items)),
   interceptTaskPage: (taskId: string, page = 1, size = 20, filter: InterceptApprovalFilter = {}) =>
     get<{ items: InterceptApprovalRow[]; total?: number }>(
       `/intercept/task/${encodeURIComponent(taskId)}?${interceptPageQuery(page, size, filter)}`,
@@ -1316,13 +1339,22 @@ export const api = {
     sp.set("size", String(params?.size ?? 50));
     return get<{ records: LLMRecordItem[]; total: number }>(`/llm/records?${sp}`);
   },
-  llmRecordDetail: (id: number) => get<LLMRecordDetail>(`/llm/records/${id}`),
+  llmRecordDetail: (id: number) => http<LLMRecordDetail>(`/llm/records/${id}`, { cache: "no-store" }),
   llmTasks: () => get<{ tasks: LLMTask[] }>(`/llm/records/tasks`),
   llmRecordsDeleteTask: (task: string) => del<{ deleted: number }>(`/llm/records?task=${encodeURIComponent(task)}`),
   // 按模型聚合本任务的 token 用量（来自常开的 llm_usage 计量账本，逐次调用精确，
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- 系统日志 ----
+  logsHistory: (before = 0, limit = 200) => {
+    const sp = new URLSearchParams({ limit: String(limit) });
+    if (before > 0) sp.set("before", String(before));
+    return http<{ items?: LogLine[]; has_more?: boolean }>(`/logs/history?${sp.toString()}`, {
+      cache: "no-store",
+    }).then((r) => ({ items: arr(r?.items), has_more: Boolean(r?.has_more) }));
+  },
 
   // ---- 一键更新 ----
   // 检查以后端为准：下载是后端做的，浏览器能连 GitHub 而服务器连不上的情况很常见

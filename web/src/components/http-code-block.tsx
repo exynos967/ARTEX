@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn, copyText } from "@/lib/utils";
+import { CODE_PREVIEW_THRESHOLD_BYTES, buildCodePreview } from "@/lib/view-guards";
 
 function statusTone(status: number) {
   if (status >= 500) return "text-red-500";
@@ -114,11 +115,23 @@ function HighlightedBody({ body, format }: { body: string; format: BodyFormat })
 export function HttpCodeBlock({ raw }: { raw: string }) {
   const [wrapLines, setWrapLines] = React.useState(true);
   const [copied, setCopied] = React.useState(false);
+  const [expandedForRaw, setExpandedForRaw] = React.useState<string | null>(null);
+  const showFullPlain = expandedForRaw === raw;
   const value = raw || "（空）";
-  const lines = value.replaceAll("\r\n", "\n").split("\n");
-  const separator = lines.indexOf("");
-  const body = separator >= 0 ? lines.slice(separator + 1).join("\n") : "";
-  const bodyFormat = detectBodyFormat(body);
+  const previewInfo = React.useMemo(
+    () => buildCodePreview(value, CODE_PREVIEW_THRESHOLD_BYTES),
+    [value],
+  );
+
+  // Only split and run syntax highlighting when the payload is below the 64 KiB guard.
+  const parsed = React.useMemo(() => {
+    if (previewInfo.isLarge) return null;
+    const lines = value.replaceAll("\r\n", "\n").split("\n");
+    const separator = lines.indexOf("");
+    const body = separator >= 0 ? lines.slice(separator + 1).join("\n") : "";
+    const bodyFormat = detectBodyFormat(body);
+    return { lines, separator, bodyFormat };
+  }, [previewInfo.isLarge, value]);
 
   React.useEffect(() => {
     if (!copied) return;
@@ -136,15 +149,18 @@ export function HttpCodeBlock({ raw }: { raw: string }) {
   };
 
   const renderLine = (line: string, index: number) => {
+    if (!parsed) return line;
     if (index === 0) return <StartLine line={line} />;
-    if (separator < 0 || index < separator) return <HeaderLine line={line} />;
-    if (index === separator) return null;
-    return <HighlightedBody body={line} format={bodyFormat} />;
+    if (parsed.separator < 0 || index < parsed.separator) return <HeaderLine line={line} />;
+    if (index === parsed.separator) return null;
+    return <HighlightedBody body={line} format={parsed.bodyFormat} />;
   };
+
+  const sizeKB = Math.max(1, Math.ceil(previewInfo.totalChars / 1024));
 
   return (
     <div className="relative mx-3 my-4 overflow-hidden rounded-md border bg-background shadow-xs">
-      <div className="absolute top-2 right-2 flex items-center gap-0.5 rounded-md border bg-background/95 p-0.5 shadow-xs">
+      <div className="absolute top-2 right-2 z-10 flex items-center gap-0.5 rounded-md border bg-background/95 p-0.5 shadow-xs">
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -175,6 +191,23 @@ export function HttpCodeBlock({ raw }: { raw: string }) {
           <TooltipContent side="bottom">{copied ? "已复制" : "复制报文"}</TooltipContent>
         </Tooltip>
       </div>
+      {previewInfo.isLarge && (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/40 px-3 py-1.5 pr-20 text-xs text-muted-foreground">
+          <span>
+            内容较大 ({sizeKB} KB)，已切换为纯文本预览以防卡顿
+            {!showFullPlain && `（已省略剩余 ${previewInfo.truncatedChars.toLocaleString()} 字符）`}
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-6 px-2 text-xs"
+            onClick={() => setExpandedForRaw((current) => (current === raw ? null : raw))}
+          >
+            {showFullPlain ? "收起为 64 KB 预览" : "展开全部纯文本"}
+          </Button>
+        </div>
+      )}
       {/* biome-ignore lint/a11y/useSemanticElements: textarea cannot preserve line numbers and syntax-highlighting markup. */}
       <div
         role="textbox"
@@ -194,22 +227,33 @@ export function HttpCodeBlock({ raw }: { raw: string }) {
           selection.addRange(range);
         }}
       >
-        {lines.map((line, index) => (
-          <div
-            key={`${index}-${line}`}
-            data-line={index + 1}
-            className="grid min-w-0 grid-cols-[1.5rem_minmax(0,1fr)] leading-relaxed before:sticky before:left-0 before:self-stretch before:border-r before:bg-muted/20 before:px-1 before:text-right before:text-muted-foreground/60 before:content-[attr(data-line)]"
+        {previewInfo.isLarge ? (
+          <pre
+            className={cn(
+              "min-w-0 px-3 leading-relaxed [tab-size:4]",
+              wrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
+            )}
           >
-            <code
-              className={cn(
-                "min-h-[1lh] min-w-0 pr-16 pl-1.5 [tab-size:4]",
-                wrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
-              )}
+            {showFullPlain ? value : previewInfo.preview}
+          </pre>
+        ) : (
+          parsed?.lines.map((line, index) => (
+            <div
+              key={`${index}-${line}`}
+              data-line={index + 1}
+              className="grid min-w-0 grid-cols-[1.5rem_minmax(0,1fr)] leading-relaxed before:sticky before:left-0 before:self-stretch before:border-r before:bg-muted/20 before:px-1 before:text-right before:text-muted-foreground/60 before:content-[attr(data-line)]"
             >
-              {renderLine(line, index)}
-            </code>
-          </div>
-        ))}
+              <code
+                className={cn(
+                  "min-h-[1lh] min-w-0 pr-16 pl-1.5 [tab-size:4]",
+                  wrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
+                )}
+              >
+                {renderLine(line, index)}
+              </code>
+            </div>
+          ))
+        )}
       </div>
     </div>
   );

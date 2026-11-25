@@ -81,6 +81,14 @@ import type {
   TokenTotal,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import {
+  DEFAULT_MAX_LOADED_SESSIONS,
+  DEFAULT_NORMAL_ITEM_CAP,
+  DEFAULT_SCROLLED_ITEM_CAP,
+  pruneSessionStoreLRU,
+  touchAccessOrder,
+  trimBoundedItems,
+} from "@/lib/view-guards";
 
 // resolutionLabel names the LLM a session runs on. The badge shows this alone and
 // keeps the model id in its tooltip. Env-backed configs can arrive without a name,
@@ -108,8 +116,9 @@ function fmtBytes(n: number): string {
 //     so refresh / tab-switch / sleep / reconnect never drop the newest records.
 
 const PAGE = 200; // history page size
-const SYSTEM_SCAN_PAGE = 500; // generic activity pages scanned to recover sparse system audit events
-const MAX_KEEP = 4000; // per-session in-memory cap; older pages re-fetched on scroll-up
+const NORMAL_KEEP = DEFAULT_NORMAL_ITEM_CAP; // 2000 when pinned to bottom
+const SCROLLED_KEEP = DEFAULT_SCROLLED_ITEM_CAP; // 4000 hard cap even when scrolled up
+const MAX_LOADED_SESSIONS = DEFAULT_MAX_LOADED_SESSIONS; // LRU limit for cached loaded sessions
 const STREAM_WINDOW_MS = 5000; // "live" = activity seen within this window
 const MAX_WORKER_MESSAGE_CHARS = 4000;
 
@@ -245,6 +254,33 @@ function fmtDuration(ms: number): string {
   return `${h}h${String(m % 60).padStart(2, "0")}m`;
 }
 
+// Isolated ticking badge so live elapsed duration updates every 1.5s without
+// re-rendering the entire SessionsTab tree.
+const RunDurationBadge = React.memo(function RunDurationBadge({
+  startMs,
+  endMs,
+  live,
+}: {
+  startMs: number;
+  endMs: number;
+  live: boolean;
+}) {
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (!live) return;
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), 1500);
+    return () => clearInterval(id);
+  }, [live]);
+  const duration = Math.max(0, (live ? nowMs : endMs) - startMs);
+  return (
+    <span className="inline-flex items-center gap-1" title="运行时长（首步 → 末步）">
+      <ClockIcon className="size-3" />
+      {fmtDuration(duration)}
+    </span>
+  );
+});
+
 const roleMeta = {
   mainagent: { label: "主 Agent", icon: UserIcon },
   planner: { label: "规划 Planner", icon: BrainIcon },
@@ -289,9 +325,9 @@ const PLANNER_SESSION: Session = {
   last_activity: "",
 };
 
-// LLM provider switches are task-level audit events rather than agent output. The
-// history endpoint has no "system" filter, so this fixed session is populated by
-// scanning the generic incremental activity endpoint and then tailed by task SSE.
+// LLM provider switches and task-level system notices are audit events rather than
+// agent output. Backed directly by `/exploration/activity/history?session=system`
+// and tailed live by the single task SSE stream.
 const SYSTEM_ID = "s-system";
 const SYSTEM_SESSION: Session = {
   id: SYSTEM_ID,
@@ -586,7 +622,16 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       setMainSegs((prev) => [{ seq: r.seq, created_at: r.created_at }, ...prev.filter((m) => m.seq !== r.seq)]);
       setCurrentSeg(r.current ?? r.seq);
       // Seed an empty, loaded state so the new (empty) session renders immediately.
-      setStore((prev) => ({ ...prev, [mainSessionKey(r.seq)]: { ...emptyState(), loaded: true } }));
+      const newKey = mainSessionKey(r.seq);
+      accessOrderRef.current = touchAccessOrder(accessOrderRef.current, newKey);
+      setStore((prev) =>
+        pruneSessionStoreLRU(
+          { ...prev, [newKey]: { ...emptyState(), loaded: true } },
+          newKey,
+          accessOrderRef.current,
+          MAX_LOADED_SESSIONS,
+        ),
+      );
       setActiveId(mainSessionId(r.seq));
       setListOpen(false);
       setInput("");
@@ -657,10 +702,18 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [pendingIntercepts, setPendingIntercepts] = React.useState<InterceptApprovalRow[]>([]);
 
   // Refs backing SSE/loading without re-render churn.
+  const taskIdRef = React.useRef(taskId);
+  React.useLayoutEffect(() => {
+    taskIdRef.current = taskId;
+  }, [taskId]);
   const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
   const esRef = React.useRef<EventSource | null>(null);
   const activeKeyRef = React.useRef(mainSessionKey(0)); // current session key (for SSE dispatch/unread)
   const atBottomRef = React.useRef(true); // transcript pinned to bottom?
+  const revealFoldedRef = React.useRef<(() => boolean) | null>(null);
+  const registerRevealFolded = React.useCallback((fn: (() => boolean) | null) => {
+    revealFoldedRef.current = fn;
+  }, []);
   const llmToastSeqRef = React.useRef<Set<number>>(new Set());
   const chatStatusRequestRef = React.useRef(0);
   const firstIntentsRef = React.useRef<TaskNode[]>([]);
@@ -672,10 +725,21 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   // first-load effect and the active-session effect both want "main" on mount (the
   // former also opens the SSE, so it must not be pre-empted).
   const loadingKeysRef = React.useRef<Set<string>>(new Set());
+  // LRU access order for loaded sessions so inactive sessions' heavy items arrays
+  // are evicted once more than MAX_LOADED_SESSIONS (8) sessions are cached.
+  const accessOrderRef = React.useRef<string[]>([]);
 
   // ── store helpers ──────────────────────────────────────────────────────────────
   const patchStore = React.useCallback((key: string, fn: (s: SessionState) => SessionState) => {
     setStore((prev) => ({ ...prev, [key]: fn(prev[key] ?? emptyState()) }));
+  }, []);
+
+  const patchStoreAndPrune = React.useCallback((key: string, fn: (s: SessionState) => SessionState) => {
+    accessOrderRef.current = touchAccessOrder(accessOrderRef.current, key);
+    setStore((prev) => {
+      const next = { ...prev, [key]: fn(prev[key] ?? emptyState()) };
+      return pruneSessionStoreLRU(next, activeKeyRef.current, accessOrderRef.current, MAX_LOADED_SESSIONS);
+    });
   }, []);
 
   // Load a session's LATEST page (before=0) on first open. Keyed + request-token
@@ -689,62 +753,22 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       reqTokenRef.current[key] = token;
       patchStore(key, (s) => ({ ...s, loading: true, error: undefined }));
 
-      if (key === "system") {
-        void (async () => {
-          let since = 0;
-          let systemItems: Activity[] = [];
-          for (;;) {
-            const page = await api.activity(taskId, { since, limit: SYSTEM_SCAN_PAGE });
-            if (reqTokenRef.current[key] !== token) return;
-            systemItems = mergeBySeq(
-              systemItems,
-              page.items.filter(
-                (item) => item.worker === "system" || item.kind === "llm_switch" || item.kind === "llm_failover",
-              ),
-            );
-            if (page.items.length < SYSTEM_SCAN_PAGE || page.cursor <= since) break;
-            since = page.cursor;
-          }
-          patchStore(key, (s) => {
-            const items = mergeBySeq(systemItems, s.items);
-            return {
-              ...s,
-              items,
-              loaded: true,
-              loading: false,
-              hasMore: false,
-              earliestSeq: items.length ? items[0].seq : 0,
-              unread: 0,
-              lastTs: items.length ? items[items.length - 1].ts : s.lastTs,
-              error: undefined,
-            };
-          });
-        })()
-          .catch((error) => {
-            if (reqTokenRef.current[key] !== token) return;
-            patchStore(key, (s) => ({
-              ...s,
-              loading: false,
-              error: (error as Error).message || "加载失败",
-            }));
-          })
-          .finally(() => loadingKeysRef.current.delete(key));
-        return;
-      }
-
       api
         .activityHistory(taskId, key, 0, PAGE)
         .then((r) => {
           if (reqTokenRef.current[key] !== token) return; // superseded
           if (r.snapshotCursor > snapshotRef.current) snapshotRef.current = r.snapshotCursor;
-          patchStore(key, (s) => {
-            const items = mergeBySeq(r.items, s.items); // keep any live frames arrived meanwhile
+          patchStoreAndPrune(key, (s) => {
+            const merged = mergeBySeq(r.items, s.items); // keep any live frames arrived meanwhile
+            const pinnedToBottom = key !== activeKeyRef.current || atBottomRef.current;
+            const items = trimBoundedItems(merged, pinnedToBottom, NORMAL_KEEP, SCROLLED_KEEP);
+            const trimmed = items.length < merged.length;
             return {
               ...s,
               items,
               loaded: true,
               loading: false,
-              hasMore: r.hasMore,
+              hasMore: r.hasMore || trimmed,
               earliestSeq: items.length ? items[0].seq : 0,
               unread: 0,
               lastTs: items.length ? items[items.length - 1].ts : s.lastTs,
@@ -758,38 +782,76 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         })
         .finally(() => loadingKeysRef.current.delete(key));
     },
-    [taskId, patchStore],
+    [taskId, patchStore, patchStoreAndPrune],
   );
 
   // Load one older page (scroll-up) for a session, preserving scroll position.
   const loadEarlier = React.useCallback(
     (key: string, viewport: () => HTMLElement | null) => {
       const st = store[key];
-      if (!st || st.loadingMore || !st.hasMore || !st.earliestSeq) return;
+      if (!st || !st.loaded || st.loadingMore || !st.hasMore || !st.earliestSeq) return;
+      const remaining = SCROLLED_KEEP - st.items.length;
+      if (remaining <= 0) return;
+      const pageLimit = Math.min(PAGE, remaining);
       const vp = viewport();
       const prevH = vp?.scrollHeight ?? 0;
       const prevTop = vp?.scrollTop ?? 0;
+      const reqTaskId = taskId;
+      const reqTokenMap = reqTokenRef.current;
+      const reqKeyToken = reqTokenMap[key] ?? 0;
       patchStore(key, (s) => ({ ...s, loadingMore: true }));
-      api
-        .activityHistory(taskId, key, st.earliestSeq, PAGE)
+      void api
+        .activityHistory(reqTaskId, key, st.earliestSeq, pageLimit)
         .then((r) => {
-          patchStore(key, (s) => {
-            const items = mergeBySeq(r.items, s.items);
+          if (
+            taskIdRef.current !== reqTaskId ||
+            reqTokenRef.current !== reqTokenMap ||
+            (reqTokenRef.current[key] ?? 0) !== reqKeyToken
+          ) {
+            return;
+          }
+          setStore((prev) => {
+            const cur = prev[key];
+            if (!cur || !cur.loaded) return prev;
+            const merged = mergeBySeq(r.items, cur.items);
+            const items = trimBoundedItems(merged, false, NORMAL_KEEP, SCROLLED_KEEP);
+            const trimmed = items.length < merged.length;
             return {
-              ...s,
-              items,
-              loadingMore: false,
-              hasMore: r.hasMore,
-              earliestSeq: items.length ? items[0].seq : s.earliestSeq,
+              ...prev,
+              [key]: {
+                ...cur,
+                items,
+                loadingMore: false,
+                hasMore: r.hasMore || trimmed,
+                earliestSeq: items.length ? items[0].seq : cur.earliestSeq,
+              },
             };
           });
           requestAnimationFrame(() => {
+            if (
+              taskIdRef.current !== reqTaskId ||
+              reqTokenRef.current !== reqTokenMap ||
+              activeKeyRef.current !== key
+            ) {
+              return;
+            }
             const v = viewport();
             if (v) v.scrollTop = prevTop + (v.scrollHeight - prevH);
           });
         })
         .catch(() => {
-          patchStore(key, (s) => ({ ...s, loadingMore: false }));
+          if (
+            taskIdRef.current !== reqTaskId ||
+            reqTokenRef.current !== reqTokenMap ||
+            (reqTokenRef.current[key] ?? 0) !== reqKeyToken
+          ) {
+            return;
+          }
+          setStore((prev) => {
+            const cur = prev[key];
+            if (!cur || !cur.loaded) return prev;
+            return { ...prev, [key]: { ...cur, loadingMore: false } };
+          });
         });
     },
     [taskId, store, patchStore],
@@ -864,9 +926,9 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     let alive = true;
     const load = () =>
       api
-        .interceptTask(taskId)
+        .interceptTaskPending(taskId)
         .then((rows) => {
-          if (alive) setPendingIntercepts(rows.filter((r) => r.status === "pending"));
+          if (alive) setPendingIntercepts(rows);
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
@@ -878,12 +940,9 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     };
   }, [taskId]);
 
-  // Re-render on a timer so "streaming" liveness recomputes as activity goes stale.
-  const [, setTick] = React.useState(0);
-  React.useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 1500);
-    return () => clearInterval(id);
-  }, []);
+  // One-shot liveness expiration stamp (replaces the old 1.5s setInterval that
+  // used to re-render the entire SessionsTab tree continuously).
+  const [livenessStamp, setLivenessStamp] = React.useState(0);
 
   // ── first load + single task SSE ────────────────────────────────────────────────
   // On task open: load Main's latest page, take the task-level snapshot cursor from
@@ -910,6 +969,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     snapshotRef.current = 0;
     llmToastSeqRef.current = new Set();
     reqTokenRef.current = {};
+    accessOrderRef.current = [];
     // Reserve the initial main key so the active-session effect (which fires for main on
     // mount) won't double-load it and pre-empt the SSE opened here.
     loadingKeysRef.current = new Set([mainSessionKey(0)]);
@@ -974,14 +1034,16 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       .then((r) => {
         if (!alive || reqTokenRef.current.mainboot !== token) return;
         snapshotRef.current = r.snapshotCursor;
-        patchStore(bootKey, (s) => {
-          const items = mergeBySeq(r.items, s.items);
+        patchStoreAndPrune(bootKey, (s) => {
+          const merged = mergeBySeq(r.items, s.items);
+          const items = trimBoundedItems(merged, true, NORMAL_KEEP, SCROLLED_KEEP);
+          const trimmed = items.length < merged.length;
           return {
             ...s,
             items,
             loaded: true,
             loading: false,
-            hasMore: r.hasMore,
+            hasMore: r.hasMore || trimmed,
             earliestSeq: items.length ? items[0].seq : 0,
             unread: 0,
             lastTs: items.length ? items[items.length - 1].ts : s.lastTs,
@@ -1024,8 +1086,9 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           if (a.kind === "usage") notifyApiEvent(["/exploration/tokens", "/tokens"]);
           else if (a.kind === "llm_switch" || a.kind === "llm_failover") notifyApiEvent(["/llm", "/tasks", "/stats"]);
           else if (a.kind === "intercept_request") notifyApiEvent(["/intercept", "/stats"]);
-          else if (["result", "tool_result", "round", "intent", "user"].includes(a.kind) || a.is_error)
-            notifyApiEvent(["/tasks", "/stats", "/exploration", "/assets", "/companies", "/intercept"]);
+          else if (a.kind === "result" || a.kind === "intent" || a.is_error)
+            notifyApiEvent(["/tasks", "/stats", "/exploration", "/assets", "/intercept"]);
+          else if (a.kind === "round" || a.kind === "user") notifyApiEvent(["/tasks", "/exploration"]);
           if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
             llmToastSeqRef.current.add(a.seq);
             const transition = a.metadata?.llm_transition;
@@ -1053,14 +1116,14 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                 [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
               };
             }
-            let items = mergeBySeq(cur.items, [a]);
-            // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
-            // but never while the user is reading this session's history (scrolled up).
+            const merged = mergeBySeq(cur.items, [a]);
+            // Memory bound: keep 2000 when pinned to bottom, and ALWAYS enforce
+            // the 4000 hard cap even while scrolled up (older pages re-fetched on scroll-up).
             let hasMore = cur.hasMore;
             let earliestSeq = cur.earliestSeq;
-            const trimmable = k !== activeK || atBottomRef.current;
-            if (trimmable && items.length > MAX_KEEP) {
-              items = items.slice(items.length - MAX_KEEP);
+            const pinnedToBottom = k !== activeK || atBottomRef.current;
+            const items = trimBoundedItems(merged, pinnedToBottom, NORMAL_KEEP, SCROLLED_KEEP);
+            if (items.length < merged.length) {
               hasMore = true;
               earliestSeq = items[0].seq;
             }
@@ -1081,7 +1144,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       esRef.current?.close();
       esRef.current = null;
     };
-  }, [taskId, patchStore]);
+  }, [taskId, patchStore, patchStoreAndPrune]);
 
   React.useEffect(() => {
     let active = true;
@@ -1225,15 +1288,17 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     [pendingIntercepts],
   );
 
-  // Liveness from each session's last-seen activity time (kept fresh by the 1.5s tick).
+  // Liveness from each session's last-seen activity time; transitions back to idle
+  // via a single one-shot expiry timeout below (no continuous 1.5s full-tree tick).
   const recentLive = React.useCallback(
     (key: string) => {
+      void livenessStamp;
       const ts = store[key]?.lastTs;
       if (!ts) return false;
       const t = Date.parse(ts);
       return t > 0 && Date.now() - t < STREAM_WINDOW_MS;
     },
-    [store],
+    [store, livenessStamp],
   );
   const currentMainKey = mainSessionKey(currentSeg);
   const plannerLive = recentLive("plan");
@@ -1323,16 +1388,39 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     [store, activeKey],
   );
 
-  // Keep the SSE dispatcher's notion of the active session current, and lazily load
-  // + clear unread whenever the active session changes.
+  const plannerLastTs = store.plan?.lastTs ?? "";
+  const activeLastTs = activeState?.lastTs ?? "";
+  React.useEffect(() => {
+    let soonest = Infinity;
+    const now = Date.now();
+    for (const ts of [plannerLastTs, activeLastTs]) {
+      if (!ts) continue;
+      const parsed = Date.parse(ts);
+      if (!Number.isFinite(parsed) || parsed <= 0) continue;
+      const remaining = STREAM_WINDOW_MS - (now - parsed);
+      if (remaining > 0 && remaining < soonest) soonest = remaining;
+    }
+    if (!Number.isFinite(soonest)) return;
+    const id = setTimeout(() => setLivenessStamp((v) => v + 1), soonest + 50);
+    return () => clearTimeout(id);
+  }, [plannerLastTs, activeLastTs, livenessStamp]);
+
+  // Keep the SSE dispatcher's notion of the active session current, lazily load
+  // + clear unread whenever the active session changes, and prune LRU inactive
+  // sessions beyond MAX_LOADED_SESSIONS.
   // biome-ignore lint/correctness/useExhaustiveDependencies: cache updates must not reactivate the current session.
   React.useEffect(() => {
     activeKeyRef.current = activeKey;
+    accessOrderRef.current = touchAccessOrder(accessOrderRef.current, activeKey);
     const st = store[activeKey];
     if (!st || (!st.loaded && !st.loading)) {
       loadSession(activeKey);
-    } else if (st.unread) {
-      patchStore(activeKey, (s) => ({ ...s, unread: 0 }));
+    } else {
+      setStore((prev) => {
+        const cur = prev[activeKey];
+        const updated = cur?.unread ? { ...prev, [activeKey]: { ...cur, unread: 0 } } : prev;
+        return pruneSessionStoreLRU(updated, activeKey, accessOrderRef.current, MAX_LOADED_SESSIONS);
+      });
     }
   }, [activeKey]);
 
@@ -1449,9 +1537,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       0,
   };
 
-  // Run duration = span from this session's first step to its last (for a live
-  // session, "now" so it ticks up — the 1.5s setTick above re-renders it).
-  const runDuration = React.useMemo(() => {
+  // Run duration bounds = timestamps of this session's first and last step.
+  // Live ticking is isolated inside <RunDurationBadge> so SessionsTab doesn't
+  // re-render every 1.5s.
+  const durationBounds = React.useMemo(() => {
     let min = Infinity,
       max = 0;
     for (const a of activity) {
@@ -1461,9 +1550,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       if (t > max) max = t;
     }
     if (!Number.isFinite(min) || max === 0) return null;
-    const end = active.live ? Date.now() : max;
-    return Math.max(0, end - min);
-  }, [activity, active.live]);
+    return { startMs: min, endMs: max };
+  }, [activity]);
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -1478,7 +1566,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     const onScroll = () => {
       if (approvalFocus.state && !focusHistory.ready) return;
       atBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 60;
-      if (vp.scrollTop <= 80) loadEarlier(activeKeyRef.current, viewport); // near top → older page
+      if (vp.scrollTop <= 80) {
+        // First unfold in-memory groups from ExecView's tail window before fetching older backend pages.
+        if (revealFoldedRef.current?.()) return;
+        loadEarlier(activeKeyRef.current, viewport);
+      }
     };
     vp.addEventListener("scroll", onScroll, { passive: true });
     return () => vp.removeEventListener("scroll", onScroll);
@@ -1844,11 +1936,19 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                   实时
                 </span>
               )}
-              {activeState?.hasMore && (
-                <span className="text-[10px] text-muted-foreground" title="向上滚动加载更早历史">
-                  ↑ 更早历史
-                </span>
-              )}
+              {activeState?.hasMore &&
+                (activeState.items.length >= SCROLLED_KEEP ? (
+                  <span
+                    className="text-[10px] text-muted-foreground"
+                    title={`已达到单会话前端显示上限（${SCROLLED_KEEP} 条）`}
+                  >
+                    已达到单会话前端显示上限（{SCROLLED_KEEP} 条）
+                  </span>
+                ) : (
+                  <span className="text-[10px] text-muted-foreground" title="向上滚动加载更早历史">
+                    ↑ 更早历史
+                  </span>
+                ))}
               <div className="ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground max-sm:w-full max-sm:flex-wrap">
                 {tokenTotal.any && (
                   <Tooltip>
@@ -1879,11 +1979,12 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     </TooltipContent>
                   </Tooltip>
                 )}
-                {runDuration != null && (
-                  <span className="inline-flex items-center gap-1" title="运行时长（首步 → 末步）">
-                    <ClockIcon className="size-3" />
-                    {fmtDuration(runDuration)}
-                  </span>
+                {durationBounds != null && (
+                  <RunDurationBadge
+                    startMs={durationBounds.startMs}
+                    endMs={durationBounds.endMs}
+                    live={active.live}
+                  />
                 )}
                 {isConsultation ? <span>自动协作</span> : isMain ? <span>可交互</span> : null}
               </div>
@@ -1950,6 +2051,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     加载更早历史…
                   </div>
                 )}
+                {!activeState?.loadingMore && activeState?.hasMore && activeState.items.length >= SCROLLED_KEEP && (
+                  <div className="pb-2 text-center text-[11px] text-muted-foreground/70">
+                    已达到单会话前端显示上限（{SCROLLED_KEEP} 条）
+                  </div>
+                )}
                 {showLoader ? (
                   <div className="flex items-center gap-2 pl-9 text-xs text-muted-foreground">
                     <Loader2Icon className="size-3.5 animate-spin" />
@@ -1971,10 +2077,12 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                 ) : activity.length ? (
                   <Transcript
                     activity={activity}
+                    sessionKey={`${taskId}:${activeKey}`}
                     live={active.live}
                     taskId={taskId}
                     chat={isMain}
                     focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
+                    onRevealReady={registerRevealFolded}
                   />
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">

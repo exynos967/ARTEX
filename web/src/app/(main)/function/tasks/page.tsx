@@ -1,6 +1,7 @@
 "use client";
 
 import { subscribeRefresh } from "@/lib/api-refresh";
+import { mapWithConcurrency } from "@/lib/view-guards";
 import * as React from "react";
 import { ResourcePicker } from "@/components/resource-picker";
 import { CreateRecordExport } from "@/components/record-exports";
@@ -320,7 +321,7 @@ export default function TasksPage() {
   const { field: sortField, direction: sortDirection } = sortPreference;
   const [page, setPage] = React.useState(1);
   const [pageSize, setPageSize] = React.useState(20);
-  const [nowSec, setNowSec] = React.useState(() => Math.floor(Date.now() / 1000));
+  const [sortNowSec, setSortNowSec] = React.useState(() => Math.floor(Date.now() / 1000));
   const [batchControlling, setBatchControlling] = React.useState<"pause" | "resume" | null>(null);
   const [movingCategory, setMovingCategory] = React.useState(false);
 
@@ -375,9 +376,18 @@ export default function TasksPage() {
     });
   }, [tasks, query, statusFilter, categoryFilter]);
 
-  const sortNowSec = sortField === "duration" ? nowSec : 0;
+  // Refresh duration-sort reference timestamp only when duration sorting is active
+  // and tasks/sort order changes — live per-second display ticking is isolated in
+  // <TaskLiveDuration> so TasksPage never re-renders every second.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: tasks and sort changes intentionally refresh the duration-sort reference timestamp.
+  React.useEffect(() => {
+    if (sortField !== "duration") return;
+    setSortNowSec(Math.floor(Date.now() / 1000));
+  }, [sortField, sortDirection, tasks]);
+
   const ordered = React.useMemo(() => {
-    return [...filtered].sort((left, right) => compareTasks(left, right, sortField, sortDirection, sortNowSec));
+    const refNow = sortField === "duration" ? sortNowSec : 0;
+    return [...filtered].sort((left, right) => compareTasks(left, right, sortField, sortDirection, refNow));
   }, [filtered, sortDirection, sortField, sortNowSec]);
 
   const sortTasksBy = React.useCallback(
@@ -525,18 +535,6 @@ export default function TasksPage() {
     if (categoryFilter === "all" || categoryFilter === UNCATEGORIZED_VALUE) return;
     if (!categories.some((category) => String(category.id) === categoryFilter)) setCategoryFilter("all");
   }, [categories, categoriesLoaded, categoryFilter]);
-
-  // 只在确有 running 任务时才每秒 tick——其余情况「运行时长」是静态值,空转的 tick 会白白
-  // 重渲染整张表。
-  const hasRunning = React.useMemo(() => tasks.some((t) => t.status === "running"), [tasks]);
-
-  // tick every second so running tasks' 运行时长 counts up live.
-  React.useEffect(() => {
-    if (!hasRunning) return;
-    setNowSec(Math.floor(Date.now() / 1000));
-    const i = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
-    return () => clearInterval(i);
-  }, [hasRunning]);
 
   const deleteTask = React.useCallback(
     async (id: string, options: DeleteTaskOptions) => {
@@ -995,9 +993,6 @@ export default function TasksPage() {
                     <TaskRow
                       key={task.id}
                       task={task}
-                      // running 任务才吃 nowSec;其余行传 0 —— props 不变,memo 就能拦下每秒 tick
-                      // 带来的整表重渲染,只让在跑的那几行走时长。
-                      nowSec={task.status === "running" ? nowSec : 0}
                       onDelete={deleteTask}
                       onControl={controlTask}
                       onRename={renameTask}
@@ -1166,13 +1161,41 @@ function ConcurrencySettingsDialog() {
   );
 }
 
-// TaskRow renders one row of the task table. Memoized so the per-second 运行时长 tick and
-// list refreshes only re-render the rows whose data actually moved — a table page
-// is 20 rows × (StatusBadge + Link + a Radix AlertDialog tree), far too heavy to rebuild
+// Isolated live duration cell so running tasks tick every second (skipping
+// hidden tabs) without re-rendering TasksPage or TaskRow.
+const TaskLiveDuration = React.memo(function TaskLiveDuration({ task }: { task: Task }) {
+  const isRunning = task.status === "running";
+  const [nowSec, setNowSec] = React.useState(() => Math.floor(Date.now() / 1000));
+
+  React.useEffect(() => {
+    if (!isRunning) return;
+    const tick = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      setNowSec(Math.floor(Date.now() / 1000));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    const onVisibility = () => {
+      if (!document.hidden) setNowSec(Math.floor(Date.now() / 1000));
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [isRunning]);
+
+  const secs = taskDuration(task, isRunning ? nowSec : 0);
+  if (secs <= 0) return <span className="text-muted-foreground">—</span>;
+  return <span className={isRunning ? "text-foreground" : "text-muted-foreground"}>{fmtDuration(secs)}</span>;
+});
+
+// TaskRow renders one row of the task table. Memoized so list refreshes only
+// re-render the rows whose data actually moved — a table page is 20 rows ×
+// (StatusBadge + Link + a Radix AlertDialog tree), far too heavy to rebuild
 // wholesale on every parent render.
 const TaskRow = React.memo(function TaskRow({
   task,
-  nowSec,
   onDelete,
   onControl,
   onRename,
@@ -1182,7 +1205,6 @@ const TaskRow = React.memo(function TaskRow({
   onSelectedChange,
 }: {
   task: Task;
-  nowSec: number;
   onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
   onControl: (id: string, action: "pause" | "resume") => Promise<void>;
   onRename: (task: Task, name: string) => Promise<void>;
@@ -1262,15 +1284,7 @@ const TaskRow = React.memo(function TaskRow({
         {fmtDateTime(task.created_unix)}
       </TableCell>
       <TableCell className="text-right text-xs whitespace-nowrap tabular-nums">
-        {(() => {
-          const secs = taskDuration(task, nowSec);
-          if (secs <= 0) return <span className="text-muted-foreground">—</span>;
-          return (
-            <span className={task.status === "running" ? "text-foreground" : "text-muted-foreground"}>
-              {fmtDuration(secs)}
-            </span>
-          );
-        })()}
+        <TaskLiveDuration task={task} />
       </TableCell>
       <TableCell
         className="text-right text-xs whitespace-nowrap tabular-nums"
@@ -1693,7 +1707,12 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
       });
       const pending = [...pendingRestoreIDs.current];
       if (pending.length > 0) {
-        const states = await Promise.allSettled(pending.map((id) => api.taskArchive(id)));
+        const states = await mapWithConcurrency(pending, 4, (id) =>
+          api.taskArchive(id).then(
+            (value) => ({ status: "fulfilled" as const, value }),
+            (reason: unknown) => ({ status: "rejected" as const, reason }),
+          ),
+        );
         if (request !== archiveRequest.current || activeArchiveQuery.current !== archiveQuery) return;
         let restored = false;
         states.forEach((state, index) => {

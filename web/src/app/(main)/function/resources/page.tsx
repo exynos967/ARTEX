@@ -27,6 +27,7 @@ import { Markdown } from "@/components/markdown";
 import { ResourceLifecycle } from "@/components/resource-lifecycle";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { subscribeRefresh } from "@/lib/api-refresh";
 import {
   resourceAPI,
   type Resource,
@@ -379,28 +380,34 @@ function ResourceDetail({ resource, onSaved }: { resource: Resource; onSaved: (r
   const [draft, setDraft] = useState<ResourceDraft | null>(null);
   const [versionID, setVersionID] = useState(0);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [error, setError] = useState("");
   const [ready, setReady] = useState(false);
   const [task, setTask] = useState("");
   const [updateAvailable, setUpdateAvailable] = useState(false);
   useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+  useEffect(() => {
     let alive = true;
-    let pending = false;
-    const timer = setInterval(async () => {
-      if (document.hidden || pending) return;
-      pending = true;
+    setUpdateAvailable(false);
+    const checkRevision = async () => {
+      if (busyRef.current) return;
       try {
         const latest = await resourceAPI.get(resource.id);
-        if (alive) setUpdateAvailable(latest.revision !== resource.revision);
+        if (alive && !busyRef.current) setUpdateAvailable(latest.revision !== resource.revision);
       } catch {
         /* Retain the current editor on transient connection errors. */
-      } finally {
-        pending = false;
       }
-    }, 10000);
+    };
+    const stop = subscribeRefresh(checkRevision, {
+      intervalMs: 10_000,
+      immediate: false,
+      keys: ["/resources", "/resource-drafts"],
+    });
     return () => {
       alive = false;
-      clearInterval(timer);
+      stop();
     };
   }, [resource.id, resource.revision]);
   const load = useCallback(async () => {
@@ -418,6 +425,7 @@ function ResourceDetail({ resource, onSaved }: { resource: Resource; onSaved: (r
     load().catch((e) => setError(message(e)));
   }, [load]);
   const run = async (f: () => Promise<void>) => {
+    busyRef.current = true;
     setBusy(true);
     setError("");
     try {
@@ -427,6 +435,7 @@ function ResourceDetail({ resource, onSaved }: { resource: Resource; onSaved: (r
     } catch (e) {
       setError(message(e));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };

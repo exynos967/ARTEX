@@ -47,6 +47,7 @@ import {
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import type { LLMRecordItem, LLMRecordDetail, LLMTask } from "@/lib/types";
+import { CODE_PREVIEW_THRESHOLD_BYTES, buildCodePreview } from "@/lib/view-guards";
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN", {
@@ -110,7 +111,7 @@ function CopyButton({ text }: { text: string }) {
       className="size-5 shrink-0"
       disabled={disabled}
       title={copied ? "已复制" : "复制内容"}
-      onClick={copy}
+      onClick={() => void copy()}
     >
       {copied ? <CheckIcon className="size-3 text-emerald-600" /> : <CopyIcon className="size-3" />}
     </Button>
@@ -142,18 +143,42 @@ export default function LLMRecordsPage() {
   // 归一化视图 / HTTP 原文视图。原文是排查 provider 侧问题的唯一依据：归一化视图
   // 不含工具 schema，响应里也没有 tool_use 块。
   const [rawView, setRawView] = React.useState(false);
+  const [expandedReqKey, setExpandedReqKey] = React.useState<string | null>(null);
+  const [expandedRespKey, setExpandedRespKey] = React.useState<string | null>(null);
 
   const hasRaw = !!(detail?.raw_request || detail?.raw_response);
   // 开关保持用户选择，但切到一条无原文的旧记录时自动落回解析视图，而不是显示空白。
   const showRaw = rawView && hasRaw;
+  const activePayloadKey = `${selected?.id ?? ""}:${showRaw}`;
+  const expandReq = expandedReqKey === activePayloadKey;
+  const expandResp = expandedRespKey === activePayloadKey;
+
+  const rawReqText = showRaw ? (detail?.raw_request ?? "") : (detail?.request_body ?? "");
+  const rawRespText = showRaw ? (detail?.raw_response ?? "") : (detail?.response_body ?? "");
+
+  const reqPreview = React.useMemo(
+    () => buildCodePreview(rawReqText, CODE_PREVIEW_THRESHOLD_BYTES),
+    [rawReqText],
+  );
+  const respPreview = React.useMemo(
+    () => buildCodePreview(rawRespText, CODE_PREVIEW_THRESHOLD_BYTES),
+    [rawRespText],
+  );
+
   // 原文请求体是 JSON，pretty-print 只改排版不改语义，便于阅读；原文响应是 SSE
-  // 帧，tryFormatJSON 解析失败会原样返回，故两边共用一个函数即可。
-  const reqText = showRaw
-    ? detail?.raw_request && tryFormatJSON(detail.raw_request)
-    : detail?.request_body && tryFormatJSON(detail.request_body);
-  const respText = showRaw
-    ? detail?.raw_response
-    : detail?.response_body && tryFormatJSON(detail.response_body);
+  // 帧，tryFormatJSON 解析失败会原样返回。超过 64 KiB 时默认跳过同步 JSON 格式化，
+  // 展示纯文本截断预览，用户显式展开后再执行格式化。
+  const reqText = React.useMemo(() => {
+    if (!rawReqText) return "";
+    if (reqPreview.isLarge && !expandReq) return reqPreview.preview;
+    return tryFormatJSON(rawReqText);
+  }, [rawReqText, reqPreview, expandReq]);
+
+  const respText = React.useMemo(() => {
+    if (!rawRespText) return "";
+    if (respPreview.isLarge && !expandResp) return respPreview.preview;
+    return showRaw ? rawRespText : tryFormatJSON(rawRespText);
+  }, [rawRespText, respPreview, expandResp, showRaw]);
 
   // Per-task delete (task picker + confirm dialog)
   const [tasks, setTasks] = React.useState<LLMTask[]>([]);
@@ -331,7 +356,7 @@ export default function LLMRecordsPage() {
             id="llm-rec-toggle"
             size="sm"
             checked={recEnabled}
-            onCheckedChange={toggleRecording}
+            onCheckedChange={(v) => void toggleRecording(v)}
             disabled={recBusy}
           />
           <label
@@ -511,8 +536,25 @@ export default function LLMRecordsPage() {
               <div className="flex min-h-0 min-w-0 flex-col">
                 <div className="flex items-center gap-2 border-b py-0.5 pr-1.5 pl-3 text-[11px] font-medium text-muted-foreground">
                   <span>Request{showRaw && " · 原文"}</span>
-                  <CopyButton text={reqText || ""} />
+                  <CopyButton text={reqPreview.isLarge && !expandReq ? rawReqText : reqText} />
                 </div>
+                {!detailLoading && reqPreview.isLarge && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/40 px-3 py-1 text-[11px] text-muted-foreground">
+                    <span>
+                      内容较大 ({Math.max(1, Math.ceil(reqPreview.totalChars / 1024))} KB)，
+                      {expandReq ? "已展开全部内容" : "已切换为 64 KB 纯文本预览以防卡顿"}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-5 px-2 text-[11px]"
+                      onClick={() => setExpandedReqKey((cur) => (cur === activePayloadKey ? null : activePayloadKey))}
+                    >
+                      {expandReq ? "收起预览" : "展开并格式化全部"}
+                    </Button>
+                  </div>
+                )}
                 <div className="min-h-0 flex-1 overflow-auto">
                   {detailLoading ? (
                     <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground">
@@ -529,8 +571,25 @@ export default function LLMRecordsPage() {
               <div className="flex min-h-0 min-w-0 flex-col">
                 <div className="flex items-center gap-2 border-b py-0.5 pr-1.5 pl-3 text-[11px] font-medium text-muted-foreground">
                   <span>Response{showRaw && " · 原文（SSE）"}</span>
-                  <CopyButton text={respText || ""} />
+                  <CopyButton text={respPreview.isLarge && !expandResp ? rawRespText : respText} />
                 </div>
+                {!detailLoading && respPreview.isLarge && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/40 px-3 py-1 text-[11px] text-muted-foreground">
+                    <span>
+                      内容较大 ({Math.max(1, Math.ceil(respPreview.totalChars / 1024))} KB)，
+                      {expandResp ? "已展开全部内容" : "已切换为 64 KB 纯文本预览以防卡顿"}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-5 px-2 text-[11px]"
+                      onClick={() => setExpandedRespKey((cur) => (cur === activePayloadKey ? null : activePayloadKey))}
+                    >
+                      {expandResp ? "收起预览" : showRaw ? "展开全部纯文本" : "展开并格式化全部"}
+                    </Button>
+                  </div>
+                )}
                 <div className="min-h-0 flex-1 overflow-auto">
                   {detailLoading ? (
                     <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground">

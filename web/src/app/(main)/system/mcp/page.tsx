@@ -22,6 +22,7 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import type { MCPServer, MCPTool, Agent } from "@/lib/types";
+import { mapWithConcurrency } from "@/lib/view-guards";
 
 type Transport = "stdio" | "http" | "sse";
 type FormState = {
@@ -57,23 +58,48 @@ export default function MCPPage() {
   const [toolsLoading, setToolsLoading] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(false);
 
+  const visibilityLoadSeq = React.useRef(0);
   const load = React.useCallback(() => {
-    api.agents().then(setAgents).catch(() => {});
-    api
-      .mcpServers()
-      .then((ss) => {
-        setServers(ss);
-        ss.forEach((s) =>
-          api
-            .resourceVisibility("mcp", s.id)
-            .then((ids) => setVisibility((v) => ({ ...v, [s.id]: ids })))
-            .catch(() => {}),
-        );
+    const seq = ++visibilityLoadSeq.current;
+    void api
+      .agents()
+      .then((list) => {
+        if (visibilityLoadSeq.current === seq) setAgents(list);
       })
-      .catch(() => {});
+      .catch(() => {
+        /* ignore transient load error */
+      });
+    void api
+      .mcpServers()
+      .then(async (ss) => {
+        if (visibilityLoadSeq.current !== seq) return;
+        setServers(ss);
+        const entries = await mapWithConcurrency(ss, 4, async (s) => {
+          try {
+            const ids = await api.resourceVisibility("mcp", s.id);
+            return [s.id, ids] as const;
+          } catch {
+            return null;
+          }
+        });
+        if (visibilityLoadSeq.current !== seq) return;
+        const updates: Record<number, string[]> = {};
+        for (const entry of entries) {
+          if (entry) updates[entry[0]] = entry[1];
+        }
+        if (Object.keys(updates).length > 0) {
+          setVisibility((v) => ({ ...v, ...updates }));
+        }
+      })
+      .catch(() => {
+        /* ignore transient load error */
+      });
   }, []);
   React.useEffect(() => {
     load();
+    return () => {
+      visibilityLoadSeq.current++;
+    };
   }, [load]);
 
   function setF(patch: Partial<FormState>) {

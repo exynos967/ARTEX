@@ -221,12 +221,16 @@ function TaskDetailInner() {
   useApiRefresh(api.llmProfiles, setProfiles, [], { keys: ["/llm/profiles"], intervalMs: 60_000 });
 
   React.useEffect(() => {
+    if (!id) {
+      setInterceptPendingCount(0);
+      return;
+    }
     let alive = true;
     const load = () =>
       api
-        .interceptTask(id)
+        .interceptTaskPending(id)
         .then((rows) => {
-          if (alive) setInterceptPendingCount(rows.filter((r) => r.status === "pending").length);
+          if (alive) setInterceptPendingCount(rows.length);
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.

@@ -228,21 +228,47 @@ function SyncWorkbench() {
   const [tasks, setTasks] = React.useState<SSTask[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [search, setSearch] = React.useState("");
+  const [debouncedSearch, setDebouncedSearch] = React.useState("");
   const [page, setPage] = React.useState(1);
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
+  const loadSeqRef = React.useRef(0);
 
   const [syncing, setSyncing] = React.useState(false);
   const [result, setResult] = React.useState<Awaited<ReturnType<typeof api.ssSync>> | null>(null);
 
+  React.useEffect(() => {
+    if (search === debouncedSearch) return;
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search);
+      setPage(1);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [search, debouncedSearch]);
+
+  React.useEffect(() => {
+    return () => {
+      loadSeqRef.current++;
+    };
+  }, []);
+
   const load = React.useCallback(() => {
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     setSelected(new Set());
     const fn =
       dimension === "project"
-        ? api.ssProjects(page, 50, search).then((r) => setProjects(r.projects))
-        : api.ssTasks(page, 50, search).then(setTasks);
-    fn.catch((e) => toast.error(`加载列表失败：${e.message}`)).finally(() => setLoading(false));
-  }, [dimension, page, search]);
+        ? api.ssProjects(page, 50, debouncedSearch).then((r) => {
+            if (loadSeqRef.current === seq) setProjects(r.projects);
+          })
+        : api.ssTasks(page, 50, debouncedSearch).then((items) => {
+            if (loadSeqRef.current === seq) setTasks(items);
+          });
+    fn.catch((e) => {
+      if (loadSeqRef.current === seq) toast.error(`加载列表失败：${e.message}`);
+    }).finally(() => {
+      if (loadSeqRef.current === seq) setLoading(false);
+    });
+  }, [dimension, page, debouncedSearch]);
 
   React.useEffect(() => {
     load();
@@ -386,8 +412,12 @@ function SyncWorkbench() {
               onChange={(e) => setSearch(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
-                  setPage(1);
-                  load();
+                  if (debouncedSearch !== search || page !== 1) {
+                    setPage(1);
+                    setDebouncedSearch(search);
+                  } else {
+                    load();
+                  }
                 }
               }}
             />

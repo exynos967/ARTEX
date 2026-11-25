@@ -61,6 +61,7 @@ import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.
 import { isBtwCommand } from "@/lib/side-questions";
 import type { Activity, Agent, ChatAttachment, Conversation, LLMProfile } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { DEFAULT_NORMAL_ITEM_CAP, DEFAULT_SCROLLED_ITEM_CAP, trimBoundedItems } from "@/lib/view-guards";
 
 // fmtBytes renders a human file size for attachment chips (mirrors transcript.tsx).
 function fmtBytes(n: number): string {
@@ -91,6 +92,8 @@ function fmtDuration(ms: number): string {
 // thread stays snappy (only ~a page of rows is in the DOM until you scroll up).
 const HISTORY_PAGE = 200;
 const CONVERSATION_LIST_PAGE = 100;
+const MAX_KEEP = DEFAULT_NORMAL_ITEM_CAP; // 2000 when pinned to bottom
+const SCROLLED_KEEP = DEFAULT_SCROLLED_ITEM_CAP; // 4000 hard cap even when scrolled up
 
 // Which agent groups the user has collapsed in the left rail. Persisted so the
 // rail looks the same after a reload; unknown keys are harmless (a deleted agent
@@ -508,11 +511,23 @@ function ChatView({
   const earliestRef = React.useRef(0); // earliest loaded id — reverse-pagination anchor
   const hasMoreRef = React.useRef(false); // older history remains above the loaded window
   const loadingMoreRef = React.useRef(false); // guard: one scroll-up load at a time
+  const messageCountRef = React.useRef(0);
   const [historyLoaded, setHistoryLoaded] = React.useState(false);
   const [hasMore, setHasMore] = React.useState(false); // drives the "load earlier" hint
   const agent = agents.find((a) => a.key === conv.agent_key);
   const currentProfileId = conv.llm_profile_id ?? null;
   const side = useSideQuestions(`/api/conversations/${conv.id}`);
+
+  React.useEffect(() => {
+    messageCountRef.current = messages.length;
+    if (messages.length > 0 && earliestRef.current > 0 && messages[0].seq > earliestRef.current) {
+      earliestRef.current = messages[0].seq;
+      if (!hasMoreRef.current) {
+        hasMoreRef.current = true;
+        setHasMore(true);
+      }
+    }
+  }, [messages]);
 
   async function changeProfile(id: number | null) {
     try {
@@ -544,6 +559,7 @@ function ChatView({
     cursorRef.current = 0;
     earliestRef.current = 0;
     hasMoreRef.current = false;
+    messageCountRef.current = 0;
     setHasMore(false);
     setMessages([]);
     setHistoryLoaded(false);
@@ -553,7 +569,7 @@ function ChatView({
       .conversationHistory(conv.id, 0, HISTORY_PAGE)
       .then((r) => {
         if (!live) return;
-        setMessages((current) => mergeActivities(r.items, current));
+        setMessages((current) => trimBoundedItems(mergeActivities(r.items, current), true, MAX_KEEP, SCROLLED_KEEP));
         cursorRef.current = Math.max(cursorRef.current, r.cursor);
         earliestRef.current = r.items.length ? r.items[0].seq : 0;
         hasMoreRef.current = r.hasMore;
@@ -587,7 +603,9 @@ function ChatView({
         const r = await api.conversationMessages(conv.id, cursorRef.current);
         if (!live) return;
         if (r.items.length) {
-          setMessages((prev) => mergeActivities(prev, r.items));
+          setMessages((prev) =>
+            trimBoundedItems(mergeActivities(prev, r.items), atBottomRef.current, MAX_KEEP, SCROLLED_KEEP),
+          );
         }
         cursorRef.current = Math.max(cursorRef.current, r.cursor);
         setRunning(r.running);
@@ -627,6 +645,10 @@ function ChatView({
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
   const atBottomRef = React.useRef(true);
+  const revealFoldedRef = React.useRef<(() => boolean) | null>(null);
+  const registerRevealFolded = React.useCallback((fn: (() => boolean) | null) => {
+    revealFoldedRef.current = fn;
+  }, []);
   const viewport = React.useCallback(
     () => (contentRef.current?.closest('[data-slot="scroll-area-viewport"]') as HTMLElement | null) ?? null,
     [],
@@ -635,15 +657,17 @@ function ChatView({
   // so the view doesn't jump (record height/offset before, restore the delta after).
   const loadEarlier = React.useCallback(async () => {
     if (loadingMoreRef.current || !hasMoreRef.current) return;
+    const remaining = SCROLLED_KEEP - messageCountRef.current;
+    if (remaining <= 0) return;
     const vp = viewport();
     if (!vp) return;
     loadingMoreRef.current = true;
     const prevH = vp.scrollHeight;
     const prevTop = vp.scrollTop;
     try {
-      const r = await api.conversationHistory(conv.id, earliestRef.current, HISTORY_PAGE);
+      const r = await api.conversationHistory(conv.id, earliestRef.current, Math.min(HISTORY_PAGE, remaining));
       if (r.items.length) {
-        setMessages((prev) => mergeActivities(r.items, prev));
+        setMessages((prev) => trimBoundedItems(mergeActivities(r.items, prev), false, MAX_KEEP, SCROLLED_KEEP));
         earliestRef.current = r.items[0].seq;
       }
       hasMoreRef.current = r.hasMore;
@@ -664,7 +688,11 @@ function ChatView({
     const onScroll = () => {
       if (approvalFocus.state && !focusHistory.ready) return;
       atBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 60;
-      if (vp.scrollTop <= 80) void loadEarlier(); // near top → pull an older page
+      if (vp.scrollTop <= 80) {
+        // First reveal folded in-memory groups before hitting the backend history endpoint.
+        if (revealFoldedRef.current?.()) return;
+        void loadEarlier();
+      }
     };
     vp.addEventListener("scroll", onScroll, { passive: true });
     return () => vp.removeEventListener("scroll", onScroll);
@@ -810,14 +838,20 @@ function ChatView({
           ) : (
             <>
               {hasMore && (
-                <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">向上滚动加载更早的消息…</div>
+                <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">
+                  {messages.length >= SCROLLED_KEEP
+                    ? `已达到单会话前端显示上限（${SCROLLED_KEEP} 条）`
+                    : "向上滚动加载更早的消息…"}
+                </div>
               )}
               <Transcript
                 activity={messages}
+                sessionKey={`conv-${conv.id}`}
                 live={running}
                 chat
                 fetchDetail={fetchDetail}
                 focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
+                onRevealReady={registerRevealFolded}
               />
             </>
           )}

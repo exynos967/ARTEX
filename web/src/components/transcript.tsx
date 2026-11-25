@@ -26,6 +26,11 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { api } from "@/lib/api";
 import { endedToolCalls } from "@/lib/ended-tool-calls";
 import type { Activity, InterceptPending } from "@/lib/types";
+import { computeExecWindowTransition, type ExecWindowSnapshot, mapWithConcurrency } from "@/lib/view-guards";
+
+const DETAIL_FETCH_CONCURRENCY = 4;
+const EXEC_WINDOW_INITIAL = 200;
+const EXEC_WINDOW_STEP = 150;
 
 // ---- per-agent lane color (planner + work#1/#2/#3 …) ---------------------------
 const workerColors = [
@@ -189,14 +194,16 @@ function toolInputText(tool: string, raw: string): string {
 
 // InterceptCard renders an inline intercept_request approval card. The pending_id
 // is extracted from the summary (format: "工具 X 请求审批 (#N)") so buttons are
-// available immediately without waiting for the detail load.
-function InterceptCard({
+// available immediately without waiting for the detail load. Network lookups are
+// deferred via useInView so off-screen historical approvals don't trigger bursts.
+const InterceptCard = React.memo(function InterceptCard({
   step,
   getDetail,
 }: {
   step: Activity;
   getDetail: (seq: number) => Promise<string>;
 }) {
+  const [cardRef, inView] = useInView();
   // extract pending_id from summary: "工具 Bash 请求审批 (#42)"
   const pendingId = React.useMemo(() => {
     const m = /\(#(\d+)\)/.exec(step.summary);
@@ -208,7 +215,7 @@ function InterceptCard({
     return m ? m[1] : step.summary;
   }, [step.summary]);
 
-  const [detail, setDetail] = React.useState<Record<string, unknown> | null>(null);
+  const [inputPreview, setInputPreview] = React.useState<string | null>(null);
   const [decided, setDecided] = React.useState<"allowed" | "denied" | "timeout" | null>(null);
   const [deciding, setDeciding] = React.useState(false);
   const [expanded, setExpanded] = React.useState(false);
@@ -217,32 +224,47 @@ function InterceptCard({
   const [retry, setRetry] = React.useState(0);
 
   // Load persisted detail JSON + check the real current status from the backend
-  // so that a page refresh shows the already-decided state instead of re-offering buttons.
+  // once the card approaches the viewport, keeping only the 200-char preview.
   React.useEffect(() => {
+    if (!inView) return;
     let live = true;
     getDetail(step.seq)
       .then((raw) => {
         if (!live || !raw) return;
-        try { setDetail(JSON.parse(raw)); } catch { /* ignore */ }
+        try {
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          if (parsed?.input) setInputPreview(JSON.stringify(parsed.input).slice(0, 200));
+        } catch {
+          /* ignore */
+        }
       })
-      .catch(() => {/* ignore */});
-    return () => { live = false; };
-  }, [step.seq, getDetail]);
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      live = false;
+    };
+  }, [inView, step.seq, getDetail]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: Retry explicitly reloads the same approval after a failed request.
   React.useEffect(() => {
-    if (!pendingId) return;
+    if (!inView || !pendingId) return;
     let live = true;
-    api.interceptGetOne(pendingId)
+    api
+      .interceptGetOne(pendingId)
       .then((p) => {
         if (!live) return;
         setPending(p);
         setStatusError("");
         if (p.status !== "pending") setDecided(p.status as "allowed" | "denied" | "timeout");
       })
-      .catch((error) => { if (live) setStatusError((error as Error).message || "审批详情加载失败"); });
-    return () => { live = false; };
-  }, [pendingId, retry]);
+      .catch((error) => {
+        if (live) setStatusError((error as Error).message || "审批详情加载失败");
+      });
+    return () => {
+      live = false;
+    };
+  }, [inView, pendingId, retry]);
 
   async function decide(decision: "allowed" | "denied") {
     if (step.inherited || !pendingId || deciding) return;
@@ -258,14 +280,10 @@ function InterceptCard({
     }
   }
 
-  const inputStr = detail?.input
-    ? JSON.stringify(detail.input).slice(0, 200)
-    : null;
-
   const row = pending ? { ...pending, status: decided || pending.status, conv_title: "", conv_agent_key: "", rule_name: "" } : null;
 
   return (
-    <div className="my-2 rounded-lg border border-amber-400/50 bg-amber-50/40 dark:bg-amber-950/15 p-3 text-xs">
+    <div ref={cardRef} className="my-2 rounded-lg border border-amber-400/50 bg-amber-50/40 dark:bg-amber-950/15 p-3 text-xs">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex items-start gap-2 min-w-0">
           <ShieldAlertIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
@@ -279,8 +297,8 @@ function InterceptCard({
                 <span className="text-muted-foreground">#{pendingId}</span>
               )}
             </div>
-            {inputStr && (
-              <p className="font-mono text-muted-foreground truncate">{inputStr}</p>
+            {inputPreview && (
+              <p className="font-mono text-muted-foreground truncate">{inputPreview}</p>
             )}
           </div>
         </div>
@@ -304,7 +322,7 @@ function InterceptCard({
               size="sm"
               className="h-6 px-2 text-xs"
               disabled={deciding || !pendingId}
-              onClick={() => decide("allowed")}
+              onClick={() => void decide("allowed")}
             >
               <CheckIcon className="h-3 w-3" />
               允许
@@ -314,7 +332,7 @@ function InterceptCard({
               variant="destructive"
               className="h-6 px-2 text-xs"
               disabled={deciding || !pendingId}
-              onClick={() => decide("denied")}
+              onClick={() => void decide("denied")}
             >
               <XIcon className="h-3 w-3" />
               拒绝
@@ -352,22 +370,37 @@ function InterceptCard({
       ) : null}
     </div>
   );
-}
+});
 
-// ToolBlock renders ONE tool call: the command and its result bound into a single
-// row (collapsed shows the command + a status/result preview; expand shows the
-// full input AND output together). Lazy-loads both details on expand.
-function ToolBlock({
-  group,
-  getDetail,
-  showWorker,
-  focused = false,
-}: {
+interface ToolBlockProps {
   group: Extract<Group, { type: "tool" }>;
   getDetail: (seq: number) => Promise<string>;
   showWorker?: boolean;
   focused?: boolean;
-}) {
+}
+
+function areToolBlockPropsEqual(prev: ToolBlockProps, next: ToolBlockProps): boolean {
+  return (
+    prev.getDetail === next.getDetail &&
+    prev.showWorker === next.showWorker &&
+    prev.focused === next.focused &&
+    prev.group.worker === next.group.worker &&
+    prev.group.ended === next.group.ended &&
+    Object.is(prev.group.use, next.group.use) &&
+    Object.is(prev.group.result, next.group.result)
+  );
+}
+
+// ToolBlock renders ONE tool call: the command and its result bound into a single
+// row (collapsed shows the command + a status/result preview; expand shows the
+// full input AND output together). Lazy-loads both details on expand and clears
+// detail state on collapse so large tool outputs are released immediately.
+function ToolBlockImpl({
+  group,
+  getDetail,
+  showWorker,
+  focused = false,
+}: ToolBlockProps) {
   const [open, setOpen] = React.useState(focused);
   const targetRef = React.useRef<HTMLElement>(null);
   const [detail, setDetail] = React.useState<string | null>(null);
@@ -397,17 +430,20 @@ function ToolBlock({
   // key over the seqs we'd load; changes when the result (or command) arrives.
   const detailKey = `${use?.seq ?? ""}:${result?.seq ?? ""}`;
   React.useEffect(() => {
-    if (!open || loadedKey.current === detailKey) return;
+    if (!open) {
+      loadedKey.current = null;
+      setDetail(null);
+      return;
+    }
+    if (loadedKey.current === detailKey) return;
     let live = true;
     const segs: { label: string; seq: number }[] = [];
     if (use) segs.push({ label: "命令", seq: use.seq });
     if (result) segs.push({ label: "输出" + (result.is_error ? " ✕" : " ✓"), seq: result.seq });
-    void Promise.all(
-      segs.map((x) =>
-        getDetail(x.seq)
-          .then((d) => d || "（空）")
-          .catch(() => "（加载失败）"),
-      ),
+    void mapWithConcurrency(segs, DETAIL_FETCH_CONCURRENCY, (x) =>
+      getDetail(x.seq)
+        .then((d) => d || "（空）")
+        .catch(() => "（加载失败）"),
     ).then((parts) => {
       if (!live) return;
       setDetail(
@@ -488,17 +524,37 @@ function ToolBlock({
   );
 }
 
-// MessageBlock renders a coalesced agent message (merged streaming text/thinking/
-// result fragments into one block) so the conversation reads as messages, not rows.
-function MessageBlock({
-  group,
-  getDetail,
-  showWorker,
-}: {
+const ToolBlock = React.memo(ToolBlockImpl, areToolBlockPropsEqual);
+
+interface MessageBlockProps {
   group: Extract<Group, { type: "msg" }>;
   getDetail: (seq: number) => Promise<string>;
   showWorker?: boolean;
-}) {
+}
+
+function areMessageBlockPropsEqual(prev: MessageBlockProps, next: MessageBlockProps): boolean {
+  if (
+    prev.getDetail !== next.getDetail ||
+    prev.showWorker !== next.showWorker ||
+    prev.group.worker !== next.group.worker ||
+    prev.group.steps.length !== next.group.steps.length
+  ) {
+    return false;
+  }
+  for (let i = 0; i < prev.group.steps.length; i++) {
+    if (!Object.is(prev.group.steps[i], next.group.steps[i])) return false;
+  }
+  return true;
+}
+
+// MessageBlock renders a coalesced agent message (merged streaming text/thinking/
+// result fragments into one block) so the conversation reads as messages, not rows.
+// Caps concurrent detail fetches and releases expanded detail on collapse.
+function MessageBlockImpl({
+  group,
+  getDetail,
+  showWorker,
+}: MessageBlockProps) {
   const [open, setOpen] = React.useState(false);
   const [detail, setDetail] = React.useState<string | null>(null);
   // like ToolBlock: keyed by the group's step seqs so streamed steps arriving
@@ -513,14 +569,17 @@ function MessageBlock({
 
   const detailKey = group.steps.map((s) => s.seq).join(",");
   React.useEffect(() => {
-    if (!open || loadedKey.current === detailKey) return;
+    if (!open) {
+      loadedKey.current = null;
+      setDetail(null);
+      return;
+    }
+    if (loadedKey.current === detailKey) return;
     let live = true;
-    void Promise.all(
-      group.steps.map((s) =>
-        getDetail(s.seq)
-          .then((d) => d || s.summary)
-          .catch(() => s.summary),
-      ),
+    void mapWithConcurrency(group.steps, DETAIL_FETCH_CONCURRENCY, (s) =>
+      getDetail(s.seq)
+        .then((d) => d || s.summary)
+        .catch(() => s.summary),
     ).then((parts) => {
       if (!live) return;
       setDetail(group.steps.map((s, i) => `【${kindLabel(s.kind)}】\n${parts[i]}`).join("\n\n"));
@@ -557,6 +616,8 @@ function MessageBlock({
   );
 }
 
+const MessageBlock = React.memo(MessageBlockImpl, areMessageBlockPropsEqual);
+
 // UserRow renders a right-aligned chat bubble: either a human turn (the message you
 // sent the main agent) or, in a worker session, the LLM-generated intent that leads
 // it (intent=true) — same bubble, but a target icon instead of the human avatar.
@@ -588,7 +649,15 @@ function parseUserBody(body: string): { text: string; attachments: MsgAttachment
   return { text: body, attachments: [] };
 }
 
-function UserRow({ step, intent, getDetail }: { step: Activity; intent?: boolean; getDetail: (seq: number) => Promise<string> }) {
+const UserRow = React.memo(function UserRow({
+  step,
+  intent,
+  getDetail,
+}: {
+  step: Activity;
+  intent?: boolean;
+  getDetail: (seq: number) => Promise<string>;
+}) {
   const Icon = intent ? CrosshairIcon : UserIcon;
   const [ref, inView] = useInView();
   // Optimistic echoes carry their detail inline; persisted rows lazy-load it on scroll.
@@ -640,12 +709,18 @@ function UserRow({ step, intent, getDetail }: { step: Activity; intent?: boolean
       </div>
     </div>
   );
-}
+});
 
 // AnswerBlock renders the agent's FINAL answer (kind="result") in full — never
 // collapsed. The summary is a truncated first line, so the full text is pulled
 // from the detail and shown inline.
-function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: number) => Promise<string> }) {
+const AnswerBlock = React.memo(function AnswerBlock({
+  step,
+  getDetail,
+}: {
+  step: Activity;
+  getDetail: (seq: number) => Promise<string>;
+}) {
   const [ref, inView] = useInView();
   const [full, setFull] = React.useState<string | null>(null);
   React.useEffect(() => {
@@ -686,26 +761,149 @@ function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: num
       <ActivityTime ts={step.ts} />
     </div>
   );
-}
+});
 
 // ExecView renders an agent execution replay (planner / worker / main agent) in
 // the compact, grouped, expand-to-detail format — thinking, tool calls/results,
 // and (for the main agent) the human turns. Worker lane chips show only when the
-// view actually mixes agents.
-function ExecView({
+// view actually mixes agents. Long transcripts (>200 groups) render a bounded
+// tail window with scroll-anchored on-demand reveal so DOM nodes stay bounded.
+const ExecView = React.memo(function ExecView({
   activity,
+  sessionKey,
   taskId,
   chat,
   fetchDetail,
   focusedSeq,
+  onRevealReady,
 }: {
   activity: Activity[];
+  sessionKey?: string;
   taskId?: string;
   chat?: boolean;
   fetchDetail?: (seq: number) => Promise<string>;
   focusedSeq?: number;
+  onRevealReady?: (reveal: (() => boolean) | null) => void;
 }) {
-  const showWorker = new Set(activity.map((a) => a.worker)).size > 1;
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const [windowState, setWindowState] = React.useState<{ key: string | undefined; count: number }>({
+    key: sessionKey,
+    count: EXEC_WINDOW_INITIAL,
+  });
+  const prevSnapshotRef = React.useRef<ExecWindowSnapshot | null>(null);
+  const startIndexRef = React.useRef(0);
+  const revealingRef = React.useRef(false);
+  const revealRafRef = React.useRef<number | null>(null);
+
+  const visibleCount =
+    sessionKey !== undefined && windowState.key !== sessionKey ? EXEC_WINDOW_INITIAL : windowState.count;
+
+  const showWorker = React.useMemo(() => new Set(activity.map((a) => a.worker)).size > 1, [activity]);
+  const groups = React.useMemo(() => groupSteps(activity, !!chat), [activity, chat]);
+  const { minRealSeq, maxRealSeq } = React.useMemo(() => {
+    let min = 0;
+    let max = 0;
+    for (const a of activity) {
+      if (a.seq <= 0) continue; // skip synthetic worker intent header (seq = -1)
+      if (min === 0 || a.seq < min) min = a.seq;
+      if (a.seq > max) max = a.seq;
+    }
+    return { minRealSeq: min, maxRealSeq: max };
+  }, [activity]);
+
+  // Reset the revealed window deterministically on session switches, and bump
+  // visibleCount when scroll-up loadEarlier prepends older history on the same
+  // session so newly loaded history is immediately visible instead of folded.
+  React.useLayoutEffect(() => {
+    const transition = computeExecWindowTransition(prevSnapshotRef.current, {
+      sessionKey,
+      taskId,
+      minRealSeq,
+      maxRealSeq,
+      groupCount: groups.length,
+    });
+    prevSnapshotRef.current = transition.nextSnapshot;
+    if (transition.action === "reset") {
+      revealingRef.current = false;
+      if (revealRafRef.current !== null) {
+        cancelAnimationFrame(revealRafRef.current);
+        revealRafRef.current = null;
+      }
+      setWindowState((cur) =>
+        cur.key === sessionKey && cur.count === EXEC_WINDOW_INITIAL
+          ? cur
+          : { key: sessionKey, count: EXEC_WINDOW_INITIAL },
+      );
+    } else if (transition.action === "bump") {
+      setWindowState((cur) => {
+        const base = sessionKey !== undefined && cur.key !== sessionKey ? EXEC_WINDOW_INITIAL : cur.count;
+        return { key: sessionKey, count: base + transition.delta };
+      });
+    }
+  }, [sessionKey, taskId, minRealSeq, maxRealSeq, groups.length]);
+
+  React.useEffect(
+    () => () => {
+      if (revealRafRef.current !== null) {
+        cancelAnimationFrame(revealRafRef.current);
+        revealRafRef.current = null;
+      }
+      revealingRef.current = false;
+    },
+    [],
+  );
+
+  const startIndex = React.useMemo(() => {
+    if (groups.length <= visibleCount) return 0;
+    let start = groups.length - visibleCount;
+    if (focusedSeq != null) {
+      const focusedIndex = groups.findIndex(
+        (g) => (g.type === "tool" && g.use?.seq === focusedSeq) || g.key === focusedSeq,
+      );
+      if (focusedIndex >= 0 && focusedIndex < start) start = focusedIndex;
+    }
+    return start;
+  }, [groups, visibleCount, focusedSeq]);
+
+  React.useLayoutEffect(() => {
+    startIndexRef.current = startIndex;
+  }, [startIndex]);
+
+  const visibleGroups = React.useMemo(
+    () => (startIndex > 0 ? groups.slice(startIndex) : groups),
+    [groups, startIndex],
+  );
+
+  const revealEarlier = React.useCallback(() => {
+    const vp = containerRef.current?.closest('[data-slot="scroll-area-viewport"]') as HTMLElement | null;
+    const prevH = vp?.scrollHeight ?? 0;
+    const prevTop = vp?.scrollTop ?? 0;
+    revealingRef.current = true;
+    setWindowState((cur) => {
+      const base = sessionKey !== undefined && cur.key !== sessionKey ? EXEC_WINDOW_INITIAL : cur.count;
+      return { key: sessionKey, count: base + EXEC_WINDOW_STEP };
+    });
+    if (revealRafRef.current !== null) cancelAnimationFrame(revealRafRef.current);
+    revealRafRef.current = requestAnimationFrame(() => {
+      revealRafRef.current = null;
+      revealingRef.current = false;
+      if (vp) {
+        vp.scrollTop = prevTop + (vp.scrollHeight - prevH);
+      }
+    });
+  }, [sessionKey]);
+
+  React.useEffect(() => {
+    if (!onRevealReady) return;
+    onRevealReady(() => {
+      if (startIndexRef.current <= 0) return false;
+      if (revealingRef.current) return true;
+      revealEarlier();
+      return true;
+    });
+    return () => onRevealReady(null);
+  }, [onRevealReady, revealEarlier]);
+
   // default detail fetcher: the task-scoped activity endpoint. The chat page passes
   // its own (conversation-scoped) fetcher instead.
   const getDetail = React.useCallback(
@@ -713,8 +911,18 @@ function ExecView({
     [fetchDetail, taskId],
   );
   return (
-    <div className="flex flex-col">
-      {groupSteps(activity, !!chat).map((g) =>
+    <div ref={containerRef} className="flex flex-col">
+      {startIndex > 0 && (
+        <div className="mb-2 flex flex-wrap items-center justify-center gap-2 rounded-md border border-dashed bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
+          <span>
+            已折叠更早的 {startIndex} 条执行块（当前渲染最近 {visibleGroups.length} 条）
+          </span>
+          <Button type="button" size="sm" variant="outline" className="h-6 px-2 text-xs" onClick={revealEarlier}>
+            展开更早 {Math.min(EXEC_WINDOW_STEP, startIndex)} 条
+          </Button>
+        </div>
+      )}
+      {visibleGroups.map((g) =>
         g.type === "round" ? (
           <div key={"r" + g.key} className="my-2 flex items-center gap-2 text-[10px] font-medium text-muted-foreground">
             <span className="h-px flex-1 bg-border" />
@@ -741,25 +949,29 @@ function ExecView({
       )}
     </div>
   );
-}
+});
 
 // Transcript renders a session's activity as a compact grouped execution replay:
 // human turns, thinking, tool calls (command+result paired), and messages — for
 // the main agent (interactive) and worker/planner (read-only) alike.
 export function Transcript({
   activity,
+  sessionKey,
   live,
   taskId,
   chat,
   fetchDetail,
   focusedSeq,
+  onRevealReady,
 }: {
   activity: Activity[];
+  sessionKey?: string;
   live?: boolean;
   taskId?: string;
   chat?: boolean;
   fetchDetail?: (seq: number) => Promise<string>;
   focusedSeq?: number;
+  onRevealReady?: (reveal: (() => boolean) | null) => void;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
   const [focusPadding, setFocusPadding] = React.useState(0);
@@ -775,7 +987,15 @@ export function Transcript({
   }, [focusedSeq]);
   return (
     <div ref={transcriptRef} className="flex flex-col gap-1" style={focusPadding ? { paddingBlock: focusPadding } : undefined}>
-      <ExecView activity={activity} taskId={taskId} chat={chat} fetchDetail={fetchDetail} focusedSeq={focusedSeq} />
+      <ExecView
+        activity={activity}
+        sessionKey={sessionKey}
+        taskId={taskId}
+        chat={chat}
+        fetchDetail={fetchDetail}
+        focusedSeq={focusedSeq}
+        onRevealReady={onRevealReady}
+      />
       {live && (
         <div className="flex items-center gap-2 pl-2 pt-1 text-xs text-muted-foreground">
           <span className="flex gap-1">

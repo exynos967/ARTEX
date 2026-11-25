@@ -44,14 +44,26 @@ export function UpdateCard() {
   // 与 progress 分开：暂存完成后进程就没了，SSE 会断，此时要切到轮询 /api/health。
   const [restarting, setRestarting] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const esRef = React.useRef<EventSource | null>(null);
+  const unmountedRef = React.useRef(false);
+
+  React.useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+      esRef.current?.close();
+      esRef.current = null;
+    };
+  }, []);
 
   // quiet 同时决定要不要绕过后端缓存：进页面时的自动检查用缓存（顶栏刚查过），
   // 用户手动点「检查更新」则强制回源，否则刚发布的版本要等缓存过期才看得到。
   const check = React.useCallback((quiet = false) => {
     setChecking(true);
-    api
+    void api
       .checkUpdate(!quiet)
       .then((r) => {
+        if (unmountedRef.current) return;
         setInfo(r);
         if (!quiet) {
           if (r.error) toast.error("检查更新失败：" + r.error);
@@ -60,9 +72,12 @@ export function UpdateCard() {
         }
       })
       .catch((e) => {
+        if (unmountedRef.current) return;
         if (!quiet) toast.error("检查更新失败：" + (e as Error).message);
       })
-      .finally(() => setChecking(false));
+      .finally(() => {
+        if (!unmountedRef.current) setChecking(false);
+      });
   }, []);
 
   React.useEffect(() => {
@@ -74,17 +89,22 @@ export function UpdateCard() {
   // 判据必须是"版本变了"而不是"能连上了"：换装过程中旧版本会短暂地重新起来一次
   // （那一次只负责把 artex.new 换上去然后立刻退出），只看连通性会误判成功。
   const waitForNewVersion = React.useCallback(async (fromVersion: string) => {
+    if (unmountedRef.current) return;
     setRestarting(true);
     const deadline = Date.now() + RESTART_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await sleep(2000);
+      if (unmountedRef.current) return;
       try {
         const r = await fetch("/api/health", { cache: "no-store" });
+        if (unmountedRef.current) return;
         if (r.ok) {
           const j = (await r.json()) as { version?: string };
+          if (unmountedRef.current) return;
           if (j.version && j.version !== fromVersion) {
             toast.success(`已更新到 ${j.version}，正在重新加载页面`);
             await sleep(800);
+            if (unmountedRef.current) return;
             window.location.reload();
             return;
           }
@@ -93,6 +113,7 @@ export function UpdateCard() {
         // 重启窗口内连不上是预期的，继续轮询。
       }
     }
+    if (unmountedRef.current) return;
     setRestarting(false);
     toast.error("等待服务重启超时。请检查后端日志，或确认 artex 是通过 start.sh / start.bat 启动的。");
   }, []);
@@ -100,8 +121,18 @@ export function UpdateCard() {
   // 订阅更新进度。SSE 不走 Next 的 /api 重写（那层会缓冲，事件推不出来）。
   const openStream = React.useCallback(
     (fromVersion: string) => {
+      esRef.current?.close();
       const es = new EventSource(sseUrl("/api/update/stream"));
+      esRef.current = es;
+      const closeStream = () => {
+        es.close();
+        if (esRef.current === es) esRef.current = null;
+      };
       es.onmessage = (ev) => {
+        if (unmountedRef.current) {
+          closeStream();
+          return;
+        }
         let p: UpdateProgress;
         try {
           p = JSON.parse(ev.data) as UpdateProgress;
@@ -110,20 +141,20 @@ export function UpdateCard() {
         }
         setProgress(p);
         if (p.phase === "failed") {
-          es.close();
+          closeStream();
           setBusy(false);
           toast.error("更新失败：" + (p.error || p.message));
           return;
         }
         if (p.phase === "staged") {
-          es.close();
+          closeStream();
           void waitForNewVersion(fromVersion);
         }
       };
       es.onerror = () => {
         // 进程退出时 SSE 必然断开。如果已经进入等待重启，这属于正常现象，
         // 交给 /api/health 轮询继续判定即可。
-        es.close();
+        closeStream();
       };
       return es;
     },
@@ -146,8 +177,10 @@ export function UpdateCard() {
     setBusy(true);
     setProgress({ phase: "downloading", percent: 0, message: "准备中…" });
     const es = openStream(from);
-    api.applyUpdate().catch((e) => {
+    void api.applyUpdate().catch((e) => {
       es.close();
+      if (esRef.current === es) esRef.current = null;
+      if (unmountedRef.current) return;
       setBusy(false);
       setProgress(null);
       toast.error("启动更新失败：" + (e as Error).message);
@@ -164,13 +197,15 @@ export function UpdateCard() {
       return;
     const from = info.current;
     setBusy(true);
-    api
+    void api
       .rollbackUpdate()
       .then(() => {
+        if (unmountedRef.current) return;
         toast.success("已切换到上一版本，正在重启…");
         void waitForNewVersion(from);
       })
       .catch((e) => {
+        if (unmountedRef.current) return;
         setBusy(false);
         toast.error("回滚失败：" + (e as Error).message);
       });

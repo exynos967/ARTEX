@@ -1,10 +1,20 @@
-import { RefreshCoordinator, RequestCache, type RefreshOptions } from "./api-cache";
+import { RefreshCooldownGate, RefreshCoordinator, RequestCache, type RefreshOptions } from "./api-cache";
+
+export const EVENT_COALESCE_MS = 2_500;
+export const FOCUS_REFRESH_COOLDOWN_MS = 10_000;
+export const RESUME_REFRESH_COOLDOWN_MS = 5_000;
 
 export const apiCache = new RequestCache();
 const coordinator = new RefreshCoordinator();
+const refreshCooldown = new RefreshCooldownGate({
+  focusMs: FOCUS_REFRESH_COOLDOWN_MS,
+  resumeMs: RESUME_REFRESH_COOLDOWN_MS,
+});
 let subscribers = 0;
 let removeListeners: (() => void) | undefined;
 let session: string | null | undefined;
+let eventTimer: ReturnType<typeof setTimeout> | undefined;
+const eventKeys = new Set<string>();
 
 export function syncApiSession(token: string | null): void {
   if (session === token) return;
@@ -14,6 +24,12 @@ export function syncApiSession(token: string | null): void {
 
 export function clearApiCache(): void {
   session = undefined;
+  if (eventTimer !== undefined) {
+    clearTimeout(eventTimer);
+    eventTimer = undefined;
+    eventKeys.clear();
+  }
+  refreshCooldown.reset();
   apiCache.clear();
   coordinator.invalidate();
 }
@@ -24,9 +40,7 @@ export function invalidateApiData(keys?: readonly string[]): void {
 }
 
 // Activity can arrive for every streamed token. Coalesce it into at most one
-// invalidation per second while preserving the last batch during long streams.
-let eventTimer: ReturnType<typeof setTimeout> | undefined;
-const eventKeys = new Set<string>();
+// invalidation per 2.5 seconds while preserving the last batch during long streams.
 export function notifyApiEvent(keys: readonly string[]): void {
   for (const key of keys) eventKeys.add(key);
   if (eventTimer !== undefined) return;
@@ -34,32 +48,44 @@ export function notifyApiEvent(keys: readonly string[]): void {
     eventTimer = undefined;
     const batch = [...eventKeys];
     eventKeys.clear();
-    invalidateApiData(batch);
-  }, 1_000);
+    if (batch.length > 0) invalidateApiData(batch);
+  }, EVENT_COALESCE_MS);
 }
 
 function attachBrowserListeners(): () => void {
   if (typeof document === "undefined") return () => undefined;
+  let wasVisible = document.visibilityState !== "hidden";
+  coordinator.setVisible(wasVisible, false);
   const visibility = () => {
     const visible = document.visibilityState !== "hidden";
-    if (visible) apiCache.invalidate();
-    coordinator.setVisible(visible);
+    if (!visible) {
+      wasVisible = false;
+      coordinator.setVisible(false);
+      return;
+    }
+    const returningFromHidden = !wasVisible;
+    wasVisible = true;
+    const shouldRefresh = returningFromHidden && refreshCooldown.allow("resume");
+    if (shouldRefresh) apiCache.invalidate();
+    coordinator.setVisible(true, shouldRefresh);
   };
-  const refresh = () => {
-    if (document.visibilityState !== "hidden") invalidateApiData();
+  const onFocus = () => {
+    if (document.visibilityState !== "hidden" && refreshCooldown.allow("focus")) invalidateApiData();
+  };
+  const onOnline = () => {
+    if (document.visibilityState !== "hidden" && refreshCooldown.allow("online")) invalidateApiData();
   };
   const storage = (event: StorageEvent) => {
     if (event.key === "artex_token" || event.key === null) clearApiCache();
   };
-  visibility();
   document.addEventListener("visibilitychange", visibility);
-  window.addEventListener("focus", refresh);
-  window.addEventListener("online", refresh);
+  window.addEventListener("focus", onFocus);
+  window.addEventListener("online", onOnline);
   window.addEventListener("storage", storage);
   return () => {
     document.removeEventListener("visibilitychange", visibility);
-    window.removeEventListener("focus", refresh);
-    window.removeEventListener("online", refresh);
+    window.removeEventListener("focus", onFocus);
+    window.removeEventListener("online", onOnline);
     window.removeEventListener("storage", storage);
   };
 }

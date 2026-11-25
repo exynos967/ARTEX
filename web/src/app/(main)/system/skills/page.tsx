@@ -44,6 +44,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import type { Agent, SkillItem, MCPServer, SkillCall, MissingSkill } from "@/lib/types";
+import { mapWithConcurrency } from "@/lib/view-guards";
 
 function fmtTime(ts?: string) {
   if (!ts) return "从未调用";
@@ -341,17 +342,31 @@ export default function SkillsPage() {
   const [missing, setMissing] = React.useState<MissingSkill[]>([]);
 
   // ── Data ──────────────────────────────────────────────────────────────────
+  const visibilityLoadSeq = React.useRef(0);
   const load = React.useCallback(() => {
     api.agents().then(setAgents).catch(() => {});
     api.mcpServers().then(setMcpOptions).catch(() => {});
     api.missingSkills().then(setMissing).catch(() => {});
-    api.skills().then((ss) => {
+    const seq = ++visibilityLoadSeq.current;
+    api.skills().then(async (ss) => {
+      if (visibilityLoadSeq.current !== seq) return;
       setSkills(ss);
-      ss.forEach((s) =>
-        api.skillVisibility(s.name)
-          .then((ids) => setVisibility((v) => ({ ...v, [s.name]: ids })))
-          .catch(() => {}),
-      );
+      const entries = await mapWithConcurrency(ss, 4, async (s) => {
+        try {
+          const ids = await api.skillVisibility(s.name);
+          return [s.name, ids] as const;
+        } catch {
+          return null;
+        }
+      });
+      if (visibilityLoadSeq.current !== seq) return;
+      const updates: Record<string, string[]> = {};
+      for (const entry of entries) {
+        if (entry) updates[entry[0]] = entry[1];
+      }
+      if (Object.keys(updates).length > 0) {
+        setVisibility((v) => ({ ...v, ...updates }));
+      }
     }).catch(() => {});
   }, []);
 
@@ -577,8 +592,8 @@ export default function SkillsPage() {
         mcps: newMcps.length ? newMcps : undefined,
         instructions: newInst.trim() || undefined,
       });
-      // apply initial visibility (fire-and-forget per agent; best-effort)
-      await Promise.all(newVisibility.map((id) => api.toggleSkillVisibility(id, name, true)));
+      // apply initial visibility with bounded concurrency
+      await mapWithConcurrency(newVisibility, 4, (id) => api.toggleSkillVisibility(id, name, true));
       toast.success("已创建 Skill");
       setNewOpen(false);
       setNewName(""); setNewDesc(""); setNewLicense(""); setNewCompat(""); setNewInst("");

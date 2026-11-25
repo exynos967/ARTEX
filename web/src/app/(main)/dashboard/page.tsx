@@ -23,6 +23,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Progress } from "@/components/ui/progress";
 import { api } from "@/lib/api";
+import { dashboardTokenBreakdown, tokenPercentage } from "@/lib/dashboard-tokens";
 import type {
   Activity,
   Agent,
@@ -45,7 +46,7 @@ import { cn } from "@/lib/utils";
 // ── chart constants ───────────────────────────────────────────────────────────
 
 const dailyTrendConfig = {
-  input: { label: "输入", color: "hsl(217 91% 60%)" },
+  uncachedInput: { label: "输入（未命中）", color: "hsl(217 91% 60%)" },
   output: { label: "输出", color: "hsl(263 70% 60%)" },
   cacheRead: { label: "缓存读", color: "hsl(160 60% 45%)" },
 } satisfies ChartConfig;
@@ -433,6 +434,8 @@ export default function DashboardPage() {
       : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
   }, [tokenTab, tokenByProfile]);
 
+  const tokenBreakdown = dashboardTokenBreakdown(displayedTokens);
+
   // 旧版每日：把任务/会话的总量按其创建日期归桶（近似，非真实每日消耗）。
   const dailyTokenDataOld = React.useMemo(() => {
     const now = new Date();
@@ -479,7 +482,13 @@ export default function DashboardPage() {
     return [...m.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, v]) => ({ date: date.slice(5), ...v }));
   }, [usageStats, tokenDays, tokenTab, profileIdByName, defaultProfileId]);
 
-  const dailyTokenData = tokenVersion === "new" ? dailyTokenDataNew : dailyTokenDataOld;
+  const dailyTokenData = React.useMemo(
+    () => (tokenVersion === "new" ? dailyTokenDataNew : dailyTokenDataOld).map(({ date, ...bucket }) => ({
+      date,
+      ...dashboardTokenBreakdown(bucket),
+    })),
+    [tokenVersion, dailyTokenDataNew, dailyTokenDataOld],
+  );
 
   // activity kind label
   function kindLabel(a: Activity): string {
@@ -584,10 +593,10 @@ export default function DashboardPage() {
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <ZapIcon className="size-3" /> Token 用量
+              <ZapIcon className="size-3" /> 累计 Token 用量
             </div>
             <div className="text-2xl font-semibold tabular-nums">
-              {fmtTokens(displayedTokens.input + displayedTokens.output) || "—"}
+              {fmtTokens(tokenBreakdown.total) || "—"}
             </div>
           </CardHeader>
           <CardContent className="text-[10px] text-muted-foreground">
@@ -692,39 +701,38 @@ export default function DashboardPage() {
           <div className="flex flex-col gap-4">
             {/* Total */}
             <div>
-              <div className="text-[10px] text-muted-foreground">合计 (输入+输出)</div>
+              <div className="text-[10px] text-muted-foreground">所选数据源累计（输入 + 输出）</div>
               <div className="mt-0.5 text-3xl font-bold tabular-nums tracking-tight">
-                {fmtTokens(displayedTokens.input + displayedTokens.output) || "—"}
+                {fmtTokens(tokenBreakdown.total) || "—"}
               </div>
               <div className="mt-0.5 text-[10px] text-muted-foreground">{displayedTokens.taskCount} 个任务</div>
             </div>
 
             {/* Per-type bars */}
             <div className="space-y-3">
+              <div className="text-[10px] text-muted-foreground">各项占输入 + 输出的比例</div>
               {(() => {
-                // input 已含缓存；拆成不重叠三段：未命中输入 + 缓存命中 + 输出 = 总量。
-                const total = displayedTokens.input + displayedTokens.output;
                 return [
                   {
                     label: "输入(未命中)",
-                    value: displayedTokens.input - displayedTokens.cacheRead,
-                    barColor: dailyTrendConfig.input.color!,
+                    value: tokenBreakdown.uncachedInput,
+                    barColor: dailyTrendConfig.uncachedInput.color!,
                     text: "text-blue-400",
                   },
                   {
                     label: "缓存命中",
-                    value: displayedTokens.cacheRead,
+                    value: tokenBreakdown.cacheRead,
                     barColor: dailyTrendConfig.cacheRead.color!,
                     text: "text-emerald-400",
                   },
                   {
                     label: "输出",
-                    value: displayedTokens.output,
+                    value: tokenBreakdown.output,
                     barColor: dailyTrendConfig.output.color!,
                     text: "text-violet-400",
                   },
                 ].map(({ label, value, barColor, text }) => {
-                  const pct = total > 0 ? (value / total) * 100 : 0;
+                  const pct = tokenPercentage(value, tokenBreakdown.total) ?? 0;
                   return (
                     <div key={label}>
                       <div className="mb-1 flex items-center justify-between text-[10px]">
@@ -744,28 +752,27 @@ export default function DashboardPage() {
             </div>
 
             {/* Cache hit rate */}
-            {(() => {
-              // input 已含缓存 → 命中率 = 缓存命中 / 总输入。
-              const denominator = displayedTokens.input;
-              const hitPct = denominator > 0 ? Math.round((displayedTokens.cacheRead / denominator) * 100) : 0;
-              return (
-                <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2 text-[10px]">
-                  <span className="text-muted-foreground">缓存命中率</span>
-                  <span
-                    className={cn("font-semibold tabular-nums", hitPct > 50 ? "text-emerald-400" : "text-amber-400")}
-                  >
-                    {hitPct}%
-                  </span>
-                </div>
-              );
-            })()}
+            <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2 text-[10px]">
+              <span className="text-muted-foreground">累计命中率（缓存读 / 输入）</span>
+              <span
+                className={cn(
+                  "font-semibold tabular-nums",
+                  tokenBreakdown.hitPercent !== null && (tokenBreakdown.hitPercent > 50 ? "text-emerald-400" : "text-amber-400"),
+                )}
+              >
+                {tokenBreakdown.hitPercent === null ? "无输入" : `${tokenBreakdown.hitPercent}%`}
+              </span>
+            </div>
           </div>
 
           {/* Right: daily bar chart */}
           <div className="flex min-h-0 flex-col">
+            <div className="mb-1 text-[10px] text-muted-foreground">
+              每日用量 · {tokenVersion === "new" ? "按调用日期（UTC）" : "按任务或会话创建日期"}
+            </div>
             <div className="mb-2 flex items-center justify-between">
               <div className="flex gap-3 text-[9px] text-muted-foreground">
-                {(["input", "output", "cacheRead"] as const).map((k) => (
+                {(["uncachedInput", "output", "cacheRead"] as const).map((k) => (
                   <span key={k} className="flex items-center gap-1">
                     <span
                       className="inline-block size-2 rounded-sm"
@@ -845,7 +852,7 @@ export default function DashboardPage() {
                       />
                     }
                   />
-                  <Bar dataKey="input" stackId="1" fill="var(--color-input)" radius={[0, 0, 0, 0]} />
+                  <Bar dataKey="uncachedInput" stackId="1" fill="var(--color-uncachedInput)" radius={[0, 0, 0, 0]} />
                   <Bar dataKey="output" stackId="1" fill="var(--color-output)" radius={[0, 0, 0, 0]} />
                   <Bar dataKey="cacheRead" stackId="1" fill="var(--color-cacheRead)" radius={[4, 4, 0, 0]} />
                 </BarChart>

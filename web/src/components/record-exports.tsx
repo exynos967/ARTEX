@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { subscribeRefresh } from "@/lib/api-refresh";
 import { type RecordExport, recordExportAPI } from "@/lib/record-exports";
 import { newRequestId } from "@/lib/request-id";
 
@@ -111,30 +112,28 @@ export function RecordExports({ taskId }: { taskId: string }) {
     [taskId],
   );
   useEffect(() => {
-    let alive = true,
-      pending = false;
+    let alive = true;
     paginated.current = false;
     setJobs([]);
     const refresh = async () => {
-      if (pending || document.hidden) return;
-      pending = true;
       try {
         const rows = await recordExportAPI.list(taskId);
         if (alive) {
           setJobs((v) => (paginated.current ? [...rows, ...v.filter((j) => !rows.some((r) => r.id === j.id))] : rows));
           if (!paginated.current) setMore(rows.length === 50);
+          setError("");
         }
       } catch (e) {
         if (alive) setError(String(e));
-      } finally {
-        pending = false;
       }
     };
-    void refresh();
-    const timer = setInterval(refresh, 5000);
+    const stop = subscribeRefresh(refresh, {
+      intervalMs: 5_000,
+      keys: ["/task-record-exports"],
+    });
     return () => {
       alive = false;
-      clearInterval(timer);
+      stop();
     };
   }, [taskId]);
   async function action(id: number, act: string) {
