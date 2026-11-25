@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RC-CHN/ARTEX/agent"
 	"github.com/RC-CHN/ARTEX/db"
 )
 
@@ -175,7 +176,12 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // admission is exercised without starting background planner/worker work
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx}
+	engine := NewEngine(m)
+	planner, worker := new(agent.Planner), new(agent.Worker)
+	engine.SetAuthoritativeAgentResolver(func(*Task) (*agent.Planner, *agent.Worker) {
+		return planner, worker
+	})
+	s := &Server{m: m, engine: engine, ctx: ctx}
 	live, unsubscribe := s.engine.Broadcaster().Subscribe(task.ID)
 	defer unsubscribe()
 	body := bytes.NewBufferString(`{"description":"验证完整利用链并保留可复现证据"}`)

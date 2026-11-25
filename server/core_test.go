@@ -23,6 +23,12 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer m.Close()
+	// This smoke exercises fallback goal seeding without an LLM profile; disable
+	// concurrency admission gating so !ReadyFor does not park the task in FIFO.
+	defer restoreConcurrencySetting(t, m)()
+	if err := m.SetConcurrency(false, defaultConcurrencyLimit); err != nil {
+		t.Fatal(err)
+	}
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 	h := s.Handler()

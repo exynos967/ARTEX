@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -222,8 +223,11 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "1-0001", 1, host, "GET", "/", "https://"+host+"
 BEGIN RAISE EXCEPTION 'forced task delete failure'; END $body$`, functionName)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.pg.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE DELETE ON tasks
-FOR EACH ROW WHEN (OLD.id = %d) EXECUTE FUNCTION %s()`, triggerName, taskID, functionName)); err != nil {
+	// Trigger on Phase 1 tombstone UPDATE (which runs inside the locked
+	// transaction after traffic staging) to verify pre-commit failure rolls back
+	// PostgreSQL, workspace files, transcripts, and traffic cleanly.
+	if _, err := m.pg.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE OF deleted_at ON tasks
+FOR EACH ROW WHEN (OLD.id = %d AND NEW.deleted_at IS NOT NULL) EXECUTE FUNCTION %s()`, triggerName, taskID, functionName)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -242,6 +246,62 @@ FOR EACH ROW WHEN (OLD.id = %d) EXECUTE FUNCTION %s()`, triggerName, taskID, fun
 	var trafficRows int
 	if err := tr.DB().QueryRow(`SELECT COUNT(*) FROM exchanges WHERE host=?`, host).Scan(&trafficRows); err != nil || trafficRows != 1 {
 		t.Fatalf("traffic index was not restored: rows=%d err=%v", trafficRows, err)
+	}
+}
+
+func TestManagerDeleteTaskCompactionFailureStaysTombstonedAndSweeps(t *testing.T) {
+	dataDir := t.TempDir()
+	m, err := NewManager(dataDir, "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
+	task, err := m.CreateTask("delete phase3 sweep", "delete phase3 sweep", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID := mustTaskID(t, task.ID)
+	triggerName := fmt.Sprintf("test_fail_task_compact_%d", taskID)
+	functionName := triggerName + "_fn"
+	dropTrigger := func() {
+		_, _ = m.pg.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON tasks`, triggerName))
+		_, _ = m.pg.Exec(fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, functionName))
+	}
+	t.Cleanup(func() {
+		dropTrigger()
+		_, _ = m.pg.SweepOrphanedDeletedTasks(context.Background())
+	})
+
+	createDeleteFixture(t, dataDir, filepath.Join("tasks", task.ID), true)
+	if _, err := m.pg.Exec(fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $body$
+BEGIN RAISE EXCEPTION 'forced phase3 compaction failure'; END $body$`, functionName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.pg.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE DELETE ON tasks
+FOR EACH ROW WHEN (OLD.id = %d) EXECUTE FUNCTION %s()`, triggerName, taskID, functionName)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = m.DeleteTask(task.ID, DeleteTaskOptions{DeleteFiles: true})
+	var committed *taskDeleteCommittedError
+	if !errors.As(err, &committed) || !strings.Contains(err.Error(), "forced phase3 compaction failure") {
+		t.Fatalf("delete err=%v, want taskDeleteCommittedError wrapping compaction failure", err)
+	}
+	if got, gerr := m.pg.GetTask(taskID); gerr != nil || got != nil {
+		t.Fatalf("tombstoned task should not be visible as live: task=%+v err=%v", got, gerr)
+	}
+	assertPathMissing(t, filepath.Join(dataDir, "tasks", task.ID))
+
+	// Removing the transient Phase 3 fault lets SweepOrphanedDeletedTasks purge the stub.
+	dropTrigger()
+	swept, err := m.pg.SweepOrphanedDeletedTasks(context.Background())
+	if err != nil || swept < 1 {
+		t.Fatalf("SweepOrphanedDeletedTasks swept=%d err=%v, want >=1 / nil", swept, err)
+	}
+	var remaining int
+	if err := m.pg.QueryRow(`SELECT COUNT(*) FROM tasks WHERE id=$1`, taskID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("tombstoned task row was not swept: remaining=%d err=%v", remaining, err)
 	}
 }
 

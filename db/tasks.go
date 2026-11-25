@@ -438,9 +438,15 @@ func (d *DB) GetTask(id int64) (*Task, error) {
 	return t, nil
 }
 
-// SetPaused persists a task's paused flag.
+// SetPaused persists a task's paused flag. Pausing a task also clears any
+// admission-queue hold (matching ApplyTaskPause) so a task cannot remain in
+// the inconsistent paused=true && queued=true state.
 func (d *DB) SetPaused(id int64, paused bool) error {
-	_, err := d.Exec(`UPDATE tasks SET paused=$1 WHERE id=$2`, paused, id)
+	_, err := d.Exec(`UPDATE tasks
+SET paused=$1,
+    queued=CASE WHEN $1 THEN false ELSE queued END,
+    queued_at=CASE WHEN $1 THEN NULL ELSE queued_at END
+WHERE id=$2`, paused, id)
 	return err
 }
 

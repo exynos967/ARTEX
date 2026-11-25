@@ -1264,6 +1264,10 @@ func (m *Manager) SetTaskPaused(id string, paused bool) error {
 	if t := m.tasks[id]; t != nil {
 		t.updateLifecycle(func(state *taskLifecycleState) {
 			state.Paused = paused
+			if paused {
+				state.Queued = false
+				state.QueuedAt = 0
+			}
 		})
 	}
 	m.mu.Unlock()
