@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	pgdb "github.com/RC-CHN/ARTEX/db"
@@ -252,5 +253,96 @@ func TestTaskArchivePackageRejectsTraversal(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(root), "escape.txt")); !os.IsNotExist(err) {
 		t.Fatalf("traversal wrote outside destination: %v", err)
+	}
+}
+
+func TestTaskArchivePackageNDJSONTablesAndLowMemZstdRoundTrip(t *testing.T) {
+	dataDir := t.TempDir()
+	payload := filepath.Join(dataDir, "payload")
+	tablesDir := filepath.Join(payload, pgdb.TaskArchiveTablesDir)
+	if err := os.MkdirAll(tablesDir, archiveDirMode); err != nil {
+		t.Fatal(err)
+	}
+
+	var activityBuf bytes.Buffer
+	for i := 1; i <= 1200; i++ {
+		activityBuf.WriteString(`{"id":` + strconv.Itoa(i) + `,"summary":"streamed activity row with compressible text payload"}` + "\n")
+	}
+	llmBody := []byte(`{"id":1,"raw_request":"` + string(bytes.Repeat([]byte("A"), 64*1024)) + `"}` + "\n")
+	if err := os.WriteFile(filepath.Join(tablesDir, "activity.ndjson"), activityBuf.Bytes(), archiveFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tablesDir, "llm_records.ndjson"), llmBody, archiveFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := &pgdb.TaskArchiveSnapshot{
+		FormatVersion: pgdb.TaskArchiveFormatVersion,
+		TaskID:        99,
+		ExplorationID: 199,
+		Tables: map[string]json.RawMessage{
+			"tasks":        json.RawMessage(`[{"id":99}]`),
+			"explorations": json.RawMessage(`[{"id":199}]`),
+			"activity":     json.RawMessage(`[]`),
+			"llm_records":  json.RawMessage(`[]`),
+		},
+		StreamedTables: map[string]string{
+			"activity":    pgdb.TaskArchiveTablePath("activity"),
+			"llm_records": pgdb.TaskArchiveTablePath("llm_records"),
+		},
+		NDJSONTables: map[string]int64{
+			"activity":    1200,
+			"llm_records": 1,
+		},
+		DataCounts: map[string]int64{
+			"activity":    1200,
+			"llm_records": 1,
+		},
+	}
+
+	archivePath := taskArchivePath(dataDir, 7, "99")
+	origSize, compSize, checksum, err := writeTaskArchivePackage(archivePath, payload, snapshot)
+	if err != nil {
+		t.Fatalf("writeTaskArchivePackage: %v", err)
+	}
+	if origSize == 0 || compSize == 0 || compSize >= origSize || checksum == "" {
+		t.Fatalf("unexpected compression metrics orig=%d comp=%d sha=%q", origSize, compSize, checksum)
+	}
+
+	extracted := filepath.Join(dataDir, "extracted")
+	if err := extractTaskArchivePackage(archivePath, checksum, extracted); err != nil {
+		t.Fatalf("extractTaskArchivePackage: %v", err)
+	}
+
+	manifestRaw, err := os.ReadFile(filepath.Join(extracted, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotSnap pgdb.TaskArchiveSnapshot
+	if err := json.Unmarshal(manifestRaw, &gotSnap); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgdb.ValidateTaskArchiveStreamedTables(&gotSnap); err != nil {
+		t.Fatalf("extracted manifest failed validation: %v", err)
+	}
+	if gotSnap.NDJSONTables["activity"] != 1200 || gotSnap.NDJSONTables["llm_records"] != 1 {
+		t.Fatalf("unexpected ndjson_tables: %#v", gotSnap.NDJSONTables)
+	}
+
+	gotActivity, err := os.ReadFile(filepath.Join(extracted, filepath.FromSlash(pgdb.TaskArchiveTablePath("activity"))))
+	if err != nil || !bytes.Equal(gotActivity, activityBuf.Bytes()) {
+		t.Fatalf("extracted activity.ndjson mismatch err=%v len=%d", err, len(gotActivity))
+	}
+	gotLLM, err := os.ReadFile(filepath.Join(extracted, filepath.FromSlash(pgdb.TaskArchiveTablePath("llm_records"))))
+	if err != nil || !bytes.Equal(gotLLM, llmBody) {
+		t.Fatalf("extracted llm_records.ndjson mismatch err=%v len=%d", err, len(gotLLM))
+	}
+
+	// Verify path safety helper rejects escaping paths.
+	if _, err := resolveArchivePayloadPath(extracted, "../escape.ndjson"); err == nil {
+		t.Fatal("resolveArchivePayloadPath accepted traversal")
+	}
+	if _, err := resolveArchivePayloadPath(extracted, pgdb.TaskArchiveTablePath("activity")); err != nil {
+		t.Fatalf("resolveArchivePayloadPath rejected valid table path: %v", err)
 	}
 }

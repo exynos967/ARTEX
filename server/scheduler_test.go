@@ -18,7 +18,11 @@ func schedulerFixture(t *testing.T) (*Scheduler, func(string) *Task) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Close() })
-	for _, key := range []string{schedKeyLastFinding, schedKeyFiredGoals, schedKeyLastTimeout, schedKeyLastToolCall, schedKeyLastTaskCreate} {
+	for _, key := range []string{
+		schedKeyLastFinding, schedKeyFiredGoals, schedKeyGoalTriggersActive,
+		schedKeyLastTimeout, schedKeyFiredTimeouts, schedKeyTimeoutTriggersActive,
+		schedKeyLastToolCall, schedKeyLastTaskCreate,
+	} {
 		value, err := m.pg.GetSchedState(key)
 		if err != nil {
 			t.Fatal(err)

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -273,7 +275,7 @@ const (
 	// 绑定了某个配置就只用它、失败即失败;开启后绑定的配置失败也会回落到轮询链。
 	settingLLMPoolOn           = "llm_pool_enabled"
 	settingLLMPoolBindFallback = "llm_pool_bind_fallback"
-	// 任务并发上限:开关 + 上限数。默认关闭;开启后默认上限 5(见 defaultConcurrencyLimit)。
+	// 任务并发上限:开关 + 上限数。默认开启,默认上限 3(见 defaultConcurrencyLimit,硬上限 maxConcurrencyLimit)。
 	settingConcurrencyOn    = "task_concurrency_enabled"
 	settingConcurrencyLimit = "task_concurrency_limit"
 	// 实验功能:noa 模型驱动上下文压缩(norma v0.4.0)。默认关闭——开启后平台接入的四类
@@ -287,17 +289,30 @@ const (
 	deepSeekWebSearchBackend = "deepseek"
 	// defaultWorkers is the concurrent work-agent count when the setting is unset.
 	defaultWorkers = 3
+	// maxWorkersPerTask is the hard ceiling on concurrent work agents per task.
+	maxWorkersPerTask = 8
 	// defaultConcurrencyLimit is the simultaneous-running-task cap when the feature
-	// is enabled but no explicit limit was saved.
-	defaultConcurrencyLimit = 5
+	// is enabled (default on) and no explicit limit was saved.
+	defaultConcurrencyLimit = 3
+	// maxConcurrencyLimit is the hard ceiling on simultaneous running tasks.
+	maxConcurrencyLimit = 10
+	// P3 trigger concurrency and queue safety ceilings.
+	defaultTriggerMaxParallel = 4
+	maxTriggerMaxParallel     = 8
+	maxTriggerQueuePerAgent   = 64
 )
 
 // ConcurrencyLimit returns whether the simultaneous-running-task cap is enabled and
-// its limit (default 5 when enabled but unset). limit is always >=1 when enabled.
+// its limit (default enabled with limit 3 when unset, clamped to maxConcurrencyLimit).
+// limit is always in [1, maxConcurrencyLimit] when enabled.
 func (m *Manager) ConcurrencyLimit() (enabled bool, limit int) {
-	on, _, _ := m.pg.GetSetting(settingConcurrencyOn)
-	if strings.TrimSpace(on) != "true" {
-		return false, 0
+	if m == nil || m.pg == nil {
+		return true, defaultConcurrencyLimit
+	}
+	if on, ok, err := m.pg.GetSetting(settingConcurrencyOn); err == nil && ok {
+		if strings.TrimSpace(on) != "true" {
+			return false, 0
+		}
 	}
 	limit = defaultConcurrencyLimit
 	if v, ok, _ := m.pg.GetSetting(settingConcurrencyLimit); ok {
@@ -305,13 +320,23 @@ func (m *Manager) ConcurrencyLimit() (enabled bool, limit int) {
 			limit = n
 		}
 	}
+	if limit > maxConcurrencyLimit {
+		limit = maxConcurrencyLimit
+	}
 	return true, limit
 }
 
-// SetConcurrency persists the running-task concurrency cap. limit<1 is clamped to 1.
+// SetConcurrency persists the running-task concurrency cap. limit<1 falls back to
+// defaultConcurrencyLimit; values above maxConcurrencyLimit are rejected.
 func (m *Manager) SetConcurrency(enabled bool, limit int) error {
 	if limit < 1 {
 		limit = defaultConcurrencyLimit
+	}
+	if limit > maxConcurrencyLimit {
+		return fmt.Errorf("任务并发上限必须在 1-%d 之间", maxConcurrencyLimit)
+	}
+	if m == nil || m.pg == nil {
+		return fmt.Errorf("数据库未初始化")
 	}
 	if err := m.pg.SetSetting(settingConcurrencyLimit, strconv.Itoa(limit)); err != nil {
 		return err
@@ -319,9 +344,13 @@ func (m *Manager) SetConcurrency(enabled bool, limit int) error {
 	return m.pg.SetSetting(settingConcurrencyOn, strconv.FormatBool(enabled))
 }
 
-// Workers returns the concurrent work-agent count (default 3). The settings API
-// reconciles live task pools after persistence; reductions drain naturally.
+// Workers returns the concurrent work-agent count (default 3, clamped to
+// maxWorkersPerTask). The settings API reconciles live task pools after
+// persistence; reductions drain naturally.
 func (m *Manager) Workers() int {
+	if m == nil || m.pg == nil {
+		return defaultWorkers
+	}
 	v, ok, err := m.pg.GetSetting(settingWorkers)
 	if err != nil || !ok {
 		return defaultWorkers
@@ -330,13 +359,19 @@ func (m *Manager) Workers() int {
 	if err != nil || n <= 0 {
 		return defaultWorkers
 	}
+	if n > maxWorkersPerTask {
+		return maxWorkersPerTask
+	}
 	return n
 }
 
-// SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
+// SetWorkers persists the concurrent work-agent count. Values outside [1, maxWorkersPerTask] are rejected.
 func (m *Manager) SetWorkers(n int) error {
-	if n <= 0 {
-		return fmt.Errorf("workers 必须 >0")
+	if n <= 0 || n > maxWorkersPerTask {
+		return fmt.Errorf("workers 必须在 1-%d 之间", maxWorkersPerTask)
+	}
+	if m == nil || m.pg == nil {
+		return fmt.Errorf("数据库未初始化")
 	}
 	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
 }
@@ -786,8 +821,14 @@ func (m *Manager) GlobalProxy() string {
 func (m *Manager) SetGlobalProxy(raw string) error {
 	raw = strings.TrimSpace(raw)
 	if raw != "" {
-		if _, err := traffic.ValidateProxyURL(raw); err != nil {
+		u, err := traffic.ValidateProxyURL(raw)
+		if err != nil {
 			return err
+		}
+		if m.traffic != nil {
+			if err := checkGlobalProxySelfLoop(u, m.traffic.ProxyAddr()); err != nil {
+				return err
+			}
 		}
 	}
 	if err := m.pg.SetSetting(settingGlobalProxy, raw); err != nil {
@@ -804,6 +845,78 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 	// Keep the browser MCP's egress in sync with the new global proxy too.
 	m.syncBrowserMCPProxy()
 	return nil
+}
+
+// checkGlobalProxySelfLoop rejects any global egress proxy URL that points back
+// to this server's own local recording proxy, preventing an infinite MITM loop.
+func checkGlobalProxySelfLoop(candidate *url.URL, recordingProxyAddr string) error {
+	if candidate == nil {
+		return nil
+	}
+	selfRaw := strings.TrimSpace(recordingProxyAddr)
+	if selfRaw == "" {
+		return nil
+	}
+	if !strings.Contains(selfRaw, "://") {
+		selfRaw = "http://" + selfRaw
+	}
+	selfURL, err := url.Parse(selfRaw)
+	if err != nil || selfURL.Host == "" {
+		return nil
+	}
+	selfPort := effectiveProxyPort(selfURL)
+	candPort := effectiveProxyPort(candidate)
+	if selfPort == "" || candPort != selfPort {
+		return nil
+	}
+	selfHost := normalizeProxyHost(selfURL.Hostname())
+	candHost := normalizeProxyHost(candidate.Hostname())
+	if sameProxyHost(candHost, selfHost) {
+		return fmt.Errorf("全局代理不能指向本机录制代理 %s（检测到 %s 存在代理自环）", recordingProxyAddr, candidate.Redacted())
+	}
+	return nil
+}
+
+func effectiveProxyPort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	case "socks5":
+		return "1080"
+	default:
+		return ""
+	}
+}
+
+func normalizeProxyHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+}
+
+func isLoopbackOrUnspecifiedHost(host string) bool {
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	return false
+}
+
+func sameProxyHost(candHost, selfHost string) bool {
+	if candHost == selfHost {
+		return true
+	}
+	if isLoopbackOrUnspecifiedHost(selfHost) && isLoopbackOrUnspecifiedHost(candHost) {
+		return true
+	}
+	candIP := net.ParseIP(candHost)
+	selfIP := net.ParseIP(selfHost)
+	return candIP != nil && selfIP != nil && candIP.Equal(selfIP)
 }
 
 func (m *Manager) Close() error {
@@ -1501,7 +1614,7 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	dbResult, err := m.pg.DeleteTaskCascadePrepared(
 		n, opts.DeleteAssets, opts.DeleteFindings, opts.DeleteLLMRecords, prepare,
 	)
-	if err != nil {
+	if err != nil && !dbResult.Tombstoned {
 		return result, rollbackTaskDelete(err, trafficStage, fileStage)
 	}
 	result.AssetsDeleted = dbResult.AssetsDeleted
@@ -1509,11 +1622,16 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	result.FindingsDeleted = dbResult.FindingsDeleted
 	result.LLMRecordsDeleted = dbResult.LLMRecordsDeleted
 
-	// PostgreSQL is now authoritative: finalize the staged external deletion and
-	// forget the live task even if a final purge reports an error. Such errors are
-	// typed so the HTTP layer can still tear down the task runtime instead of
-	// incorrectly reviving a task whose database row is already gone.
+	// PostgreSQL is now authoritative (Phase 1 committed the task tombstone and
+	// asset deletions): finalize the staged external deletion and forget the live
+	// task even if Phase 2/3 row compaction or a final purge reports an error.
+	// Such errors are typed so the HTTP layer can still tear down the task runtime
+	// instead of incorrectly reviving a task whose database row is tombstoned;
+	// SweepOrphanedDeletedTasks will complete any remaining row compaction.
 	var finalizeErrs []error
+	if err != nil {
+		finalizeErrs = append(finalizeErrs, fmt.Errorf("compact deleted task rows: %w", err))
+	}
 	if trafficStage != nil {
 		if err := trafficStage.Commit(); err != nil {
 			finalizeErrs = append(finalizeErrs, fmt.Errorf("finalize traffic deletion: %w", err))

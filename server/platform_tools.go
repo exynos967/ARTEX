@@ -105,7 +105,7 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 			var b strings.Builder
 			b.WriteString("---\n")
 			fmt.Fprintf(&b, "name: %s\n", a.Name)
-			fmt.Fprintf(&b, "description: %s\n", a.Description)
+			fmt.Fprintf(&b, "description: %s\n", quoteFrontmatterScalar(a.Description))
 			b.WriteString("---\n")
 			if strings.TrimSpace(a.Instructions) != "" {
 				b.WriteString(a.Instructions)
@@ -134,7 +134,10 @@ func (s *Server) toolUpdateSkillFile() actool.CoreTool {
 			if !validSkillName(a.Name) {
 				return actool.Errorf("skill 名不合法"), nil
 			}
-			skillPath := filepath.Join(s.skillDir, a.Name)
+			skillPath, ok := safeContainmentPath(s.skillDir, a.Name, "")
+			if !ok {
+				return actool.Errorf("skill 路径越界"), nil
+			}
 			if _, err := os.Stat(skillPath); os.IsNotExist(err) {
 				return actool.Errorf("skill 不存在: " + a.Name), nil
 			}
@@ -146,7 +149,10 @@ func (s *Server) toolUpdateSkillFile() actool.CoreTool {
 			if msg != "" {
 				return actool.Errorf("非法路径: " + msg), nil
 			}
-			full := filepath.Join(skillPath, clean)
+			full, ok := safeContainmentPath(skillPath, clean, "")
+			if !ok || full == filepath.Clean(skillPath) {
+				return actool.Errorf("非法路径: 目标超出 skill 目录"), nil
+			}
 			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
@@ -318,9 +324,22 @@ func (s *Server) toolUpdateMCP() actool.CoreTool {
 			if a.ID == 0 {
 				return actool.Errorf("id 必填"), nil
 			}
+			var prevName string
+			if all, err := s.m.pg.ListMCP(); err == nil {
+				for _, m := range all {
+					if m.ID == a.ID {
+						prevName = m.Name
+						break
+					}
+				}
+			}
 			if _, err := s.m.pg.SaveMCP(a.toDB()); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			if prevName != "" && prevName != a.Name {
+				defaultMCPPool().evictServer(prevName)
+			}
+			defaultMCPPool().evictServer(a.Name)
 			return actool.Text(fmt.Sprintf("mcp updated: id=%d", a.ID)), nil
 		})
 }

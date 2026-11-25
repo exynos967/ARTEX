@@ -1,12 +1,60 @@
 package server
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/RC-CHN/ARTEX/agent"
 )
+
+func normalizedOrigin(raw string) (scheme, host, port string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" || u.User != nil {
+		return "", "", "", false
+	}
+	scheme = strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", "", "", false
+	}
+	host = strings.ToLower(u.Hostname())
+	port = u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return scheme, host, port, true
+}
+
+// sameNormalizedOrigin reports whether two HTTP(S) URLs share the same
+// case-insensitive (scheme, hostname, effectivePort) origin.
+func sameNormalizedOrigin(a, b string) bool {
+	sa, ha, pa, oka := normalizedOrigin(a)
+	sb, hb, pb, okb := normalizedOrigin(b)
+	return oka && okb && sa == sb && ha == hb && pa == pb
+}
+
+func effectiveLLMOriginURL(provider, baseURL string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL != "" {
+		return baseURL
+	}
+	switch strings.TrimSpace(provider) {
+	case "openai", "openai-responses":
+		return "https://api.openai.com"
+	default:
+		return "https://api.anthropic.com"
+	}
+}
 
 // getLLM returns the current LLM config (key never exposed).
 func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +89,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		ThinkingType    string  `json:"thinking_type"`
 		ReasoningEffort string  `json:"reasoning_effort"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -100,7 +148,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
 		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -120,21 +168,47 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	cfg.SessionHeaderKey = req.SessionHeaderKey
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
+	// 复用已存凭据时禁止把 base_url 改到其他 origin 或更改 proxy，防止凭据被重定向外泄。
 	// 会话头名同理：表单未带时用已存 profile 的值兜底。
+	reqProxy := strings.TrimSpace(req.Proxy)
 	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if cfg.APIKey == "" {
-				cfg.APIKey = p.APIKey
-			}
-			if cfg.SessionHeaderKey == "" {
-				cfg.SessionHeaderKey = p.SessionHeaderKey
+		if s.m != nil && s.m.pg != nil {
+			if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+				if cfg.APIKey == "" && p.APIKey != "" {
+					if !sameNormalizedOrigin(effectiveLLMOriginURL(cfg.Provider(), cfg.BaseURL), effectiveLLMOriginURL(p.Format, p.BaseURL)) {
+						writeErr(w, 400, "复用已存 API Key 时不允许将 base_url 更改为其他来源，请重新输入 API Key")
+						return
+					}
+					if reqProxy != strings.TrimSpace(p.Proxy) {
+						writeErr(w, 400, "复用已存 API Key 时不允许修改 proxy，请重新输入 API Key")
+						return
+					}
+					cfg.APIKey = p.APIKey
+				}
+				if cfg.SessionHeaderKey == "" {
+					cfg.SessionHeaderKey = p.SessionHeaderKey
+				}
 			}
 		}
 	}
 	if cfg.APIKey == "" {
 		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey
+		storedKey := s.llmCfg.APIKey
+		storedProv := s.llmCfg.Provider()
+		storedBase := s.llmCfg.BaseURL
+		storedProxy := s.llmCfg.Proxy
 		s.cfgMu.Unlock()
+		if storedKey != "" {
+			if !sameNormalizedOrigin(effectiveLLMOriginURL(cfg.Provider(), cfg.BaseURL), effectiveLLMOriginURL(storedProv, storedBase)) {
+				writeErr(w, 400, "复用已存 API Key 时不允许将 base_url 更改为其他来源，请重新输入 API Key")
+				return
+			}
+			if reqProxy != strings.TrimSpace(storedProxy) {
+				writeErr(w, 400, "复用已存 API Key 时不允许修改 proxy，请重新输入 API Key")
+				return
+			}
+			cfg.APIKey = storedKey
+		}
 	}
 	if cfg.APIKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})

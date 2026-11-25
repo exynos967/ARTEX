@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -149,12 +150,14 @@ func (s *Server) buildRecordExport(parent context.Context, job db.RecordExport) 
 		if job.Redacted {
 			w = recordexport.RedactJSON(w)
 		}
-		return &exportProgressWriter{WriteCloser: w, after: func() error { return progress("database") }}, nil
+		return newExportProgressWriter(w, func() error { return progress("database") }), nil
 	})
 	if err != nil {
 		return err
 	}
-	b.Manifest.Cutoff = snapshots[0].CreatedAt
+	if len(snapshots) > 0 {
+		b.Manifest.Cutoff = snapshots[0].CreatedAt
+	}
 	for _, snapshot := range snapshots {
 		prefix := fmt.Sprintf("tasks/%d", snapshot.TaskID)
 		if err = b.JSON(prefix+"/snapshot.json", snapshot); err != nil {
@@ -219,12 +222,27 @@ func (s *Server) buildRecordExport(parent context.Context, job db.RecordExport) 
 }
 
 type exportProgressWriter struct {
-	io.WriteCloser
+	raw   io.WriteCloser
+	buf   *bufio.Writer
 	after func() error
 }
 
+func newExportProgressWriter(w io.WriteCloser, after func() error) *exportProgressWriter {
+	return &exportProgressWriter{
+		raw:   w,
+		buf:   bufio.NewWriterSize(w, 64*1024),
+		after: after,
+	}
+}
+
+func (w *exportProgressWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p)
+}
+
 func (w *exportProgressWriter) Close() error {
-	if err := w.WriteCloser.Close(); err != nil {
+	flushErr := w.buf.Flush()
+	closeErr := w.raw.Close()
+	if err := errors.Join(flushErr, closeErr); err != nil {
 		return err
 	}
 	return w.after()

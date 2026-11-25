@@ -136,6 +136,14 @@ func (s *Server) syncSSDatasource(w http.ResponseWriter, r *http.Request) {
 	if m == nil {
 		m = &db.MCPServer{Name: scopeSentryMCPName, Transport: "http", Env: json.RawMessage(`{"X-API-Key":""}`)}
 	}
+	// Reusing a stored X-API-Key while switching the destination origin would
+	// exfiltrate the stored credential to the new host; require a fresh key.
+	if body.APIKey == "" && body.URL != "" && envHasValue(m.Env) {
+		if m.URL == "" || !sameNormalizedOrigin(body.URL, m.URL) {
+			writeErr(w, 400, "修改数据源地址时必须重新提供 API Key")
+			return
+		}
+	}
 	if body.URL != "" {
 		m.URL = body.URL
 	}
@@ -151,6 +159,7 @@ func (s *Server) syncSSDatasource(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	defaultMCPPool().evictServer(scopeSentryMCPName)
 	m.ID = id
 	// Best-effort tool discovery so the status card shows tools right away.
 	if m.Enabled {

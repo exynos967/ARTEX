@@ -69,18 +69,29 @@ func preview(s string, n int) string {
 // blocked 会白丢一条意图，所以这里对该终态额外重跑几次，每次之间退避一下，给
 // provider 恢复的时间；重试期间若被暂停/终止/取消则立即让位给对应分支处理。
 const (
-	modelErrorRetries      = 2               // model_error 收场后额外重试的次数
-	modelErrorRetryBackoff = 3 * time.Second // 每次重试前的退避
-	workControlWaitTimeout = 30 * time.Second
+	modelErrorRetries          = 2               // model_error 收场后额外重试的次数
+	modelErrorRetryBackoff     = 3 * time.Second // 每次重试前的退避
+	workControlWaitTimeout     = 30 * time.Second
+	workerIdleBackoffInitial   = 800 * time.Millisecond
+	workerIdleBackoffMax       = 4 * time.Second
+	workerBudgetBlockedBackoff = 5 * time.Second
+)
+
+type workerStepOutcome int
+
+const (
+	workerStepClaimed workerStepOutcome = iota
+	workerStepIdle
+	workerStepBudgetBlocked
 )
 
 var errWorkControlConflict = errors.New("work control conflict")
 
-// retryableWorkerModelError excludes errors already handled by the task router.
-// In particular, a quota error after partial streaming advances the task cursor
-// for the next LLM call but must not replay this whole intent on the backup.
+// retryableWorkerModelError excludes errors already handled or retried by lower
+// layers (task router quota failover, norma/llm 429/5xx/408 retries, adapter
+// incomplete-response recovery, and llmpool exhaustion).
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !isOuterRetryExcluded(err)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -116,6 +127,7 @@ type Engine struct {
 	// waits for all goroutines, then releases every task-level Engine reference.
 	runtimeMu sync.Mutex
 	runtimes  map[string]*taskRuntime
+	draining  map[string][]*taskRuntime
 
 	// per-task execution context: each planner.Plan / worker.Execute runs under it,
 	// so pausing can CANCEL an in-flight run (not just skip the next one). Recreated
@@ -124,6 +136,11 @@ type Engine struct {
 	execMu     sync.Mutex
 	execCancel map[string]context.CancelCauseFunc
 	execCtx    map[string]context.Context
+	// per-task background compaction lifecycle context (derived from rt.ctx):
+	// survives a single planner round completing while cancelling immediately on
+	// Pause, BeginDelete, StopTask, terminal self-cleanup, or Engine.Close.
+	compCancel map[string]context.CancelFunc
+	compCtx    map[string]context.Context
 
 	// Per-work control lets the planner kill a worker and lets the UI pause/cancel
 	// one intent without pausing the whole task. The done channel closes only after
@@ -156,13 +173,88 @@ type Engine struct {
 	readiness func() bool
 	// Wired once at startup; a failed remote broker pauses frontier admission.
 	executionAvailable func(agentKey string) bool
+
+	// onTaskStop is invoked whenever a task's runtime is torn down (StopTask or
+	// terminal self-cleanup), allowing Server to evict cached per-task agent bundles.
+	onStopMu   sync.RWMutex
+	onTaskStop func(taskID string)
+
+	// admission bounds simultaneous agent runs process-wide (nil = unlimited, safe for tests).
+	admission *runAdmission
+
+	// appendActivityFn overrides t.Store.AppendActivity in unit tests; nil in production.
+	appendActivityFn func(*Task, db.Activity) (int64, error)
+
+	// Optional workerLoop timing/step overrides for deterministic unit tests; zero/nil in production.
+	workerIdleBase   time.Duration
+	workerIdleMax    time.Duration
+	workerBudgetWait time.Duration
+	workerStepHookFn func(context.Context, *Task, string, *agent.Worker) workerStepOutcome
 }
 
 type taskRuntime struct {
-	pool   *workerPool
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	pool     *workerPool
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	stopping atomic.Bool // guards one-shot async terminal self-cleanup for this runtime
+
+	wakeMu sync.Mutex
+	wakeCh chan struct{} // broadcast channel closed & replaced when workers should re-check immediately
+}
+
+func (rt *taskRuntime) wakeSignal() <-chan struct{} {
+	rt.wakeMu.Lock()
+	if rt.wakeCh == nil {
+		rt.wakeCh = make(chan struct{})
+	}
+	ch := rt.wakeCh
+	rt.wakeMu.Unlock()
+	return ch
+}
+
+func (rt *taskRuntime) broadcastWake() {
+	rt.wakeMu.Lock()
+	if rt.wakeCh != nil {
+		close(rt.wakeCh)
+		rt.wakeCh = make(chan struct{})
+	}
+	rt.wakeMu.Unlock()
+}
+
+func (e *Engine) workerWakeSignal(taskID string) <-chan struct{} {
+	e.runtimeMu.Lock()
+	rt := e.runtimes[taskID]
+	e.runtimeMu.Unlock()
+	if rt == nil {
+		return nil
+	}
+	return rt.wakeSignal()
+}
+
+func (e *Engine) wakeWorkers(taskID string) {
+	e.runtimeMu.Lock()
+	rt := e.runtimes[taskID]
+	e.runtimeMu.Unlock()
+	if rt != nil {
+		rt.broadcastWake()
+	}
+}
+
+func (e *Engine) workerBackoffDurations() (idleBase, idleMax, budgetWait time.Duration) {
+	idleBase = e.workerIdleBase
+	if idleBase <= 0 {
+		idleBase = workerIdleBackoffInitial
+	}
+	idleMax = e.workerIdleMax
+	if idleMax < idleBase {
+		idleMax = max(workerIdleBackoffMax, idleBase)
+	}
+	budgetWait = e.workerBudgetWait
+	if budgetWait <= 0 {
+		budgetWait = workerBudgetBlockedBackoff
+	}
+	return idleBase, idleMax, budgetWait
 }
 
 type workExecution struct {
@@ -182,8 +274,17 @@ func (e *Engine) nextPlannerRound(taskID string) int {
 // Pause stops a task: marks it paused AND cancels any in-flight planner/worker run
 // for it (a long worker.Execute would otherwise keep going until it finishes).
 func (e *Engine) Pause(taskID string, cause error) {
+	e.execMu.Lock()
 	e.paused.Store(taskID, true)
-	e.cancelExec(taskID, cause)
+	if cancel := e.execCancel[taskID]; cancel != nil {
+		cancel(cause)
+	}
+	if cancel := e.compCancel[taskID]; cancel != nil {
+		cancel()
+	}
+	delete(e.compCancel, taskID)
+	delete(e.compCtx, taskID)
+	e.execMu.Unlock()
 }
 
 // BeginDelete installs an execution barrier before task data/files are removed.
@@ -196,9 +297,18 @@ func (e *Engine) BeginDelete(taskID string) bool {
 		e.deleteMu.Unlock()
 		return false
 	}
+	e.execMu.Lock()
 	e.paused.Store(taskID, true)
+	if cancel := e.execCancel[taskID]; cancel != nil {
+		cancel(agent.AbortTaskDeleted)
+	}
+	if cancel := e.compCancel[taskID]; cancel != nil {
+		cancel()
+	}
+	delete(e.compCancel, taskID)
+	delete(e.compCtx, taskID)
+	e.execMu.Unlock()
 	e.deleteMu.Unlock()
-	e.cancelExec(taskID, agent.AbortTaskDeleted)
 	return true
 }
 
@@ -210,13 +320,18 @@ func (e *Engine) AbortDelete(taskID string, keepPaused bool) {
 	}
 	e.deleting.Delete(taskID)
 	if !keepPaused {
+		e.execMu.Lock()
 		e.paused.Delete(taskID)
+		e.execMu.Unlock()
 	}
 	e.deleteMu.Unlock()
 	if !keepPaused && e.m != nil {
 		if t, ok := e.m.Task(taskID); ok {
 			t.Notify()
 		}
+	}
+	if !keepPaused {
+		e.wakeWorkers(taskID)
 	}
 }
 
@@ -247,6 +362,157 @@ func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
 	}()
 }
 
+// SetOnTaskStop installs a callback invoked whenever a task's Engine runtime
+// stops (explicit StopTask or terminal self-cleanup).
+func (e *Engine) SetOnTaskStop(fn func(taskID string)) {
+	e.onStopMu.Lock()
+	e.onTaskStop = fn
+	e.onStopMu.Unlock()
+}
+
+func (e *Engine) ensureOnTaskStop(fn func(taskID string)) {
+	e.onStopMu.RLock()
+	already := e.onTaskStop != nil
+	e.onStopMu.RUnlock()
+	if already {
+		return
+	}
+	e.onStopMu.Lock()
+	if e.onTaskStop == nil {
+		e.onTaskStop = fn
+	}
+	e.onStopMu.Unlock()
+}
+
+func (e *Engine) notifyTaskStopped(taskID string) {
+	e.onStopMu.RLock()
+	fn := e.onTaskStop
+	e.onStopMu.RUnlock()
+	if fn != nil {
+		fn(taskID)
+	}
+}
+
+func (e *Engine) taskStatus(t *Task) string {
+	if e.m != nil && t != nil {
+		if st := e.m.TaskStatus(t.ID); st != "" {
+			return st
+		}
+	}
+	if t != nil {
+		return t.lifecycleSnapshot().Status
+	}
+	return ""
+}
+
+func (e *Engine) hasInflight(taskID string) bool {
+	if v, ok := e.inflight.Load(taskID); ok {
+		return atomic.LoadInt64(v.(*int64)) > 0
+	}
+	return false
+}
+
+func (e *Engine) clearTaskState(taskID string, execCause error) {
+	e.execMu.Lock()
+	if cancel := e.execCancel[taskID]; cancel != nil {
+		cancel(execCause)
+	}
+	delete(e.execCancel, taskID)
+	delete(e.execCtx, taskID)
+	if cancel := e.compCancel[taskID]; cancel != nil {
+		cancel()
+	}
+	delete(e.compCancel, taskID)
+	delete(e.compCtx, taskID)
+	e.paused.Delete(taskID)
+	e.execMu.Unlock()
+
+	e.started.Delete(taskID)
+	e.lastAct.Delete(taskID)
+	e.llmCalls.Delete(taskID)
+	e.dropCnt.Delete(taskID)
+	e.plannerRound.Delete(taskID)
+	e.settling.Delete(taskID)
+	e.deadline.Delete(taskID)
+	e.stamped.Delete(taskID)
+	e.inflight.Delete(taskID)
+	e.coordStarted.Delete(taskID)
+}
+
+// scheduleTerminalCleanup triggers one-shot async teardown of a terminal task's
+// runtime once no task operations remain in flight. Running teardown in its own
+// goroutine prevents self-deadlock when triggered from plannerLoop or workerLoop.
+func (e *Engine) scheduleTerminalCleanup(t *Task) {
+	if t == nil {
+		return
+	}
+	e.runtimeMu.Lock()
+	rt := e.runtimes[t.ID]
+	e.runtimeMu.Unlock()
+	if rt == nil || !rt.stopping.CompareAndSwap(false, true) {
+		return
+	}
+	go e.stopTerminalRuntime(t, rt)
+}
+
+func (e *Engine) stopTerminalRuntime(t *Task, rt *taskRuntime) {
+	e.deleteMu.Lock()
+	if e.closed || e.IsDeleting(t.ID) || !isTerminalStatus(e.taskStatus(t)) || e.hasInflight(t.ID) {
+		rt.stopping.Store(false)
+		e.deleteMu.Unlock()
+		return
+	}
+	e.runtimeMu.Lock()
+	if e.runtimes[t.ID] != rt {
+		e.runtimeMu.Unlock()
+		e.deleteMu.Unlock()
+		return
+	}
+	delete(e.runtimes, t.ID)
+	if e.draining == nil {
+		e.draining = map[string][]*taskRuntime{}
+	}
+	e.draining[t.ID] = append(e.draining[t.ID], rt)
+	rt.cancel()
+	e.runtimeMu.Unlock()
+
+	e.clearTaskState(t.ID, agent.AbortGoalMet)
+	// Join operationsWG under deleteMu so Engine.Close waits for retiring task
+	// goroutines even after rt has been detached from e.runtimes.
+	e.operationsWG.Add(1)
+	e.deleteMu.Unlock()
+
+	defer e.operationsWG.Done()
+	rt.wg.Wait()
+
+	e.runtimeMu.Lock()
+	list := e.draining[t.ID]
+	for i, d := range list {
+		if d == rt {
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(list) == 0 {
+		delete(e.draining, t.ID)
+	} else {
+		e.draining[t.ID] = list
+	}
+	e.runtimeMu.Unlock()
+
+	// Final sweep in case a retiring goroutine wrote to a sync.Map right before
+	// exiting; skip if the task has been revived or entered deletion meanwhile.
+	e.deleteMu.Lock()
+	shouldNotify := !e.IsDeleting(t.ID) && !e.Started(t.ID) && isTerminalStatus(e.taskStatus(t)) && !e.hasInflight(t.ID)
+	if shouldNotify {
+		e.clearTaskState(t.ID, agent.AbortGoalMet)
+	}
+	e.deleteMu.Unlock()
+	if shouldNotify {
+		e.notifyTaskStopped(t.ID)
+	}
+}
+
 // StopTask permanently stops every long-lived goroutine and removes all Engine
 // state for a successfully deleted task. The delete barrier remains installed
 // until cleanup finishes, so no new task operation can race the teardown.
@@ -256,23 +522,23 @@ func (e *Engine) StopTask(taskID string) {
 	e.deleteMu.Unlock()
 
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
+	e.cancelCompaction(taskID)
 	e.runtimeMu.Lock()
 	rt := e.runtimes[taskID]
 	if rt != nil {
 		rt.cancel()
 	}
+	draining := append([]*taskRuntime(nil), e.draining[taskID]...)
+	for _, d := range draining {
+		d.cancel()
+	}
 	e.runtimeMu.Unlock()
 	if rt != nil {
 		rt.wg.Wait()
 	}
-
-	e.execMu.Lock()
-	if cancel := e.execCancel[taskID]; cancel != nil {
-		cancel(agent.AbortTaskDeleted)
+	for _, d := range draining {
+		d.wg.Wait()
 	}
-	delete(e.execCancel, taskID)
-	delete(e.execCtx, taskID)
-	e.execMu.Unlock()
 
 	e.runtimeMu.Lock()
 	if e.runtimes[taskID] == rt {
@@ -280,20 +546,11 @@ func (e *Engine) StopTask(taskID string) {
 	}
 	e.runtimeMu.Unlock()
 
-	e.started.Delete(taskID)
-	e.lastAct.Delete(taskID)
-	e.llmCalls.Delete(taskID)
-	e.paused.Delete(taskID)
-	e.dropCnt.Delete(taskID)
-	e.plannerRound.Delete(taskID)
-	e.settling.Delete(taskID)
-	e.deadline.Delete(taskID)
-	e.stamped.Delete(taskID)
-	e.inflight.Delete(taskID)
-	e.coordStarted.Delete(taskID)
+	e.clearTaskState(taskID, agent.AbortTaskDeleted)
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
+	e.notifyTaskStopped(taskID)
 }
 
 // cancelExec cancels a task's current per-task exec context (any in-flight
@@ -305,6 +562,47 @@ func (e *Engine) cancelExec(taskID string, cause error) {
 		cancel(cause)
 	}
 	e.execMu.Unlock()
+}
+
+// cancelCompaction cancels any in-flight cold-graph background compaction
+// launched for taskID.
+func (e *Engine) cancelCompaction(taskID string) {
+	e.execMu.Lock()
+	if cancel := e.compCancel[taskID]; cancel != nil {
+		cancel()
+	}
+	delete(e.compCancel, taskID)
+	delete(e.compCtx, taskID)
+	e.execMu.Unlock()
+}
+
+// compactionContextFor returns a task-scoped lifecycle context derived from
+// parent (rt.ctx) for background cold-graph compaction. It outlives individual
+// planner rounds but cancels immediately on Pause, BeginDelete, StopTask,
+// terminal self-cleanup, or Engine.Close.
+func (e *Engine) compactionContextFor(parent context.Context, taskID string) context.Context {
+	e.deleteMu.RLock()
+	defer e.deleteMu.RUnlock()
+	e.execMu.Lock()
+	defer e.execMu.Unlock()
+	if e.closed || e.IsPaused(taskID) || e.IsDeleting(taskID) {
+		c, cancel := context.WithCancel(parent)
+		cancel()
+		return c
+	}
+	if c := e.compCtx[taskID]; c != nil && c.Err() == nil {
+		return c
+	}
+	if e.compCtx == nil {
+		e.compCtx = map[string]context.Context{}
+	}
+	if e.compCancel == nil {
+		e.compCancel = map[string]context.CancelFunc{}
+	}
+	c, cancel := context.WithCancel(parent)
+	e.compCtx[taskID] = c
+	e.compCancel[taskID] = cancel
+	return c
 }
 
 // Resume un-pauses a task and nudges a fresh planning round. The next exec under
@@ -321,8 +619,11 @@ func (e *Engine) Resume(t *Task) {
 	if e.IsDeleting(t.ID) {
 		return
 	}
+	e.execMu.Lock()
 	e.paused.Delete(t.ID)
+	e.execMu.Unlock()
 	t.Notify()
+	e.wakeWorkers(t.ID)
 }
 
 // execContextFor returns a live per-task context derived from parent, recreating
@@ -402,13 +703,18 @@ func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix(
 func NewEngine(m *Manager) *Engine {
 	e := &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
+		compCancel: map[string]context.CancelFunc{}, compCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
-		runtimes: map[string]*taskRuntime{}}
+		runtimes: map[string]*taskRuntime{}, draining: map[string][]*taskRuntime{}}
 	if m != nil {
 		m.onClose(e.Close)
 	}
 	return e
 }
+
+// SetRunAdmission installs the process-wide agent-run admission controller.
+// Called once at server startup; nil disables global run admission.
+func (e *Engine) SetRunAdmission(a *runAdmission) { e.admission = a }
 
 // registerWork records the cancel for the work currently running intentID.
 func (e *Engine) registerWork(intentID int64, cancel context.CancelCauseFunc) {
@@ -685,7 +991,11 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = time.Now()
 	}
-	e.bc.Publish(t.ID, r)
+	// Strip Detail before fanning out to 256-slot SSE channels so multi-KB tool
+	// outputs are never pinned in RAM; clients fetch full details lazily on demand.
+	pub := r
+	pub.Detail = ""
+	e.bc.Publish(t.ID, pub)
 	e.touch(t.ID)
 	return r
 }
@@ -698,16 +1008,26 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 func (e *Engine) appendActivity(t *Task, r db.Activity) (int64, error) {
 	var id int64
 	var err error
+	appendFn := e.appendActivityFn
+	if appendFn == nil {
+		appendFn = func(task *Task, rec db.Activity) (int64, error) {
+			return task.Store.AppendActivity(rec)
+		}
+	}
 	for attempt := 1; attempt <= 3; attempt++ {
-		if id, err = t.Store.AppendActivity(r); err == nil {
+		if id, err = appendFn(t, r); err == nil {
 			if attempt > 1 {
 				log.Printf("[activity] task %s 写入第 %d 次重试成功 (worker=%s kind=%s tool=%s)",
 					t.ID, attempt, r.Worker, r.Kind, r.Tool)
 			}
 			return id, nil
 		}
+		expID := int64(0)
+		if t.Store != nil {
+			expID = t.Store.ID()
+		}
 		log.Printf("[activity] task %s 写入失败 (第 %d/3 次, worker=%s kind=%s tool=%s expID=%d): %v",
-			t.ID, attempt, r.Worker, r.Kind, r.Tool, t.Store.ID(), err)
+			t.ID, attempt, r.Worker, r.Kind, r.Tool, expID, err)
 		time.Sleep(time.Duration(attempt) * 25 * time.Millisecond)
 	}
 	return 0, err
@@ -763,19 +1083,27 @@ func (e *Engine) ReadyFor(t *Task) bool {
 // but no-op until an LLM is configured (so a task created while idle picks up
 // automatically once LLM is set from the UI).
 func (e *Engine) Run(ctx context.Context, t *Task) {
+	if t == nil {
+		return
+	}
 	e.deleteMu.RLock()
-	if e.closed || e.IsDeleting(t.ID) {
+	if e.closed || e.IsDeleting(t.ID) || isTerminalStatus(e.taskStatus(t)) {
 		e.deleteMu.RUnlock()
 		return
 	}
 	if _, loaded := e.started.LoadOrStore(t.ID, true); loaded {
 		e.deleteMu.RUnlock()
 		t.Notify() // already running — just nudge a planning round
+		e.wakeWorkers(t.ID)
 		return
 	}
 	rt := e.registerTaskRoutines(ctx, t.ID, 2)
+	workers := 1
+	if e.m != nil && e.m.pg != nil {
+		workers = e.m.Workers()
+	}
 	e.runtimeMu.Lock()
-	pool := newWorkerPool(rt.ctx, e.m.Workers(), func(loopCtx context.Context, i int, pool *workerPool) {
+	pool := newWorkerPool(rt.ctx, workers, func(loopCtx context.Context, i int, pool *workerPool) {
 		e.workerLoop(loopCtx, t, fmt.Sprintf("work#%d", i+1), pool, i)
 	})
 	rt.pool = pool
@@ -790,6 +1118,10 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	// 首轮 planner,worker 直接领种子意图开跑,跑完由 NotifyDone/心跳唤醒 planner。
 	// ⚠️ 不能用 Frontier(只数 open):worker 领取(open→running)与本检查存在竞态,会误 kick。
 	// 重启自动恢复时也可能只剩 running 意图,同样应跳过。
+	if t.Store == nil {
+		t.Notify()
+		return
+	}
 	if has, _ := t.Store.HasActiveIntent(); !has {
 		t.Notify() // kick the first planning round (acted on once LLM is ready)
 	}
@@ -828,20 +1160,17 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	runRound := func(src string) {
 		// debounce: coalesce a burst of changes into one planning round
 		timer := time.NewTimer(e.debounce)
+		defer timer.Stop()
 	drain:
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-t.notify:
+				e.wakeWorkers(t.ID)
 			case <-timer.C:
 				break drain
 			}
-		}
-		planner, _ := e.snapshotFor(t)
-		if planner == nil {
-			return // idle until LLM configured
-		}
-		if e.IsPaused(t.ID) {
-			return // user-paused: don't plan
 		}
 		if e.IsDeleting(t.ID) {
 			return
@@ -849,13 +1178,23 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// terminal task (goals all met → done, or failed): the run is over. A
 		// resume/nudge — e.g. auto-resume of the active task on restart — must NOT
 		// re-plan (it would burn an LLM round and re-confirm a settled result).
-		if isTerminalStatus(t.lifecycleSnapshot().Status) {
+		if isTerminalStatus(e.taskStatus(t)) {
+			if !e.hasInflight(t.ID) {
+				e.scheduleTerminalCleanup(t)
+			}
 			return
+		}
+		if e.IsPaused(t.ID) {
+			return // user-paused: don't plan
 		}
 		// 任务级超时收尾中:丢弃普通唤醒——worker 收尾写回、Resume 的 Notify 都不再
 		// 触发常规规划轮;终局那一轮由协调器(settleTask)直接驱动,不走这里。
 		if e.isSettling(t.ID) {
 			return
+		}
+		planner, _ := e.snapshotFor(t)
+		if planner == nil {
+			return // idle until LLM configured
 		}
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
@@ -889,6 +1228,11 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.taskBudgetBlocks(ectx, t) {
 			return
 		}
+		releaseAdmission, err := e.admission.Acquire(ectx)
+		if err != nil {
+			return
+		}
+		defer releaseAdmission()
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
 		// UI can separate rounds in the transcript (kind='round').
@@ -898,8 +1242,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
+		planCtx := agent.WithCompactionLifecycle(ectx, e.compactionContextFor(ctx, t.ID))
 		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		met, reason, err := planner.Plan(planCtx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
 		e.EndLLMCall(t.ID)
 		switch {
 		case err != nil && ectx.Err() == nil:
@@ -916,6 +1261,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			e.cancelExec(t.ID, agent.AbortGoalMet)
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
+			e.wakeWorkers(t.ID) // new intents may have landed in the frontier
 		}
 		e.touch(t.ID)
 	}
@@ -925,10 +1271,14 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		case <-ctx.Done():
 			return
 		case <-t.notify:
-			runRound("edge") // worker 结束 / finding / kill / resume / seed 首轮
+			e.wakeWorkers(t.ID) // relay task notifications (budget/settings/new intents) to idle workers
+			runRound("edge")    // worker 结束 / finding / kill / resume / seed 首轮
 		case <-heartbeat.C:
 			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
 			runRound("heartbeat")
+		}
+		if isTerminalStatus(e.taskStatus(t)) && !e.hasInflight(t.ID) {
+			e.scheduleTerminalCleanup(t)
 		}
 		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
 		resetPlannerTimer(heartbeat, interval)
@@ -936,6 +1286,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 }
 
 func (e *Engine) workerLoop(ctx context.Context, t *Task, name string, pool *workerPool, index int) {
+	idleBase, idleMax, budgetWait := e.workerBackoffDurations()
+	idleBackoff := idleBase
+
 	for {
 		if !pool.allowed(index) {
 			return
@@ -945,21 +1298,29 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string, pool *wor
 			return
 		default:
 		}
-		_, worker := e.snapshotFor(t)
-		if worker == nil {
-			if sleepCtx(ctx, 1500*time.Millisecond) {
+		// Check terminal/paused/deleting/settling BEFORE snapshotFor so paused
+		// or finished tasks never hit DB/LLM resolution every second.
+		if isTerminalStatus(e.taskStatus(t)) {
+			if !e.hasInflight(t.ID) {
+				e.scheduleTerminalCleanup(t)
+			}
+			if sleepCtx(ctx, 200*time.Millisecond) {
 				return
 			}
-			continue
+			continue // 任务已终态(done/failed/timeout):停止领取遗留意图并触发异步自清理
 		}
 		if e.IsPaused(t.ID) {
+			idleBackoff = idleBase
 			if sleepCtx(ctx, 1000*time.Millisecond) {
 				return
 			}
 			continue // user-paused: don't claim/execute intents
 		}
 		if e.IsDeleting(t.ID) {
-			return
+			if sleepCtx(ctx, 200*time.Millisecond) {
+				return
+			}
+			continue
 		}
 		if e.isSettling(t.ID) {
 			if sleepCtx(ctx, 1000*time.Millisecond) {
@@ -967,11 +1328,13 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string, pool *wor
 			}
 			continue // 任务超时收尾中:不再领新意图(在跑的自行收尾,协调器等其 drain)
 		}
-		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
-			if sleepCtx(ctx, 1000*time.Millisecond) {
+		_, worker := e.snapshotFor(t)
+		if worker == nil {
+			idleBackoff = idleBase
+			if sleepCtx(ctx, 1500*time.Millisecond) {
 				return
 			}
-			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
+			continue
 		}
 		if !pool.begin(index) {
 			if sleepCtx(ctx, 100*time.Millisecond) {
@@ -981,15 +1344,35 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string, pool *wor
 		}
 		if !e.beginTaskOperation(t.ID) {
 			pool.end()
-			return
+			if sleepCtx(ctx, 200*time.Millisecond) {
+				return
+			}
+			continue
 		}
-		claimed := func() bool {
+		// Capture wakeCh BEFORE probing the frontier so a wakeup arriving while
+		// claiming cannot be missed before entering the backoff sleep.
+		wakeCh := e.workerWakeSignal(t.ID)
+		outcome := func() workerStepOutcome {
 			defer pool.end()
 			defer e.decInflight(t.ID)
-			return e.runWorkerStep(ctx, t, name, worker)
+			return e.runWorkerStepOutcome(ctx, t, name, worker)
 		}()
-		if !claimed && sleepCtx(ctx, 800*time.Millisecond) {
-			return
+		switch outcome {
+		case workerStepClaimed:
+			idleBackoff = idleBase
+		case workerStepBudgetBlocked:
+			idleBackoff = idleBase
+			if _, done := waitWakeOrTimeout(ctx, wakeCh, budgetWait); done {
+				return
+			}
+		default:
+			wait := idleBackoff
+			idleBackoff = min(idleBackoff*2, idleMax)
+			if woken, done := waitWakeOrTimeout(ctx, wakeCh, wait); done {
+				return
+			} else if woken {
+				idleBackoff = idleBase
+			}
 		}
 	}
 }
@@ -998,15 +1381,25 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string, pool *wor
 // runIntent. Returns false when nothing was claimable. The pool worker loop is its
 // only caller.
 func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker *agent.Worker) bool {
-	if e.executionAvailable != nil && !e.executionAvailable("worker") {
-		return false
+	return e.runWorkerStepOutcome(ctx, t, name, worker) == workerStepClaimed
+}
+
+func (e *Engine) runWorkerStepOutcome(ctx context.Context, t *Task, name string, worker *agent.Worker) workerStepOutcome {
+	if e.workerStepHookFn != nil {
+		return e.workerStepHookFn(ctx, t, name, worker)
 	}
-	intent := e.claimNext(ctx, t, name)
+	if e.executionAvailable != nil && !e.executionAvailable("worker") {
+		return workerStepIdle
+	}
+	intent, outcome := e.claimNextWithOutcome(ctx, t, name)
 	if intent == nil {
-		return false
+		return outcome
 	}
 	log.Printf("[worker %s] task %s 领取意图 #%d", name, t.ID, intent.ID)
-	return e.runIntent(ctx, t, name, worker, intent, "", "")
+	if e.runIntent(ctx, t, name, worker, intent, "", "") {
+		return workerStepClaimed
+	}
+	return workerStepIdle
 }
 
 // runIntent executes and fully settles one already-claimed (state=running) intent.
@@ -1057,6 +1450,11 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	var err error
 	execute := func() {
 		err = waitWorkerPreparation(workCtx, 5*time.Second, func() error {
+			releaseAdmission, acquireErr := e.admission.Acquire(workCtx)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			defer releaseAdmission()
 			e.BeginLLMCall(t.ID)
 			defer e.EndLLMCall(t.ID)
 			if hasChatMessage {
@@ -1082,9 +1480,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	for attempt := 1; attempt <= maxRetries &&
 		retryableWorkerModelError(reason, err) &&
 		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
+		wait := jitterDuration(retryBackoff)
 		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
-			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
-		if sleepCtx(workCtx, retryBackoff) {
+			name, t.ID, intent.ID, wait, attempt, maxRetries)
+		if sleepCtx(workCtx, wait) {
 			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
 		}
 		execute()
@@ -1271,11 +1670,26 @@ func taskExecutionPaused(cause error) bool {
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return true
-	case <-time.After(d):
+	case <-timer.C:
 		return false
+	}
+}
+
+func waitWakeOrTimeout(ctx context.Context, wakeCh <-chan struct{}, d time.Duration) (woken, done bool) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, true
+	case <-wakeCh:
+		return true, false
+	case <-timer.C:
+		return false, false
 	}
 }
 
@@ -1294,14 +1708,22 @@ func (e *Engine) taskBudgetBlocks(ctx context.Context, t *Task) bool {
 }
 
 func (e *Engine) claimNext(ctx context.Context, t *Task, name string) *db.Node {
+	node, _ := e.claimNextWithOutcome(ctx, t, name)
+	return node
+}
+
+func (e *Engine) claimNextWithOutcome(ctx context.Context, t *Task, name string) (*db.Node, workerStepOutcome) {
 	fr, _ := t.Store.Frontier(20)
-	if len(fr) > 0 && e.taskBudgetBlocks(ctx, t) {
-		return nil
+	if len(fr) == 0 {
+		return nil, workerStepIdle
+	}
+	if e.taskBudgetBlocks(ctx, t) {
+		return nil, workerStepBudgetBlocked
 	}
 	for _, in := range fr {
 		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {
-			return in
+			return in, workerStepClaimed
 		}
 	}
-	return nil
+	return nil, workerStepIdle
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -40,6 +41,11 @@ func (s *Server) startTaskArchiveWorker() {
 	if err := s.m.pg.RecoverTaskArchiveJobs(); err != nil {
 		log.Printf("[task-archive] recover jobs: %v", err)
 	}
+	if n, err := s.m.pg.ResumeCompactingTaskArchives(s.ctx); err != nil {
+		log.Printf("[task-archive] resume compacting archives: %v", err)
+	} else if n > 0 {
+		log.Printf("[task-archive] resumed %d compacting archive(s) to ready", n)
+	}
 	recoveryFailed := false
 	if err := recoverTaskArchiveStages(s.m.dir, s.m.pg); err != nil {
 		log.Printf("[task-archive] recover file staging: %v", err)
@@ -63,6 +69,9 @@ func (s *Server) startTaskArchiveWorker() {
 		ticker := time.NewTicker(taskArchivePollInterval)
 		defer ticker.Stop()
 		for {
+			if _, err := s.m.pg.ResumeCompactingTaskArchives(s.ctx); err != nil && s.ctx.Err() == nil {
+				log.Printf("[task-archive] resume compacting: %v", err)
+			}
 			if err := s.runOneTaskArchiveJob(); err != nil {
 				log.Printf("[task-archive] worker: %v", err)
 			}
@@ -131,7 +140,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	if err := s.waitTaskQuiescent(drainCtx, taskID); err != nil {
 		return errors.New("任务仍有运行中的 Agent，请先暂停后重试归档")
 	}
-	if err := s.drainTaskSideQuestions(drainCtx, taskID); err != nil {
+	if err := s.prepareDrainTaskSideQuestions(drainCtx, taskID); err != nil {
 		return err
 	}
 	task, err := s.m.pg.GetTask(job.TaskID)
@@ -151,22 +160,22 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 			runErr = errors.Join(runErr, fileStage.rollback())
 		}
 	}()
-	streamPath := filepath.Join(fileStage.payload, filepath.FromSlash(pgdb.TaskArchiveLLMRecordsPath))
-	if err := os.MkdirAll(filepath.Dir(streamPath), archiveDirMode); err != nil {
-		return err
-	}
-	streamFile, err := os.OpenFile(streamPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, archiveFileMode)
-	if err != nil {
-		return err
-	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "snapshot_database", 20)
-	snapshot, snapshotErr := s.m.pg.SnapshotTaskArchiveWithLLMRecords(job.TaskID, streamFile)
-	var syncErr error
-	if snapshotErr == nil {
-		syncErr = streamFile.Sync()
-	}
-	closeErr := streamFile.Close()
-	if err := errors.Join(snapshotErr, syncErr, closeErr); err != nil {
+	snapshot, err := s.m.pg.SnapshotTaskArchiveStreamed(job.TaskID, func(_, relPath string) (io.WriteCloser, error) {
+		target, err := resolveArchivePayloadPath(fileStage.payload, relPath)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(filepath.Dir(target), archiveDirMode); err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, archiveFileMode)
+		if err != nil {
+			return nil, err
+		}
+		return &syncCloseFile{File: f}, nil
+	})
+	if err != nil {
 		return err
 	}
 	if snapshot.ExplorationID != task.ExplorationID {
@@ -214,6 +223,27 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "compact_database", 78)
 	if err := s.m.pg.CompleteTaskArchive(job.ID, snapshot, archivePath, checksum, originalSize, compressedSize); err != nil {
+		// If Phase 1 already committed the task tombstone (state='compacting')
+		// before a later Phase 2/3 compaction step failed, do NOT roll back
+		// external staging or delete the verified archive package; commit
+		// external cleanup, tear down live task state, and let the archive
+		// worker's ResumeCompactingTaskArchives pass finish Phase 2/3 cleanly.
+		if live, lookupErr := s.m.pg.GetTask(job.TaskID); lookupErr == nil && live == nil {
+			committed = true
+			removePackage = false
+			if trafficStage != nil {
+				if commitErr := trafficStage.Commit(); commitErr != nil {
+					log.Printf("[task-archive] task %s compact-stage traffic commit: %v", taskID, commitErr)
+				}
+			}
+			if commitErr := fileStage.commit(); commitErr != nil {
+				log.Printf("[task-archive] task %s compact-stage file commit: %v", taskID, commitErr)
+			}
+			s.forgetTaskSideQuestions(taskID)
+			s.engine.StopTask(taskID)
+			s.evictTaskAgents(taskID)
+			s.m.forgetTask(taskID, job.TaskID)
+		}
 		return err
 	}
 	committed = true
@@ -230,10 +260,9 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		log.Printf("[task-archive] task %s: %s", taskID, warning)
 		_ = s.m.pg.AppendTaskArchiveWarning(job.ID, warning)
 	}
+	s.forgetTaskSideQuestions(taskID)
 	s.engine.StopTask(taskID)
-	s.taskAgentMu.Lock()
-	delete(s.taskAgents, taskID)
-	s.taskAgentMu.Unlock()
+	s.evictTaskAgents(taskID)
 	s.m.forgetTask(taskID, job.TaskID)
 	return nil
 }
@@ -290,24 +319,23 @@ func (s *Server) restoreTaskArchive(job *pgdb.TaskArchive) (runErr error) {
 }
 
 func (s *Server) restoreTaskArchivePayload(job *pgdb.TaskArchive, snapshot *pgdb.TaskArchiveSnapshot, extracted string) (runErr error) {
-	var err error
-	var llmRecordsFile *os.File
-	relative, hasStreamedLLMRecords := snapshot.StreamedTables["llm_records"]
-	if len(snapshot.StreamedTables) > 0 &&
-		(snapshot.FormatVersion < 2 || !hasStreamedLLMRecords || len(snapshot.StreamedTables) != 1 ||
-			relative != pgdb.TaskArchiveLLMRecordsPath) {
-		return pgdb.ErrTaskArchiveFormatMismatch
+	if err := pgdb.ValidateTaskArchiveStreamedTables(snapshot); err != nil {
+		return err
 	}
-	if hasStreamedLLMRecords {
-		llmRecordsFile, err = os.Open(filepath.Join(extracted, filepath.FromSlash(relative)))
+	// Pre-verify every referenced NDJSON table file exists inside extracted
+	// before mutating traffic or installing workspace files.
+	for _, relative := range snapshot.StreamedTables {
+		target, err := resolveArchivePayloadPath(extracted, relative)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			if llmRecordsFile != nil {
-				_ = llmRecordsFile.Close()
-			}
-		}()
+		info, err := os.Stat(target)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return fmt.Errorf("%w: streamed table path %q is a directory", pgdb.ErrTaskArchiveFormatMismatch, relative)
+		}
 	}
 	if s.m.traffic != nil {
 		_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "restore_traffic", 35)
@@ -328,13 +356,17 @@ func (s *Server) restoreTaskArchivePayload(job *pgdb.TaskArchive, snapshot *pgdb
 	}()
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "restore_database", 70)
 	var warnings []string
-	if llmRecordsFile != nil {
-		warnings, err = s.m.pg.RestoreTaskArchiveWithLLMRecords(
-			job.ID, snapshot, job.RemainingTimeoutSeconds, llmRecordsFile,
+	if len(snapshot.StreamedTables) > 0 {
+		warnings, err = s.m.pg.RestoreTaskArchiveWithStreams(
+			job.ID, snapshot, job.RemainingTimeoutSeconds,
+			func(_, relative string) (io.ReadCloser, error) {
+				target, pathErr := resolveArchivePayloadPath(extracted, relative)
+				if pathErr != nil {
+					return nil, pathErr
+				}
+				return os.Open(target)
+			},
 		)
-		closeErr := llmRecordsFile.Close()
-		llmRecordsFile = nil
-		err = errors.Join(err, closeErr)
 	} else {
 		warnings, err = s.m.pg.RestoreTaskArchive(job.ID, snapshot, job.RemainingTimeoutSeconds)
 	}
@@ -416,6 +448,32 @@ func (s *Server) deleteTaskArchive(job *pgdb.TaskArchive) error {
 	return nil
 }
 
+type syncCloseFile struct {
+	*os.File
+}
+
+func (f *syncCloseFile) Close() error {
+	syncErr := f.File.Sync()
+	closeErr := f.File.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
+func resolveArchivePayloadPath(root, relPath string) (string, error) {
+	if filepath.VolumeName(relPath) != "" {
+		return "", fmt.Errorf("%w: unsafe archive relative path %q", pgdb.ErrTaskArchiveFormatMismatch, relPath)
+	}
+	clean := filepath.Clean(filepath.FromSlash(relPath))
+	if clean == "." || filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: unsafe archive relative path %q", pgdb.ErrTaskArchiveFormatMismatch, relPath)
+	}
+	target := filepath.Join(root, clean)
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("%w: archive path escapes payload root %q", pgdb.ErrTaskArchiveFormatMismatch, relPath)
+	}
+	return target, nil
+}
+
 func validateArchivePath(dataDir, candidate string) error {
 	if strings.TrimSpace(candidate) == "" {
 		return errors.New("归档包路径为空")
@@ -429,7 +487,7 @@ func validateArchivePath(dataDir, candidate string) error {
 		return err
 	}
 	relative, err := filepath.Rel(root, path)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return errors.New("归档包路径不在受管目录内")
 	}
 	return nil

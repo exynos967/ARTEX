@@ -3,8 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,10 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RC-CHN/ARTEX/db"
+	"github.com/RC-CHN/ARTEX/internal/httpx"
 	"github.com/RC-CHN/ARTEX/norma/permission"
 	actool "github.com/RC-CHN/ARTEX/norma/tool"
 )
@@ -149,7 +150,7 @@ func (s *Server) pgTestCustomTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req testToolReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "无效的请求体")
 		return
 	}
@@ -333,6 +334,15 @@ func ensureSchema(raw json.RawMessage) map[string]any {
 
 // ---------- command:渲染命令 → 复用 Bash 底层 run ----------
 
+func buildCommandBashInput(cmd string, timeoutMs int) []byte {
+	payload := map[string]any{"command": cmd}
+	if timeoutMs > 0 {
+		payload["timeout_ms"] = timeoutMs
+	}
+	b, _ := json.Marshal(payload)
+	return b
+}
+
 func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, params map[string]any, tc *actool.ToolContext) (actool.Result, error) {
 	var spec commandExec
 	_ = json.Unmarshal(execRaw, &spec)
@@ -342,7 +352,7 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 	cmd := renderTemplate(spec.Command, params, shellQuote)
 	// 复用 Bash 也在用的底层 run(经 Bash CoreTool.Call):自动继承安全 floor/超时/
 	// 代理 env/输出溢出。工具与 Bash 平级、共用底层,不经过 Bash 这个工具让模型调。
-	bashIn, _ := json.Marshal(map[string]any{"command": cmd})
+	bashIn := buildCommandBashInput(cmd, spec.TimeoutMs)
 	if spec.TimeoutMs > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeoutOr(spec.TimeoutMs, 120000))
@@ -378,10 +388,64 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 	return actool.Text(actool.Capture(tc, body)), nil
 }
 
+const maxPythonOutputBytes = 8 << 20 // 8 MiB in-memory cap for combined stdout+stderr
+
+// limitedBuffer caps captured process output in memory while still draining
+// further writes (returning len(p), nil) so child processes do not stall on a
+// full pipe or SIGPIPE before exiting.
+type limitedBuffer struct {
+	mu        sync.Mutex
+	limit     int
+	buf       bytes.Buffer
+	dropped   int64
+	truncated bool
+}
+
+func newLimitedBuffer(limit int) *limitedBuffer {
+	if limit < 0 {
+		limit = 0
+	}
+	return &limitedBuffer{limit: limit}
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	rem := b.limit - b.buf.Len()
+	if rem > 0 {
+		n := len(p)
+		if n > rem {
+			n = rem
+		}
+		_, _ = b.buf.Write(p[:n])
+		if len(p) > n {
+			b.truncated = true
+			b.dropped += int64(len(p) - n)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+		b.dropped += int64(len(p))
+	}
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.truncated {
+		return b.buf.String()
+	}
+	return b.buf.String() + fmt.Sprintf("\n... [输出超出 %d 字节上限，已截断 %d 字节] ...", b.limit, b.dropped)
+}
+
 // execPython writes the code to a temp .py under workDir/.tools, runs it via interp
 // with the params JSON on stdin + scalar params mirrored to TOOL_<NAME> env, and
 // returns combined stdout+stderr (with a timeout/exit note). Standalone + testable.
 func execPython(ctx context.Context, interp, key, code string, params map[string]any, workDir string, sessionEnv []string, timeout time.Duration) (string, error) {
+	return execPythonWithLimit(ctx, interp, key, code, params, workDir, sessionEnv, timeout, maxPythonOutputBytes)
+}
+
+func execPythonWithLimit(ctx context.Context, interp, key, code string, params map[string]any, workDir string, sessionEnv []string, timeout time.Duration, maxOutput int) (string, error) {
 	toolsDir := filepath.Join(workDir, ".tools")
 	if err := os.MkdirAll(toolsDir, 0o755); err != nil {
 		return "", err
@@ -401,6 +465,7 @@ func execPython(ctx context.Context, interp, key, code string, params map[string
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	c := exec.CommandContext(runCtx, interp, tmp)
+	configurePythonCmd(c)
 	c.Dir = workDir
 	c.Env = append(os.Environ(), sessionEnv...) // 会话代理 env
 	for k, v := range params {                  // 标量参数镜像成 TOOL_<NAME>
@@ -410,8 +475,11 @@ func execPython(ctx context.Context, interp, key, code string, params map[string
 	}
 	pj, _ := json.Marshal(params)
 	c.Stdin = bytes.NewReader(pj) // 参数 JSON 走 stdin
-	out, err := c.CombinedOutput()
-	body := string(out)
+	out := newLimitedBuffer(maxOutput)
+	c.Stdout = out
+	c.Stderr = out
+	err = c.Run()
+	body := out.String()
 	if runCtx.Err() == context.DeadlineExceeded {
 		body += "\n... [超时终止] ..."
 	} else if err != nil {
@@ -437,7 +505,8 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	if spec.Body != "" {
 		bodyReader = strings.NewReader(renderTemplate(spec.Body, params, identity))
 	}
-	runCtx, cancel := context.WithTimeout(ctx, timeoutOr(spec.TimeoutMs, 30000))
+	timeout := timeoutOr(spec.TimeoutMs, 30000)
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(runCtx, method, rawURL, bodyReader)
 	if err != nil {
@@ -446,49 +515,84 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	for k, v := range spec.Headers {
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
-	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
-	if tr := s.httpProxyTransport(spec); tr != nil {
+	client := &http.Client{Timeout: timeout}
+	tr, err := s.httpProxyTransport(spec)
+	if err != nil {
+		return actool.Errorf("代理配置无效: " + err.Error()), nil
+	}
+	if tr != nil {
 		client.Transport = tr
+	} else if directTr, err := httpx.SharedTransport(httpx.TransportOpts{}); err == nil {
+		client.Transport = directTr
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return actool.Errorf("请求失败: " + err.Error()), nil
 	}
-	defer resp.Body.Close()
+	defer httpx.DrainAndClose(resp.Body)
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	out := map[string]any{"status": resp.StatusCode, "body": string(respBody)}
 	b, _ := json.Marshal(out)
 	return actool.Text(actool.Capture(tc, string(b))), nil
 }
 
-// httpProxyTransport builds a Transport for the http tool's proxy config, or nil
-// (direct). use_recording_proxy routes through the recording proxy + trusts its CA.
-func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
+// normalizeProxyURL prepends http:// only when raw has no explicit scheme, so
+// addresses that already include a scheme (such as s.m.ProxyAddr()'s
+// "http://127.0.0.1:8788" or "socks5://...") are never double-prefixed.
+func normalizeProxyURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		return "http://" + raw
+	}
+	return raw
+}
+
+// validateProxyURL ensures a configured proxy URL has a valid host and an
+// allowed proxy scheme supported by Go's http.Transport.
+func validateProxyURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid proxy URL")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return nil
+	default:
+		return fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
+	}
+}
+
+// httpProxyTransport returns a pooled shared Transport for the http tool's
+// proxy config, or (nil, nil) for direct connections. A configured proxy that
+// fails validation/transport construction returns an error (fail closed) rather
+// than silently falling back to direct egress.
+func (s *Server) httpProxyTransport(spec httpExec) (*http.Transport, error) {
 	proxyStr := strings.TrimSpace(spec.Proxy)
 	var caFile string
-	if spec.UseRecordingProxy {
+	if spec.UseRecordingProxy && s.m != nil {
 		if addr := s.m.ProxyAddr(); addr != "" {
-			proxyStr = "http://" + addr
+			proxyStr = addr
 			caFile = s.m.ProxyCACert()
 		}
 	}
+	proxyStr = normalizeProxyURL(proxyStr)
 	if proxyStr == "" {
-		return nil
+		return nil, nil
 	}
-	pu, err := url.Parse(proxyStr)
+	if err := validateProxyURL(proxyStr); err != nil {
+		return nil, err
+	}
+	tr, err := httpx.SharedTransport(httpx.TransportOpts{
+		ProxyURL:   proxyStr,
+		CACertPath: caFile,
+	})
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	tr := &http.Transport{Proxy: http.ProxyURL(pu)}
-	if caFile != "" {
-		if pem, err := os.ReadFile(caFile); err == nil {
-			pool := x509.NewCertPool()
-			if pool.AppendCertsFromPEM(pem) {
-				tr.TLSClientConfig = &tls.Config{RootCAs: pool}
-			}
-		}
-	}
-	return tr
+	return tr, nil
 }
 
 // ---------- helpers ----------
@@ -498,13 +602,22 @@ func identity(s string) string { return s }
 // shellQuote single-quotes a value for safe shell interpolation.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// renderTemplate replaces {name} placeholders with each param's rendered value.
+// renderTemplate replaces {name} placeholders with each param's rendered value
+// in a single pass so substituted values can never expand other placeholders.
 func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
-	out := tmpl
-	for k, v := range params {
-		out = strings.ReplaceAll(out, "{"+k+"}", quote(valToStr(v)))
+	if len(params) == 0 {
+		return tmpl
 	}
-	return out
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, 0, len(keys)*2)
+	for _, k := range keys {
+		pairs = append(pairs, "{"+k+"}", quote(valToStr(params[k])))
+	}
+	return strings.NewReplacer(pairs...).Replace(tmpl)
 }
 
 // valToStr renders a param value: scalars as-is, arrays/objects as compact JSON.

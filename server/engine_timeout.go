@@ -251,7 +251,8 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 		planner, _ = e.snapshotFor(t)
 	}
 	// 独立 ctx(不挂 execCancel,避免 pause/硬 cancel 打断这最后一轮),带 Final 注入任务超时词。
-	fctx := e.clockCtx(ctx, t, true)
+	// 同时绑定任务级 compaction lifecycle，防止超时收尾轮次启动 5 分钟孤儿压缩。
+	fctx := agent.WithCompactionLifecycle(e.clockCtx(ctx, t, true), e.compactionContextFor(ctx, t.ID))
 	if !e.beginTaskOperation(t.ID) {
 		return false
 	}

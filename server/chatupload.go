@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -80,7 +81,13 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxChatUpload)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	err := r.ParseMultipartForm(32 << 20)
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+	if err != nil {
 		writeErr(w, 400, "解析上传失败或超出大小限制: "+err.Error())
 		return
 	}
@@ -123,19 +130,79 @@ func uniqueUploadPath(dir, name string) string {
 	}
 }
 
+// validateAttachmentPath verifies that a client-supplied attachment path is a
+// clean relative path strictly inside <baseDir>/uploads (rejecting "..",
+// absolute paths, Windows volume prefixes, and symlinks escaping uploads/).
+func validateAttachmentPath(baseDir, rawPath string) (string, error) {
+	p := strings.TrimSpace(rawPath)
+	if p == "" || strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("附件路径无效")
+	}
+	if filepath.VolumeName(p) != "" || filepath.IsAbs(p) || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
+		return "", fmt.Errorf("附件路径非法: %q", rawPath)
+	}
+	norm := strings.ReplaceAll(p, "\\", "/")
+	for _, seg := range strings.Split(norm, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", fmt.Errorf("附件路径非法: %q", rawPath)
+		}
+	}
+	clean := path.Clean(norm)
+	if !strings.HasPrefix(clean, "uploads/") || clean == "uploads" {
+		return "", fmt.Errorf("附件路径必须位于 uploads/ 目录内: %q", rawPath)
+	}
+	base := filepath.Clean(baseDir)
+	if _, ok := safeContainmentPath(base, clean, ""); !ok {
+		return "", fmt.Errorf("附件路径越界: %q", rawPath)
+	}
+	uploadsDir := filepath.Join(base, "uploads")
+	subRel := strings.TrimPrefix(clean, "uploads/")
+	resolved, ok := safeContainmentPath(uploadsDir, subRel, "")
+	if !ok || resolved == filepath.Clean(uploadsDir) {
+		return "", fmt.Errorf("附件路径越界: %q", rawPath)
+	}
+	return resolved, nil
+}
+
+// validateAttachments validates every attachment's Path against <baseDir>/uploads.
+func validateAttachments(baseDir string, atts []chatAttachment) error {
+	for _, a := range atts {
+		if _, err := validateAttachmentPath(baseDir, a.Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // composeAgentMessage appends an attachment manifest to the user's message so the agent
 // knows which files were uploaded and where to Read them. baseDir is the agent's working
 // dir (its CWD); we emit ABSOLUTE paths (baseDir + relative) so the agent can Read/Bash
-// them unambiguously regardless of how it interprets relative paths.
+// them unambiguously regardless of how it interprets relative paths. Invalid paths are
+// skipped defensively so untrusted input can never steer the agent outside uploads/.
 func composeAgentMessage(msg string, atts []chatAttachment, baseDir string) string {
 	if len(atts) == 0 {
+		return msg
+	}
+	type validAtt struct {
+		abs  string
+		size int64
+	}
+	valid := make([]validAtt, 0, len(atts))
+	for _, a := range atts {
+		abs, err := validateAttachmentPath(baseDir, a.Path)
+		if err != nil {
+			continue
+		}
+		valid = append(valid, validAtt{abs: abs, size: a.Size})
+	}
+	if len(valid) == 0 {
 		return msg
 	}
 	var b strings.Builder
 	b.WriteString(msg)
 	b.WriteString("\n\n【用户上传的附件】(绝对路径，需要时用 Read/Bash 查看)：")
-	for _, a := range atts {
-		fmt.Fprintf(&b, "\n- %s（%s）", filepath.Join(baseDir, a.Path), humanBytes(a.Size))
+	for _, a := range valid {
+		fmt.Fprintf(&b, "\n- %s（%s）", a.abs, humanBytes(a.size))
 	}
 	return b.String()
 }

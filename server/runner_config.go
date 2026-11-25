@@ -379,7 +379,7 @@ func (s *Server) setRunnerEnabled(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enabled bool `json:"enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeErr(w, 400, "invalid request")
 		return
 	}

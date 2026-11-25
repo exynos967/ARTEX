@@ -2,7 +2,10 @@ package server
 
 import (
 	"log"
+	"runtime"
+	"sync"
 	"time"
+	"weak"
 
 	"github.com/RC-CHN/ARTEX/agent"
 	"github.com/RC-CHN/ARTEX/db"
@@ -158,18 +161,106 @@ func (s *Server) poolForActive(activeID int64, prov llm.Provider, cfg agent.Conf
 	return pool
 }
 
+// bindingPoolCache caches wrapped bound-profile providers per Server instance so
+// hot-path agentBindingProvider calls do not query PG PoolProfiles() or rebuild
+// llmpool.Pool on every LLM request. Invalidated whenever invalidateTaskAgents()
+// or invalidateProfileAgents() (provCacheGen bump) runs; entries are reclaimed
+// automatically when a Server is GC'd.
+type bindingPoolCache struct {
+	mu      sync.Mutex
+	provGen uint64
+	invGen  uint64
+	entries map[int64]llm.Provider
+}
+
+var (
+	bindingPoolCachesMu sync.Mutex
+	bindingPoolCaches   = map[weak.Pointer[Server]]*bindingPoolCache{}
+)
+
+func bindingPoolCacheFor(s *Server) *bindingPoolCache {
+	if s == nil {
+		return nil
+	}
+	key := weak.Make(s)
+	bindingPoolCachesMu.Lock()
+	defer bindingPoolCachesMu.Unlock()
+	if c := bindingPoolCaches[key]; c != nil {
+		return c
+	}
+	c := &bindingPoolCache{entries: map[int64]llm.Provider{}}
+	bindingPoolCaches[key] = c
+	runtime.AddCleanup(s, func(k weak.Pointer[Server]) {
+		bindingPoolCachesMu.Lock()
+		delete(bindingPoolCaches, k)
+		bindingPoolCachesMu.Unlock()
+	}, key)
+	return c
+}
+
+func (s *Server) provCacheGeneration() uint64 {
+	s.provCacheMu.Lock()
+	defer s.provCacheMu.Unlock()
+	return s.provCacheGen
+}
+
+func (s *Server) invalidateBindingPools() {
+	c := bindingPoolCacheFor(s)
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.invGen++
+	clear(c.entries)
+	c.mu.Unlock()
+}
+
+func (s *Server) poolForBindingCached(id int64, build func() llm.Provider) llm.Provider {
+	c := bindingPoolCacheFor(s)
+	if c == nil {
+		return build()
+	}
+	provGen := s.provCacheGeneration()
+	c.mu.Lock()
+	if c.provGen != provGen {
+		c.provGen = provGen
+		clear(c.entries)
+	}
+	invGen := c.invGen
+	if cached, ok := c.entries[id]; ok {
+		c.mu.Unlock()
+		return cached
+	}
+	c.mu.Unlock()
+
+	built := build()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.provGen == s.provCacheGeneration() && c.provGen == provGen && c.invGen == invGen {
+		if existing, ok := c.entries[id]; ok {
+			return existing
+		}
+		c.entries[id] = built
+	}
+	return built
+}
+
 // poolForBinding wraps a BOUND profile's provider so it falls back to the chain.
 // Only active when both the failover master switch and the bound-fallback switch
 // are on; otherwise a bound profile stays exclusive (fails hard), which is the
-// default and the documented precedence.
+// default and the documented precedence. Results are cached per profile id until
+// invalidateTaskAgents() / invalidateProfileAgents() runs.
 func (s *Server) poolForBinding(id int64, prov llm.Provider, cfg agent.Config) llm.Provider {
-	if s.m == nil || !s.m.LLMPoolEnabled() || !s.m.LLMPoolBindFallback() {
+	return s.poolForBindingCached(id, func() llm.Provider {
+		if s.m == nil || !s.m.LLMPoolEnabled() || !s.m.LLMPoolBindFallback() {
+			return prov
+		}
+		if pool := s.poolChain(id, prov, cfg); pool != nil {
+			return pool
+		}
 		return prov
-	}
-	if pool := s.poolChain(id, prov, cfg); pool != nil {
-		return pool
-	}
-	return prov
+	})
 }
 
 // LLMPoolMemberStatus is one chain entry as shown in the UI.

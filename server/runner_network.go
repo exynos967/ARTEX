@@ -104,14 +104,8 @@ func (s *Server) runnerNetwork(spec *runner.RunSpec, plan *runnerfiles.Plan, env
 		if t.Name == "WebFetch" {
 			t.Exec, _ = json.Marshal(actool.WebFetchConfig{Proxy: proxy, CACert: cert})
 		}
-		if t.Name == "web_search" && t.Kind == "builtin" {
-			var search actool.WebSearchConfig
-			if err := json.Unmarshal(t.Exec, &search); err != nil {
-				return err
-			}
-			search.Proxy, search.CACert = proxy, cert
-			t.Exec, _ = json.Marshal(search)
-		}
+		// web_search 使用独立配置的 web_search_proxy（见 runner_execution.go / agent/worker.go），
+		// 不应被目标流量录制代理 proxy/cert 覆盖，避免搜索流量被错误劫持到靶场 MITM 代理。
 		if t.Kind == "http" {
 			var conf httpExec
 			if err := json.Unmarshal(t.Exec, &conf); err != nil {

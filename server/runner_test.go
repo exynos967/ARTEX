@@ -178,7 +178,8 @@ func TestRunnerCAPublicationKeepsExistingSnapshotImmutable(t *testing.T) {
 func TestRunnerNetworkReplacesControllerProxy(t *testing.T) {
 	m := runnerTestManager(t)
 	s := &Server{m: m}
-	search, _ := json.Marshal(actool.WebSearchConfig{Backend: "ddgs", Proxy: "http://localhost:9999"})
+	searchProxy := "http://search-proxy.example.invalid:7890"
+	search, _ := json.Marshal(actool.WebSearchConfig{Backend: "ddgs", Proxy: searchProxy})
 	custom, _ := json.Marshal(httpExec{URL: "https://example.invalid", UseRecordingProxy: true})
 	spec := runner.RunSpec{Env: map[string]string{}, Tools: []runner.ToolDefinition{{Name: "WebFetch", Kind: "builtin"}, {Name: "web_search", Kind: "builtin", Exec: search}, {Name: "custom", Kind: "http", Exec: custom}}}
 	proxy := "http://proxy.example.invalid:8080"
@@ -186,6 +187,12 @@ func TestRunnerNetworkReplacesControllerProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tool := range spec.Tools {
+		if tool.Name == "web_search" {
+			if strings.Contains(string(tool.Exec), proxy) || !strings.Contains(string(tool.Exec), searchProxy) {
+				t.Fatalf("web_search proxy should remain independent of recording proxy: %s", tool.Exec)
+			}
+			continue
+		}
 		if strings.Contains(string(tool.Exec), "localhost") || !strings.Contains(string(tool.Exec), proxy) {
 			t.Fatalf("controller proxy leaked to %s: %s", tool.Name, tool.Exec)
 		}

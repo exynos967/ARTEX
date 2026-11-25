@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -221,7 +221,30 @@ func (s *Server) pgDeleteConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.cleanupConversationFiles(c.ID)
 	writeJSON(w, 200, map[string]any{"deleted": c.ID})
+}
+
+// cleanupConversationFiles removes on-disk session, transcript, and noa artifacts
+// belonging to a single deleted conversation without touching sibling conversations
+// (e.g. conv-1 vs conv-10).
+func (s *Server) cleanupConversationFiles(convID int64) {
+	if s == nil || s.m == nil || s.m.dir == "" || convID <= 0 {
+		return
+	}
+	key := s.convBusyKey(convID)
+	targets := []string{
+		filepath.Join(s.m.dir, "sessions", key),
+		filepath.Join(s.m.dir, "transcripts", key+".jsonl"),
+		filepath.Join(s.m.dir, "transcripts", key),
+		filepath.Join(s.m.dir, "noa", key),
+		filepath.Join(s.m.dir, "noa", "chat-"+key),
+	}
+	for _, target := range targets {
+		if err := os.RemoveAll(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("[conv %d] cleanup %s failed: %v", convID, target, err)
+		}
+	}
 }
 
 const maxConversationDeleteBatch = 100
@@ -285,6 +308,7 @@ func (s *Server) pgDeleteConversationsBatch(w http.ResponseWriter, r *http.Reque
 	deletedSet := make(map[int64]struct{}, len(deleted))
 	for _, id := range deleted {
 		deletedSet[id] = struct{}{}
+		s.cleanupConversationFiles(id)
 	}
 	items := make([]conversationDeleteItem, 0, len(ids))
 	for _, id := range ids {
@@ -403,6 +427,12 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 		writeErr(w, 400, "消息不能为空")
 		return
 	}
+	busyKey := s.convBusyKey(c.ID)
+	baseDir := filepath.Join(s.m.dir, "sessions", busyKey)
+	if err := validateAttachments(baseDir, req.Attachments); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	agentMessage, ok := s.prepareChatMentionMessage(w, msg)
 	if !ok {
 		return
@@ -416,7 +446,6 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	busyKey := s.convBusyKey(c.ID)
 	s.chatMu.Lock()
 	if s.chatBusy[busyKey] {
 		s.chatMu.Unlock()
@@ -453,7 +482,6 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 	// Read/Bash tools. baseDir = the agent's per-session CWD (<workDir>/sessions/
 	// conv-<id>/), matching chatUpload's landing dir and agent/chat.go's sessionWorkDir
 	// — busyKey == convBusyKey(c.ID) == "conv-<id>" == that session id.
-	baseDir := filepath.Join(s.m.dir, "sessions", busyKey)
 	s.runConversation(c, composeAgentMessage(agentMessage, req.Attachments, baseDir), busyKey, msg)
 	writeJSON(w, 202, map[string]any{"status": "accepted"})
 }
@@ -551,6 +579,12 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 		finishReason = s.chatUnavailableReason()
 		return
 	}
+	releaseAdmission, err := s.admission.Acquire(ctx)
+	if err != nil {
+		finishReason = err.Error()
+		return
+	}
+	defer releaseAdmission()
 	pg := s.m.pg
 	maxTurns := s.agentMaxTurns(c.AgentKey)
 	maxDuration := time.Duration(s.agentRunSeconds(c.AgentKey)) * time.Second
@@ -584,13 +618,29 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 type triggerBehavior struct {
 	runMode     string // serial | parallel
 	mergeMode   string // by_task | all | none (serial 用;parallel 忽略,每条各自一个会话)
-	maxParallel int    // parallel 用的每 agent 并发上限;<=0=不限
+	maxParallel int    // parallel 用的每 agent 并发上限;<=0 用默认上限,最大不超过 maxTriggerMaxParallel
+}
+
+// triggerMaxParallel resolves the effective per-agent concurrency cap for a
+// trigger strategy. Serial runs 1 at a time; parallel defaults <=0 to
+// defaultTriggerMaxParallel and clamps values above maxTriggerMaxParallel.
+func triggerMaxParallel(cfg triggerBehavior) int {
+	if cfg.runMode != "parallel" {
+		return 1
+	}
+	if cfg.maxParallel <= 0 {
+		return defaultTriggerMaxParallel
+	}
+	if cfg.maxParallel > maxTriggerMaxParallel {
+		return maxTriggerMaxParallel
+	}
+	return cfg.maxParallel
 }
 
 // readTriggerBehavior loads an agent's策略, falling back to safe defaults
-// (serial / all / 5) on any error or unknown enum value.
+// (serial / all / defaultTriggerMaxParallel) on any error or unknown enum value.
 func (s *Server) readTriggerBehavior(agentKey string) triggerBehavior {
-	b := triggerBehavior{runMode: "serial", mergeMode: "all", maxParallel: 5}
+	b := triggerBehavior{runMode: "serial", mergeMode: "all", maxParallel: defaultTriggerMaxParallel}
 	if s.m.pg == nil {
 		return b
 	}
@@ -605,8 +655,31 @@ func (s *Server) readTriggerBehavior(agentKey string) triggerBehavior {
 	case "by_task", "all", "none":
 		b.mergeMode = a.TriggerMergeMode
 	}
-	b.maxParallel = a.TriggerMaxParallel
+	b.maxParallel = clampTriggerMaxParallel(a.TriggerMaxParallel)
 	return b
+}
+
+// enqueueTriggeredRunLocked appends one trigger fire to agentKey's bounded queue.
+// When the queue is already at maxTriggerQueuePerAgent, the oldest queued entry
+// is dropped and trailing backing-array slots are zeroed so payloads can be GC'd.
+// Caller holds queueMu.
+func (s *Server) enqueueTriggeredRunLocked(agentKey string, cfg triggerBehavior, item triggeredRun) {
+	if s.triggerCfg == nil {
+		s.triggerCfg = map[string]triggerBehavior{}
+	}
+	if s.triggerQ == nil {
+		s.triggerQ = map[string][]triggeredRun{}
+	}
+	s.triggerCfg[agentKey] = cfg
+	q := s.triggerQ[agentKey]
+	if len(q) >= maxTriggerQueuePerAgent {
+		drop := len(q) - maxTriggerQueuePerAgent + 1
+		log.Printf("[trigger] agent=%s 触发队列已达上限(%d)，丢弃最早的 %d 条积压事件", agentKey, maxTriggerQueuePerAgent, drop)
+		n := copy(q, q[drop:])
+		clear(q[n:])
+		q = q[:n]
+	}
+	s.triggerQ[agentKey] = append(q, item)
 }
 
 // StartTriggeredRun enqueues a P3 trigger fire for agentKey and pumps the queue. The
@@ -614,34 +687,25 @@ func (s *Server) readTriggerBehavior(agentKey string) triggerBehavior {
 // merging by task / all / none); parallel → run each fire in its own concurrent
 // conversation up to trigger_max_parallel. Distinct agents always run concurrently.
 func (s *Server) StartTriggeredRun(agentKey, title, message string, taskID int64, mergeable bool, taskDesc, taskGoal string) {
-	if s.m.pg == nil || s.chatAgentRef() == nil {
+	if s.m == nil || s.m.pg == nil || s.chatAgentRef() == nil {
 		return
 	}
 	cfg := s.readTriggerBehavior(agentKey) // DB read BEFORE the lock (never under queueMu)
 	s.queueMu.Lock()
-	s.triggerCfg[agentKey] = cfg
-	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
+	s.enqueueTriggeredRunLocked(agentKey, cfg, triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
 	s.pumpLocked(agentKey)
 	s.queueMu.Unlock()
 }
 
-// pumpLocked launches queued fires for one agent up to its concurrency limit, then
-// returns. Serial → limit 1; parallel → limit = maxParallel (<=0 → unlimited). Each
-// launched run re-pumps on completion (runAndPump) to fill the freed slot. Caller
-// holds queueMu.
+// pumpLocked launches queued fires for one agent up to its bounded concurrency
+// limit, then returns. Each launched run re-pumps on completion (runAndPump) to
+// fill the freed slot. Caller holds queueMu.
 func (s *Server) pumpLocked(agentKey string) {
-	if s.ctx.Err() != nil {
+	if s.ctx != nil && s.ctx.Err() != nil {
 		return
 	}
 	cfg := s.triggerCfg[agentKey]
-	limit := 1
-	if cfg.runMode == "parallel" {
-		if cfg.maxParallel <= 0 {
-			limit = math.MaxInt
-		} else {
-			limit = cfg.maxParallel
-		}
-	}
+	limit := triggerMaxParallel(cfg)
 	for s.triggerActive[agentKey] < limit && len(s.triggerQ[agentKey]) > 0 {
 		item := s.nextTriggerRun(agentKey, cfg)
 		s.triggerActive[agentKey]++
@@ -668,6 +732,26 @@ func (s *Server) runAndPump(agentKey string, item triggeredRun) {
 	s.queueMu.Unlock()
 }
 
+// popTriggerHeadLocked pops q[0], explicitly zeroing the slot so large string
+// fields are released for GC, and drops the map entry once the queue drains.
+// Caller holds queueMu.
+func (s *Server) popTriggerHeadLocked(agentKey string, q []triggeredRun) triggeredRun {
+	head := q[0]
+	q[0] = triggeredRun{}
+	rest := q[1:]
+	if len(rest) == 0 {
+		delete(s.triggerQ, agentKey)
+	} else if cap(q) > maxTriggerQueuePerAgent && len(rest) <= cap(q)/4 {
+		shrunk := make([]triggeredRun, len(rest))
+		copy(shrunk, rest)
+		clear(rest)
+		s.triggerQ[agentKey] = shrunk
+	} else {
+		s.triggerQ[agentKey] = rest
+	}
+	return head
+}
+
 // nextTriggerRun pops the next run from the agent's queue per the merge mode:
 //
 //	parallel / none → one head item, no merge
@@ -678,21 +762,21 @@ func (s *Server) runAndPump(agentKey string, item triggeredRun) {
 func (s *Server) nextTriggerRun(agentKey string, cfg triggerBehavior) triggeredRun {
 	q := s.triggerQ[agentKey]
 	if cfg.runMode == "parallel" || cfg.mergeMode == "none" {
-		s.triggerQ[agentKey] = q[1:]
-		return q[0]
+		return s.popTriggerHeadLocked(agentKey, q)
 	}
 	if cfg.mergeMode == "all" {
-		s.triggerQ[agentKey] = q[:0:0]
-		return mergeAllRuns(q)
+		merged := mergeAllRuns(q)
+		clear(q)
+		delete(s.triggerQ, agentKey)
+		return merged
 	}
 	// by_task: head + same-task mergeable fires.
 	head := q[0]
 	if !head.mergeable || head.taskID == 0 {
-		s.triggerQ[agentKey] = q[1:]
-		return head
+		return s.popTriggerHeadLocked(agentKey, q)
 	}
 	group := []triggeredRun{head}
-	rest := q[:0:0] // keep non-matching items in order
+	var rest []triggeredRun // keep non-matching items in order
 	for _, it := range q[1:] {
 		if it.mergeable && it.taskID == head.taskID {
 			group = append(group, it)
@@ -700,8 +784,14 @@ func (s *Server) nextTriggerRun(agentKey string, cfg triggerBehavior) triggeredR
 			rest = append(rest, it)
 		}
 	}
-	s.triggerQ[agentKey] = rest
-	return mergeTriggeredRuns(group)
+	merged := mergeTriggeredRuns(group)
+	clear(q)
+	if len(rest) == 0 {
+		delete(s.triggerQ, agentKey)
+	} else {
+		s.triggerQ[agentKey] = rest
+	}
+	return merged
 }
 
 // taskContextHeader renders a task's description/goal once. Same-task fires share

@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -43,9 +43,9 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
 		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；运行中任务的后续调度立即生效
-		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
-		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
+		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3，上限8)；运行中任务的后续调度立即生效
+		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认开)
+		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(默认3，上限10)
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -135,7 +135,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -219,6 +219,10 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			on = *req.ConcurrencyEnabled
 		}
 		if req.ConcurrencyLimit != nil {
+			if *req.ConcurrencyLimit < 1 || *req.ConcurrencyLimit > maxConcurrencyLimit {
+				writeErr(w, 400, fmt.Sprintf("任务并发上限需在 1 到 %d 之间", maxConcurrencyLimit))
+				return
+			}
 			limit = *req.ConcurrencyLimit
 		}
 		if err := s.m.SetConcurrency(on, limit); err != nil {
@@ -298,7 +302,12 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		changed = true
 	}
 	if changed {
-		// rebuild agents so the new proxy/tools/prompt/web-search take hold (only if LLM configured).
+		// Unconditionally invalidate cached per-task & per-profile agents so
+		// TrafficCapture / GlobalProxy / WebSearch changes take effect even when
+		// no global LLM profile is configured (e.g. pinned/bound profiles only).
+		s.invalidateTaskAgents()
+		s.invalidateProfChatAgents()
+		// Refresh global s.chatAgent / s.llmProv when global LLM is configured.
 		s.cfgMu.Lock()
 		cfg, on := s.llmCfg, s.llmOn
 		s.cfgMu.Unlock()
@@ -325,7 +334,7 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 		TavilyKey string `json:"tavily_search_api_key"`
 	}
 	// Empty body is fine — fall back entirely to the saved config below.
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+	if err := decodeBody(w, r, &req); err != nil && err != io.EOF {
 		writeErr(w, 400, err.Error())
 		return
 	}

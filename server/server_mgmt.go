@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -25,6 +24,7 @@ import (
 
 	"github.com/RC-CHN/ARTEX/agent"
 	"github.com/RC-CHN/ARTEX/db"
+	"github.com/RC-CHN/ARTEX/internal/httpx"
 	"github.com/RC-CHN/ARTEX/norma/llm"
 	"github.com/RC-CHN/ARTEX/norma/skill"
 )
@@ -78,7 +78,16 @@ func pathInt(r *http.Request, name string) (int64, bool) {
 	return n, err == nil
 }
 
-func decode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+const maxDecodeBodyBytes = 8 << 20 // 8 MiB: covers legitimate JSON writes (e.g. 2 MiB wsWrite + escaping)
+
+func decode(r *http.Request, v any) error {
+	return json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxDecodeBodyBytes)).Decode(v)
+}
+
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxDecodeBodyBytes)
+	return json.NewDecoder(r.Body).Decode(v)
+}
 
 // ---------- tasks (delete) ----------
 
@@ -162,7 +171,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.drainTaskSideQuestions(drainCtx, id); err != nil {
+	if err := s.prepareDrainTaskSideQuestions(drainCtx, id); err != nil {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -172,10 +181,9 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &committed) {
 			// PostgreSQL is already gone. Complete runtime teardown and return the
 			// auditable counts together with the post-commit cleanup warning.
+			s.forgetTaskSideQuestions(id)
 			s.engine.StopTask(id)
-			s.taskAgentMu.Lock()
-			delete(s.taskAgents, id)
-			s.taskAgentMu.Unlock()
+			s.evictTaskAgents(id)
 			deleted = true
 			writeCommittedTaskDelete(w, result, err)
 			return
@@ -186,10 +194,9 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	// Manager has removed the task from the registry, so no new API operation can
 	// resolve it. Now stop and join every task-owned Engine goroutine and clear its
 	// lifecycle maps before releasing the delete barrier.
+	s.forgetTaskSideQuestions(id)
 	s.engine.StopTask(id)
-	s.taskAgentMu.Lock()
-	delete(s.taskAgents, id)
-	s.taskAgentMu.Unlock()
+	s.evictTaskAgents(id)
 	deleted = true
 	writeJSON(w, 200, result)
 }
@@ -204,7 +211,7 @@ func (s *Server) waitTaskQuiescent(ctx context.Context, taskID string) error {
 	defer ticker.Stop()
 	for {
 		if s.engine.inflightCount(taskID) == 0 && !s.hasActiveTaskChat(taskID) {
-			return nil
+			break
 		}
 		select {
 		case <-ctx.Done():
@@ -212,6 +219,9 @@ func (s *Server) waitTaskQuiescent(ctx context.Context, taskID string) error {
 		case <-ticker.C:
 		}
 	}
+	// Also close & wait for any cold-graph Compactor goroutine owned by this
+	// task's cached agent bundle so no background compaction writes after delete/archive.
+	return s.closeTaskCompactor(ctx, taskID)
 }
 
 // ---------- agents ----------
@@ -365,7 +375,7 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		TriggerMergeMode   *string `json:"trigger_merge_mode"`
 		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -431,7 +441,14 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 			mergeMode = *req.TriggerMergeMode
 		}
 		if req.TriggerMaxParallel != nil {
-			maxPar = *req.TriggerMaxParallel
+			validated, err := validateTriggerMaxParallel(*req.TriggerMaxParallel)
+			if err != nil {
+				writeErr(w, 400, err.Error())
+				return
+			}
+			maxPar = validated
+		} else {
+			maxPar = clampTriggerMaxParallel(maxPar)
 		}
 		if err := pg.SetAgentTriggerBehavior(a.Key, runMode, mergeMode, maxPar); err != nil {
 			writeErr(w, 500, err.Error())
@@ -461,6 +478,27 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		resp["run_seconds"] = *req.RunSeconds
 	}
 	writeJSON(w, 200, resp)
+}
+
+// validateTriggerMaxParallel rejects negative trigger_max_parallel values and
+// clamps values above maxTriggerMaxParallel to the hard ceiling.
+func validateTriggerMaxParallel(n int) (int, error) {
+	if n < 0 {
+		return 0, fmt.Errorf("trigger_max_parallel 不能为负数")
+	}
+	return clampTriggerMaxParallel(n), nil
+}
+
+// clampTriggerMaxParallel normalizes persisted trigger_max_parallel values into
+// [0, maxTriggerMaxParallel] (0 means defaultTriggerMaxParallel when parallel).
+func clampTriggerMaxParallel(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > maxTriggerMaxParallel {
+		return maxTriggerMaxParallel
+	}
+	return n
 }
 
 func (s *Server) pgGetAgent(w http.ResponseWriter, r *http.Request) {
@@ -868,10 +906,29 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isNew := m.ID == 0
+	var prevName string
+	if !isNew {
+		if all, err := pg.ListMCP(); err == nil {
+			for _, cur := range all {
+				if cur.ID == m.ID {
+					prevName = cur.Name
+					break
+				}
+			}
+		}
+	}
 	id, err := pg.SaveMCP(&m)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	if !isNew {
+		if prevName != "" && prevName != m.Name {
+			defaultMCPPool().evictServer(prevName)
+		}
+		if !m.Enabled || prevName != "" {
+			defaultMCPPool().evictServer(m.Name)
+		}
 	}
 	// On initial add, auto-discover + cache the tool list so the UI shows it right
 	// away (bounded so a slow/broken server can't hang the request). Skipped on
@@ -893,9 +950,21 @@ func (s *Server) pgDeleteMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, _ := pathInt(r, "id")
+	var prevName string
+	if all, err := pg.ListMCP(); err == nil {
+		for _, cur := range all {
+			if cur.ID == id {
+				prevName = cur.Name
+				break
+			}
+		}
+	}
 	if err := pg.DeleteMCP(id); err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	if prevName != "" {
+		defaultMCPPool().evictServer(prevName)
 	}
 	writeJSON(w, 200, map[string]any{"deleted": id})
 }
@@ -1059,14 +1128,69 @@ func (s *Server) fsMissingSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 // cleanStrs trims each string and drops empties.
+func sanitizeSingleLine(s string) string {
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.TrimSpace(s)
+}
+
+// isSafePlainYAMLScalar reports whether a single-line string can be emitted as
+// an unquoted YAML 1.2 plain scalar without any risk of type coercion, comment
+// truncation, or key/structure injection.
+func isSafePlainYAMLScalar(s string) bool {
+	if s == "" || strings.TrimSpace(s) != s {
+		return false
+	}
+	switch s[0] {
+	case '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`':
+		return false
+	}
+	switch strings.ToLower(s) {
+	case "null", "~", "true", "false", "yes", "no", "on", "off":
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+		switch r {
+		case ':', '#', '[', ']', '{', '}', ',', '&', '*', '!', '|', '>', '\'', '"', '\\', '%', '@', '`':
+			return false
+		}
+	}
+	return true
+}
+
+// quoteFrontmatterScalar strips CR/LF and encodes unsafe values as a YAML 1.2
+// double-quoted scalar (JSON string syntax is a valid YAML 1.2 subset and keeps
+// UTF-8 intact), preventing YAML key/structure injection in SKILL.md frontmatter
+// while keeping benign plain descriptions readable.
+func quoteFrontmatterScalar(s string) string {
+	clean := sanitizeSingleLine(s)
+	if !strings.ContainsAny(s, "\r\n") && isSafePlainYAMLScalar(clean) {
+		return clean
+	}
+	b, _ := json.Marshal(clean)
+	return string(b)
+}
+
 func cleanStrs(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
-		if s = strings.TrimSpace(s); s != "" {
+		if s = sanitizeSingleLine(s); s != "" {
 			out = append(out, s)
 		}
 	}
 	return out
+}
+
+func formatFrontmatterMCPs(in []string) string {
+	cleaned := cleanStrs(in)
+	if len(cleaned) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(cleaned)
+	return string(b)
 }
 
 func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
@@ -1086,11 +1210,15 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "skill name must be 1-64 lowercase alphanumeric/hyphen characters, not starting/ending/doubling hyphens")
 		return
 	}
-	if strings.TrimSpace(body.Description) == "" {
+	if sanitizeSingleLine(body.Description) == "" {
 		writeErr(w, 400, "description is required")
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, body.Name)
+	skillPath, ok := safeContainmentPath(s.skillDir, body.Name, "")
+	if !ok {
+		writeErr(w, 400, "invalid skill path")
+		return
+	}
 	if _, err := os.Stat(skillPath); err == nil {
 		writeErr(w, 409, "skill already exists")
 		return
@@ -1106,16 +1234,16 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 	var sb strings.Builder
 	sb.WriteString("---\n")
 	fmt.Fprintf(&sb, "name: %s\n", body.Name)
-	fmt.Fprintf(&sb, "description: %s\n", body.Description)
-	if body.License != "" {
-		fmt.Fprintf(&sb, "license: %s\n", body.License)
+	fmt.Fprintf(&sb, "description: %s\n", quoteFrontmatterScalar(body.Description))
+	if sanitizeSingleLine(body.License) != "" {
+		fmt.Fprintf(&sb, "license: %s\n", quoteFrontmatterScalar(body.License))
 	}
-	if body.Compatibility != "" {
-		fmt.Fprintf(&sb, "compatibility: %s\n", body.Compatibility)
+	if sanitizeSingleLine(body.Compatibility) != "" {
+		fmt.Fprintf(&sb, "compatibility: %s\n", quoteFrontmatterScalar(body.Compatibility))
 	}
 	// mcps: MCP servers this skill unlocks on load (skill-gated deferred tools).
-	if mcps := cleanStrs(body.MCPs); len(mcps) > 0 {
-		fmt.Fprintf(&sb, "mcps: %s\n", strings.Join(mcps, ", "))
+	if mcps := formatFrontmatterMCPs(body.MCPs); mcps != "" {
+		fmt.Fprintf(&sb, "mcps: %s\n", mcps)
 	}
 	sb.WriteString("---\n")
 	if strings.TrimSpace(body.Instructions) != "" {
@@ -1155,7 +1283,11 @@ func (s *Server) fsUpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	skillMD := filepath.Join(s.skillDir, name, "SKILL.md")
+	skillMD, ok := resolveSkillFilePath(s.skillDir, name, "SKILL.md")
+	if !ok {
+		writeErr(w, 400, "invalid skill path")
+		return
+	}
 	raw, err := os.ReadFile(skillMD)
 	if err != nil {
 		writeErr(w, 404, "skill not found")
@@ -1201,24 +1333,25 @@ func rewriteSkillFrontmatter(content []byte, mcps *[]string, description, licens
 			pairs = append(pairs, kv{"", l}) // preserve non-key lines verbatim
 		}
 	}
-	// Apply updates (nil pointer = no change)
+	// Apply updates (nil pointer = no change); sanitize & YAML-quote every scalar.
 	applyStr := func(key string, val *string) {
 		if val == nil {
 			return
 		}
+		quoted := quoteFrontmatterScalar(*val)
 		for i, p := range pairs {
 			if p.k == key {
-				pairs[i].v = strings.TrimSpace(*val)
+				pairs[i].v = quoted
 				return
 			}
 		}
-		pairs = append(pairs, kv{key, strings.TrimSpace(*val)})
+		pairs = append(pairs, kv{key, quoted})
 	}
 	applyStr("description", description)
 	applyStr("license", license)
 	applyStr("compatibility", compatibility)
 	if mcps != nil {
-		cleaned := cleanStrs(*mcps)
+		formatted := formatFrontmatterMCPs(*mcps)
 		// Remove existing mcps line
 		filtered := pairs[:0]
 		for _, p := range pairs {
@@ -1227,8 +1360,8 @@ func rewriteSkillFrontmatter(content []byte, mcps *[]string, description, licens
 			}
 		}
 		pairs = filtered
-		if len(cleaned) > 0 {
-			pairs = append(pairs, kv{"mcps", strings.Join(cleaned, ", ")})
+		if formatted != "" {
+			pairs = append(pairs, kv{"mcps", formatted})
 		}
 	}
 	// Reconstruct
@@ -1417,6 +1550,10 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		if n > maxSkillFileBytes {
+			writeErr(w, 400, "文件过大："+rel)
+			return
+		}
 		total += n
 		if total > maxSkillTotalBytes {
 			writeErr(w, 400, "压缩包解压后过大")
@@ -1446,7 +1583,14 @@ func readZipEntry(f *zip.File) ([]byte, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadAll(io.LimitReader(rc, maxSkillFileBytes))
+	data, err := io.ReadAll(io.LimitReader(rc, maxSkillFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxSkillFileBytes {
+		return nil, fmt.Errorf("file exceeds %d bytes", maxSkillFileBytes)
+	}
+	return data, nil
 }
 
 func (s *Server) fsDeleteSkill(w http.ResponseWriter, r *http.Request) {
@@ -1583,6 +1727,20 @@ func (s *Server) fsListFiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"files": files})
 }
 
+// resolveSkillFilePath enforces symlink containment for a skill's root dir and
+// a validated relative file path inside it.
+func resolveSkillFilePath(skillDir, name, rel string) (string, bool) {
+	skillPath, ok := safeContainmentPath(skillDir, name, "")
+	if !ok {
+		return "", false
+	}
+	fullPath, ok := safeContainmentPath(skillPath, rel, "")
+	if !ok || fullPath == filepath.Clean(skillPath) {
+		return "", false
+	}
+	return fullPath, true
+}
+
 func (s *Server) fsReadFile(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if !validSkillName(name) {
@@ -1594,7 +1752,12 @@ func (s *Server) fsReadFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(s.skillDir, name, file))
+	fullPath, ok := resolveSkillFilePath(s.skillDir, name, file)
+	if !ok {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	data, err := os.ReadFile(fullPath)
 	if os.IsNotExist(err) {
 		writeErr(w, 404, "file not found")
 		return
@@ -1624,12 +1787,20 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, name)
+	skillPath, ok := safeContainmentPath(s.skillDir, name, "")
+	if !ok {
+		writeErr(w, 400, "invalid path")
+		return
+	}
 	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	fullPath := filepath.Join(skillPath, file)
+	fullPath, ok := safeContainmentPath(skillPath, file, "")
+	if !ok || fullPath == filepath.Clean(skillPath) {
+		writeErr(w, 400, "invalid path")
+		return
+	}
 	// create parent subdirectory if needed (e.g. scripts/, references/, assets/)
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
 		writeErr(w, 500, err.Error())
@@ -1660,12 +1831,21 @@ func (s *Server) fsCreateDir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, name)
+	skillPath, ok := safeContainmentPath(s.skillDir, name, "")
+	if !ok {
+		writeErr(w, 400, "invalid path")
+		return
+	}
 	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	if err := os.MkdirAll(filepath.Join(skillPath, dir), 0o755); err != nil {
+	fullDir, ok := safeContainmentPath(skillPath, dir, "")
+	if !ok || fullDir == filepath.Clean(skillPath) {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if err := os.MkdirAll(fullDir, 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -1683,8 +1863,12 @@ func (s *Server) fsDeletePath(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	fullPath := filepath.Join(s.skillDir, name, file)
-	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+	fullPath, ok := resolveSkillFilePath(s.skillDir, name, file)
+	if !ok {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if _, err := os.Lstat(fullPath); os.IsNotExist(err) {
 		writeErr(w, 404, "not found")
 		return
 	}
@@ -1985,20 +2169,48 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	// Resolve API key: form input > profile stored key.
+	// Resolve API key: form input > profile stored key (or global config).
+	// Reusing a stored API key must not redirect it to a different origin or proxy.
 	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" && req.ProfileID != nil {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
+	provider := strings.TrimSpace(req.Provider)
+	reqProxy := strings.TrimSpace(req.Proxy)
+	if apiKey == "" && req.ProfileID != nil && s.m != nil && s.m.pg != nil {
+		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil && p.APIKey != "" {
+			if !sameNormalizedOrigin(effectiveLLMOriginURL(provider, baseURL), effectiveLLMOriginURL(p.Format, p.BaseURL)) {
+				writeErr(w, 400, "复用已存 API Key 时不允许将 base_url 更改为其他来源，请重新输入 API Key")
+				return
+			}
+			if reqProxy != strings.TrimSpace(p.Proxy) {
+				writeErr(w, 400, "复用已存 API Key 时不允许修改 proxy，请重新输入 API Key")
+				return
+			}
 			apiKey = p.APIKey
+		}
+	}
+	if apiKey == "" && req.ProfileID == nil {
+		s.cfgMu.Lock()
+		storedKey := s.llmCfg.APIKey
+		storedProv := s.llmCfg.Provider()
+		storedBase := s.llmCfg.BaseURL
+		storedProxy := s.llmCfg.Proxy
+		s.cfgMu.Unlock()
+		if storedKey != "" {
+			if !sameNormalizedOrigin(effectiveLLMOriginURL(provider, baseURL), effectiveLLMOriginURL(storedProv, storedBase)) {
+				writeErr(w, 400, "复用已存 API Key 时不允许将 base_url 更改为其他来源，请重新输入 API Key")
+				return
+			}
+			if reqProxy != strings.TrimSpace(storedProxy) {
+				writeErr(w, 400, "复用已存 API Key 时不允许修改 proxy，请重新输入 API Key")
+				return
+			}
+			apiKey = storedKey
 		}
 	}
 	if apiKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
 		return
 	}
-
-	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
-	provider := strings.TrimSpace(req.Provider)
 
 	// Candidate endpoints to try in order. Some Anthropic-compatible providers
 	// (e.g. DeepSeek) implement /v1/messages under an /anthropic path but expose
@@ -2046,12 +2258,20 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build HTTP client with optional proxy.
-	transport := &http.Transport{}
-	if p := strings.TrimSpace(req.Proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
-			transport.Proxy = http.ProxyURL(pu)
+	// Build HTTP client with optional proxy using the shared pooled transport.
+	// Fail closed if a non-empty proxy is invalid or cannot construct a transport.
+	trOpts := httpx.TransportOpts{}
+	if reqProxy != "" {
+		if err := validateProxyURL(reqProxy); err != nil {
+			writeErr(w, 400, "代理地址格式无效: "+err.Error())
+			return
 		}
+		trOpts.ProxyURL = reqProxy
+	}
+	transport, err := httpx.SharedTransport(trOpts)
+	if err != nil {
+		writeErr(w, 400, "代理配置无效: "+err.Error())
+		return
 	}
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 
@@ -2071,7 +2291,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		resp.Body.Close()
+		httpx.DrainAndClose(resp.Body)
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(body[:min(len(body), 512)]))
 			continue

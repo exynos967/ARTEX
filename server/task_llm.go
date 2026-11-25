@@ -7,13 +7,18 @@ import (
 	"fmt"
 	"iter"
 	"log"
+	"math/rand/v2"
+	"net"
+	"net/http"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/RC-CHN/ARTEX/agent"
 	"github.com/RC-CHN/ARTEX/db"
+	"github.com/RC-CHN/ARTEX/llmpool"
 	"github.com/RC-CHN/ARTEX/llmrec"
 	"github.com/RC-CHN/ARTEX/norma/llm"
 	"github.com/RC-CHN/ARTEX/norma/transcript"
@@ -27,6 +32,7 @@ type taskAgentBundle struct {
 	pl             *agent.Planner
 	wk             *agent.Worker
 	main           *agent.MainAgent
+	comp           *agent.Compactor
 }
 
 type llmAuditProfile struct {
@@ -436,11 +442,33 @@ func streamEventCommitsOutput(event llm.StreamEvent) bool {
 // 把这类抖动挡在意图整体重跑之前。可被 LLM 配置的重试覆盖/全局重试策略改写。
 const sameProviderStreamRetries = 2
 
-// sameProviderRetryBackoff 是第 attempt 次重试前的【默认】退避(0.5s、1s…,上限 4s),
-// 与 SDK 的指数梯度同风格但封顶更小,避免拖住 worker 的收尾/取消响应。
+// jitterDuration adds equal jitter in [base/2, base] to prevent thundering
+// herds when concurrent workers back off together.
+func jitterDuration(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	half := base / 2
+	if half <= 0 {
+		return base
+	}
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
+// sameProviderRetryBackoff 是第 attempt 次重试前的【默认】退避(0.5s、1s…,上限 4s)
+// 并叠加半区间抖动([base/2, base]),避免多 worker 同步重试惊群。
 // 以变量形式暴露,便于测试将退避置零。
 var sameProviderRetryBackoff = func(attempt int) time.Duration {
-	return min(500*time.Millisecond*(1<<attempt), 4*time.Second)
+	if attempt < 0 {
+		attempt = 0
+	}
+	var base time.Duration
+	if attempt >= 10 {
+		base = 4 * time.Second
+	} else {
+		base = min(500*time.Millisecond*(1<<attempt), 4*time.Second)
+	}
+	return jitterDuration(base)
 }
 
 // sameProviderRetryPolicy 解析这次调用用哪套同 provider 重试参数:配置里设了次数就
@@ -458,35 +486,110 @@ func sameProviderRetryPolicy(r agent.RetryConfig) (retries int, backoff func(int
 	return retries, backoff
 }
 
+var httpStatusErrorRe = regexp.MustCompile(`(?i)\bstatus(?:\s+code)?\s*[=:]?\s*(\d{3})\b`)
+
+func httpStatusFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	m := httpStatusErrorRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return 0
+	}
+	code, _ := strconv.Atoi(m[1])
+	return code
+}
+
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if httpStatusFromError(err) == http.StatusTooManyRequests {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "rate_limit") ||
+		strings.Contains(s, "rate limit") ||
+		strings.Contains(s, "too many requests")
+}
+
+func isDialOrConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"dial tcp", "dial udp", "dial unix",
+		"no such host", "connection refused",
+		"network is unreachable", "no route to host",
+		"tls handshake timeout", "proxyconnect",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isContextOverflowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "too long") ||
+		strings.Contains(s, "context length") ||
+		strings.Contains(s, "context_length") ||
+		strings.Contains(s, "maximum context") ||
+		httpStatusFromError(err) == http.StatusRequestEntityTooLarge
+}
+
+// isOuterRetryExcluded reports whether err was already retried by lower layers
+// (norma/llm connect/HTTP retry loop, adapter response recovery, or llmpool
+// failover) or is deterministic and must not be amplified by outer retry loops.
+func isOuterRetryExcluded(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, llmpool.ErrExhausted) {
+		return true
+	}
+	var incomplete *llm.IncompleteResponseError
+	if errors.As(err, &incomplete) {
+		return true // adapter already exhausted its bounded response recovery
+	}
+	if isQuotaExhaustedError(err) || isRateLimitError(err) || isContextOverflowError(err) {
+		return true
+	}
+	if code := httpStatusFromError(err); code >= 400 {
+		// 408/429/5xx were already retried by norma/llm/retry.go & llmpool;
+		// other 4xx (400/401/402/403/404/413/422) are deterministic rejections.
+		return true
+	}
+	return false
+}
+
 // isRetryableStreamError 判断「提交前的流失败」是否值得在同一 provider 上重放。
-// 瞬时的传输中断 / 供应商过载 / 限流会自行恢复,可安全重试;而以下三类不重试:
-//   - 额度耗尽:交给 profile 故障转移处理,别在这里白烧重试
-//   - 上下文过长:相同请求重放也没用,交给 harness 的 reactive 压缩兜底
-//   - 4xx 确定性拒绝(400/401/403/404/422):到哪个 provider 都一样会失败
+// 仅对拿到 200 之后真正发生在流内的传输中断 / 流内瞬时错误事件（如 read reset、
+// unexpected EOF、anthropic overloaded_error）重放；建连期错误（dial/connect、
+// HTTP 408/429/5xx）、llmpool.ErrExhausted、已耗尽内部恢复的 IncompleteResponseError、
+// 额度耗尽、上下文过长以及确定性 4xx 一律不再叠加重试。
 func isRetryableStreamError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var incomplete *llm.IncompleteResponseError
-	if errors.As(err, &incomplete) {
-		return false // adapter already exhausted its bounded response recovery
-	}
-	if isQuotaExhaustedError(err) {
+	if isOuterRetryExcluded(err) {
 		return false
 	}
-	s := strings.ToLower(err.Error())
-	if strings.Contains(s, "too long") || strings.Contains(s, "context length") ||
-		strings.Contains(s, "context_length") || strings.Contains(s, "maximum context") ||
-		strings.Contains(s, "status 413") {
-		return false
+	if isDialOrConnectError(err) {
+		return false // norma/llm/retry.go already retried pre-200 dial/connect failures
 	}
-	for _, code := range []string{"status 400", "status 401", "status 403", "status 404", "status 422"} {
-		if strings.Contains(s, code) {
-			return false
-		}
-	}
-	// 其余(传输 reset/EOF/timeout、408/429/5xx、流内 error 事件如 anthropic
-	// overloaded_error 等)一律视为瞬时,允许重试。
 	return true
 }
 
@@ -584,11 +687,63 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 
 func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Lock()
+	old := s.taskAgents
 	s.taskAgents = map[string]*taskAgentBundle{}
 	s.taskAgentMu.Unlock()
+	for _, bundle := range old {
+		if bundle != nil && bundle.comp != nil {
+			bundle.comp.Close()
+		}
+	}
+	s.invalidateBindingPools()
+}
+
+// evictTaskAgents drops the cached per-task agent bundle when a task's Engine
+// runtime stops (terminal cleanup or deletion), closing and joining its
+// cold-graph Compactor so no background compaction outlives the task.
+func (s *Server) evictTaskAgents(taskID string) {
+	if taskID == "" {
+		return
+	}
+	s.taskAgentMu.Lock()
+	bundle := s.taskAgents[taskID]
+	delete(s.taskAgents, taskID)
+	s.taskAgentMu.Unlock()
+	if bundle != nil && bundle.comp != nil {
+		bundle.comp.Close()
+	}
+}
+
+// closeTaskCompactor evicts the cached task bundle and waits for its cold-graph
+// Compactor to exit, bounded by ctx so delete/archive quiescence never hangs.
+func (s *Server) closeTaskCompactor(ctx context.Context, taskID string) error {
+	if taskID == "" {
+		return nil
+	}
+	s.taskAgentMu.Lock()
+	bundle := s.taskAgents[taskID]
+	delete(s.taskAgents, taskID)
+	s.taskAgentMu.Unlock()
+	if bundle == nil || bundle.comp == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		bundle.comp.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
+	if s.engine != nil {
+		s.engine.ensureOnTaskStop(s.evictTaskAgents)
+	}
 	s.taskAgentMu.Lock()
 	defer s.taskAgentMu.Unlock()
 	if bundle := s.taskAgents[t.ID]; bundle != nil {
@@ -625,7 +780,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
 	// 同模型,随任务 LLM 链解析),压缩用 Complete 一次性生成 body。
-	pl.SetCompactor(agent.NewCompactor(plannerRuntime, "task-router"))
+	comp := agent.NewCompactor(plannerRuntime, "task-router")
+	comp.SetBaseContext(s.ctx)
+	pl.SetCompactor(comp)
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
 	main.SetFindingRecorder(s.evidenceStore())
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)
@@ -637,7 +794,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
-		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,
+		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main, comp: comp,
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle

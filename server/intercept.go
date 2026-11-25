@@ -245,6 +245,19 @@ func (s *Server) interceptGetOne(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, p)
 }
 
+const maxLegacyTaskIntercepts = 500
+
+func capLegacyIntercepts(items []db.InterceptApprovalRow, limit int) ([]db.InterceptApprovalRow, int) {
+	if items == nil {
+		return []db.InterceptApprovalRow{}, 0
+	}
+	total := len(items)
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, total
+}
+
 func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -267,10 +280,8 @@ func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) 
 			writeErr(w, 500, err.Error())
 			return
 		}
-		if items == nil {
-			items = []db.InterceptApprovalRow{}
-		}
-		writeJSON(w, 200, map[string]any{"items": items, "total": len(items)})
+		items, total := capLegacyIntercepts(items, maxLegacyTaskIntercepts)
+		writeJSON(w, 200, map[string]any{"items": items, "total": total})
 		return
 	}
 	page, size := interceptPageParams(q)

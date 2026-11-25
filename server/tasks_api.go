@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -73,7 +72,7 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -82,9 +81,12 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// resume the engine for the opened task (idempotent — no-op if already running).
-	// 排队中的任务:仅设为活跃可查看,不启动引擎(维持并发上限,由 reconcile 补位)。
-	if t, ok := s.m.Task(req.ID); ok && !t.lifecycleSnapshot().Queued {
-		s.engine.Run(s.ctx, t)
+	// 排队中或已终态的任务:仅设为活跃可查看,不启动引擎(排队任务维持并发上限,终态任务不再起循环)。
+	if t, ok := s.m.Task(req.ID); ok {
+		life := t.lifecycleSnapshot()
+		if !life.Queued && !isTerminalStatus(life.Status) {
+			s.engine.Run(s.ctx, t)
+		}
 	}
 	writeJSON(w, 200, map[string]any{"active": req.ID})
 }
@@ -109,7 +111,7 @@ type createTaskReq struct {
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	var req createTaskReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
@@ -214,7 +216,7 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 		LLMProfileIDs      []int64 `json:"llm_profile_ids"`
 		ActiveLLMProfileID *int64  `json:"active_llm_profile_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}

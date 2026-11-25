@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -23,35 +24,91 @@ const (
 	maxWorkspaceUpload = 512 << 20 // 512 MiB per upload request
 )
 
-// wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
-// dir. It returns ok=false if the path would escape the root. filepath.Clean on a
-// rooted copy collapses any ".." so nothing can climb above the root.
-func (s *Server) wsResolve(rel string) (string, bool) {
-	base := filepath.Clean(s.m.dir)
-	rel = strings.TrimPrefix(strings.TrimSpace(rel), "/")
-	clean := filepath.Clean("/" + rel) // e.g. "/a/../../etc" → "/etc" (still rooted at "/")
-	if clean == "/.resource-library" || strings.HasPrefix(clean, "/.resource-library/") {
+// isPathWithin reports whether target is equal to or strictly inside root
+// (lexically, after cleaning).
+func isPathWithin(target, root string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(target))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel))
+}
+
+// safeContainmentPath maps a user-supplied relative path to a clean path inside
+// baseDir, enforcing both lexical containment and symlink containment via
+// filepath.EvalSymlinks on abs (if present, including dangling symlinks) and
+// the nearest existing ancestor up to baseDir. If blockedSubdir is non-empty
+// (e.g. ".resource-library"), any lexical or symlink-resolved path inside that
+// subdirectory is rejected.
+func safeContainmentPath(baseDir, rel, blockedSubdir string) (string, bool) {
+	base := filepath.Clean(baseDir)
+	if base == "" {
 		return "", false
 	}
-	abs := filepath.Clean(filepath.Join(base, clean))
-	// Resolve the nearest existing parent too: creating through a symlink to
-	// the library must not bypass protection merely because the leaf is new.
-	for parent := abs; ; parent = filepath.Dir(parent) {
-		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
-			library := filepath.Join(base, ".resource-library")
-			if resolved == library || strings.HasPrefix(resolved, library+string(os.PathSeparator)) {
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		realBase = base
+	}
+	realBase = filepath.Clean(realBase)
+
+	trimmed := strings.TrimSpace(rel)
+	if strings.ContainsRune(trimmed, 0) || filepath.VolumeName(trimmed) != "" {
+		return "", false
+	}
+	// Normalize both '/' and '\' to '/' so Windows backslash paths cannot bypass
+	// blockedSubdir prefix checks or lexical cleaning.
+	slashRel := strings.ReplaceAll(trimmed, "\\", "/")
+	cleanSlash := path.Clean("/" + strings.TrimPrefix(slashRel, "/"))
+
+	var realBlocked string
+	if blockedSubdir != "" {
+		blockedSlash := "/" + strings.Trim(strings.ReplaceAll(blockedSubdir, "\\", "/"), "/")
+		if cleanSlash == blockedSlash || strings.HasPrefix(cleanSlash, blockedSlash+"/") {
+			return "", false
+		}
+		realBlocked = filepath.Clean(filepath.Join(realBase, filepath.FromSlash(strings.TrimPrefix(blockedSlash, "/"))))
+	}
+
+	relNative := filepath.FromSlash(strings.TrimPrefix(cleanSlash, "/"))
+	abs := base
+	if relNative != "" && relNative != "." {
+		abs = filepath.Clean(filepath.Join(base, relNative))
+	}
+	if !isPathWithin(abs, base) {
+		return "", false
+	}
+
+	// Check abs itself (catching symlinks and dangling symlinks at leaf) and
+	// walk existing ancestors up to baseDir so no symlink hop can escape
+	// realBase or enter realBlocked.
+	for cur := abs; ; cur = filepath.Dir(cur) {
+		if _, statErr := os.Lstat(cur); statErr == nil {
+			resolved, evalErr := filepath.EvalSymlinks(cur)
+			if evalErr != nil {
+				return "", false
+			}
+			resolved = filepath.Clean(resolved)
+			if !isPathWithin(resolved, realBase) {
+				return "", false
+			}
+			if realBlocked != "" && isPathWithin(resolved, realBlocked) {
 				return "", false
 			}
 			break
 		}
-		if parent == base || filepath.Dir(parent) == parent {
+		parent := filepath.Dir(cur)
+		if cur == base || parent == cur || !isPathWithin(parent, base) {
 			break
 		}
 	}
-	if abs != base && !strings.HasPrefix(abs, base+string(os.PathSeparator)) {
-		return "", false
-	}
 	return abs, true
+}
+
+// wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
+// dir. It returns ok=false if the path would escape the root or enter the protected
+// .resource-library directory (lexically or via symlink).
+func (s *Server) wsResolve(rel string) (string, bool) {
+	return safeContainmentPath(s.m.dir, rel, ".resource-library")
 }
 
 // wsRel renders an absolute path back as a workspace-relative path (forward slashes).
@@ -257,7 +314,13 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxWorkspaceUpload)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	err := r.ParseMultipartForm(32 << 20)
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+	if err != nil {
 		writeErr(w, 400, "解析上传失败或超出大小限制："+err.Error())
 		return
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/RC-CHN/ARTEX/db"
@@ -31,7 +32,9 @@ func (s *Server) getLogsHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	before := int64(atoiDefault(r.URL.Query().Get("before"), 0))
 	limit := atoiDefault(r.URL.Query().Get("limit"), 200)
-	if limit > 500 {
+	if limit <= 0 {
+		limit = 200
+	} else if limit > 500 {
 		limit = 500
 	}
 	// If no before given, return the most recent DB rows (mirrors ring restore).
@@ -40,9 +43,9 @@ func (s *Server) getLogsHistory(w http.ResponseWriter, r *http.Request) {
 		err  error
 	)
 	if before <= 0 {
-		rows, err = s.m.pg.RecentLogs(limit)
+		rows, err = s.m.pg.RecentLogsContext(r.Context(), limit)
 	} else {
-		rows, err = s.m.pg.ListLogsBefore(before, limit)
+		rows, err = s.m.pg.ListLogsBeforeContext(r.Context(), before, limit)
 	}
 	if err != nil {
 		writeErr(w, 500, "db: "+err.Error())
@@ -62,7 +65,7 @@ func (s *Server) getLogsHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // streamLogs is the live SSE tail of the backend log: replays history after
-// ?since=<seq>, then pushes each new line.
+// Last-Event-ID (or ?since=<seq>), then pushes each new line.
 func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -70,6 +73,11 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	since := int64(atoiDefault(r.URL.Query().Get("since"), 0))
+	if le := r.Header.Get("Last-Event-ID"); le != "" {
+		if n, err := strconv.ParseInt(le, 10, 64); err == nil {
+			since = n
+		}
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -77,21 +85,26 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 
 	ch, unsub := logSink.subscribe()
 	defer unsub()
-	send := func(l LogLine) {
+	ctx := r.Context()
+	send := func(l LogLine) bool {
 		b, _ := json.Marshal(l)
-		fmt.Fprintf(w, "data: %s\n\n", b)
+		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", l.Seq, b); err != nil {
+			return false
+		}
 		flusher.Flush()
+		return true
 	}
 	lines, cursor := logSink.recent(since, 1000)
 	for _, l := range lines {
-		send(l)
+		if ctx.Err() != nil || !send(l) {
+			return
+		}
 	}
 	if cursor > since {
 		since = cursor
 	}
 	flusher.Flush()
 
-	ctx := r.Context()
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
 	for {
@@ -106,9 +119,13 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			since = l.Seq
-			send(l)
+			if !send(l) {
+				return
+			}
 		case <-ping.C:
-			fmt.Fprint(w, ": ping\n\n")
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}

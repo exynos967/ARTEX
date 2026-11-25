@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -98,7 +99,13 @@ func (s *Server) deleteTrafficHosts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Hosts []string `json:"hosts"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		writeErr(w, 400, "invalid body")
 		return
 	}

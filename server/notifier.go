@@ -77,6 +77,9 @@ type Notifier struct {
 	s  *Server
 	pg *db.DB
 
+	// assetNamesBatchFn 仅用于单测覆盖批量资产名查询；生产环境为 nil，直接走 pg。
+	assetNamesBatchFn func(ctx context.Context, assetIDs []int64) (map[int64]string, error)
+
 	// mu 保护 buckets。渠道数量少、竞争低，一把互斥锁足够，
 	// 不值得为它引入更细粒度的结构。
 	mu      sync.Mutex
@@ -386,7 +389,7 @@ func (n *Notifier) renderSingle(ctx context.Context, dl *db.NotificationDelivery
 }
 
 // renderBatch 渲染汇总消息。逐条解析快照——单条坏了只跳过那一条，
-// 不让它把整批汇总拖没。
+// 不让它把整批汇总拖没；整批涉及的资产 ID 合并做一次批量查询，避免 N+1 往返。
 //
 // 返回值 included 与 msg.Items **严格一一对应**（第 i 个投递 ↔ 第 i 个条目）。
 // 这个对应关系是硬要求：调用方按「渠道回报装下了前 K 条」来决定前 K 个投递
@@ -394,8 +397,13 @@ func (n *Notifier) renderSingle(ctx context.Context, dl *db.NotificationDelivery
 // 下标就会错位——本该失败的坏条目会被标成已送达，而好条目被误判为未送达。
 // 坏掉的那些由调用方显式标记失败，见 stepDigest。
 func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.NotificationDelivery, baseURL string, windowMinutes int) (notify.Message, []*db.NotificationDelivery, error) {
-	items := make([]notify.Item, 0, len(deliveries))
-	included := make([]*db.NotificationDelivery, 0, len(deliveries))
+	type parsedDelivery struct {
+		dl   *db.NotificationDelivery
+		snap notify.Snapshot
+	}
+	parsed := make([]parsedDelivery, 0, len(deliveries))
+	var uniqueAssetIDs []int64
+	seenAsset := map[int64]struct{}{}
 	for _, dl := range deliveries {
 		snap, err := parseSnapshot(dl)
 		if err != nil {
@@ -404,15 +412,31 @@ func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.Notificatio
 			log.Printf("[notify] 汇总批次中跳过无法解析的快照 delivery=%d: %v", dl.ID, err)
 			continue
 		}
-		item, err := n.itemFor(ctx, snap, baseURL)
-		if err != nil {
-			return notify.Message{}, nil, err
+		parsed = append(parsed, parsedDelivery{dl: dl, snap: snap})
+		for _, id := range snap.AssetIDs {
+			if _, ok := seenAsset[id]; ok {
+				continue
+			}
+			seenAsset[id] = struct{}{}
+			uniqueAssetIDs = append(uniqueAssetIDs, id)
 		}
-		items = append(items, item)
-		included = append(included, dl)
 	}
-	if len(items) == 0 {
+	if len(parsed) == 0 {
 		return notify.Message{}, nil, fmt.Errorf("汇总批次 %d 条投递全部无法解析", len(deliveries))
+	}
+
+	assetNames, err := n.fetchAssetNamesBatch(ctx, uniqueAssetIDs)
+	if err != nil {
+		// 资产名解析失败不该阻止推送：读不到名字比收不到通知轻得多，
+		// 消息里少一行资产而已。
+		log.Printf("[notify] 汇总批次批量解析资产名失败 count=%d: %v", len(uniqueAssetIDs), err)
+	}
+
+	items := make([]notify.Item, 0, len(parsed))
+	included := make([]*db.NotificationDelivery, 0, len(parsed))
+	for _, p := range parsed {
+		items = append(items, itemForWithAssets(p.snap, baseURL, assetNames))
+		included = append(included, p.dl)
 	}
 	return notify.Message{
 		Items:         items,
@@ -422,13 +446,46 @@ func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.Notificatio
 	}, included, nil
 }
 
+func (n *Notifier) fetchAssetNamesBatch(ctx context.Context, assetIDs []int64) (map[int64]string, error) {
+	if len(assetIDs) == 0 {
+		return map[int64]string{}, nil
+	}
+	if n.assetNamesBatchFn != nil {
+		return n.assetNamesBatchFn(ctx, assetIDs)
+	}
+	if n.pg == nil {
+		return map[int64]string{}, nil
+	}
+	return n.pg.NotificationAssetNamesBatch(ctx, assetIDs)
+}
+
 // itemFor 把事件快照渲染成待推送条目，顺带解析资产名与详情回链。
 func (n *Notifier) itemFor(ctx context.Context, snap notify.Snapshot, baseURL string) (notify.Item, error) {
-	assets, err := n.pg.NotificationAssetNames(ctx, snap.AssetIDs)
+	assetNames, err := n.fetchAssetNamesBatch(ctx, snap.AssetIDs)
 	if err != nil {
 		// 资产名解析失败不该阻止推送：读不到名字比收不到通知轻得多，
 		// 消息里少一行资产而已。
 		log.Printf("[notify] 解析资产名失败 finding=%d: %v", snap.FindingID, err)
+	}
+	return itemForWithAssets(snap, baseURL, assetNames), nil
+}
+
+// itemForWithAssets 使用预先批量查好的资产名映射组装待推送条目，
+// 保持 snap.AssetIDs 的输入顺序并去重，跳过查不到的 id。
+func itemForWithAssets(snap notify.Snapshot, baseURL string, assetNames map[int64]string) notify.Item {
+	var assets []string
+	if len(snap.AssetIDs) > 0 && len(assetNames) > 0 {
+		assets = make([]string, 0, len(snap.AssetIDs))
+		seen := make(map[int64]struct{}, len(snap.AssetIDs))
+		for _, id := range snap.AssetIDs {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			if label := assetNames[id]; label != "" {
+				assets = append(assets, label)
+			}
+		}
 	}
 	item := notify.Item{
 		FindingID:  snap.FindingID,
@@ -445,7 +502,7 @@ func (n *Notifier) itemFor(ctx context.Context, snap notify.Snapshot, baseURL st
 		// 它从 query 参数 id 读取漏洞 id。
 		item.DetailURL = fmt.Sprintf("%s/function/findings/detail?id=%d", baseURL, snap.FindingID)
 	}
-	return item, nil
+	return item
 }
 
 // takeTokens 从渠道令牌桶里取走**最多 want 个**令牌，返回实际取到的数量。

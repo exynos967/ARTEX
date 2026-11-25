@@ -344,16 +344,24 @@ func (s *Server) updateStream(w http.ResponseWriter, r *http.Request) {
 	ch, unsub := updHub.subscribe()
 	defer unsub()
 
-	send := func(p updateProgress) {
+	ctx := r.Context()
+	send := func(p updateProgress) bool {
 		b, _ := json.Marshal(p)
-		fmt.Fprintf(w, "data: %s\n\n", b)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			return false
+		}
 		flusher.Flush()
+		return true
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	// 先补一条当前状态，页面刷新后能立刻看到进行中的升级。
 	cur, _ := updHub.snapshot()
-	send(cur)
+	if !send(cur) {
+		return
+	}
 
-	ctx := r.Context()
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
 	for {
@@ -361,12 +369,13 @@ func (s *Server) updateStream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case p, ok := <-ch:
-			if !ok {
+			if !ok || !send(p) {
 				return
 			}
-			send(p)
 		case <-ping.C:
-			fmt.Fprint(w, ": ping\n\n")
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}

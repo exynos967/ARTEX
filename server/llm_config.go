@@ -345,13 +345,20 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	return ca
 }
 
+// invalidateProfChatAgents drops only the per-profile ChatAgent cache so
+// runtime settings changes (proxy, capture, web-search) take effect on the next
+// chat turn without throwing away shared rate-limited LLM providers.
+func (s *Server) invalidateProfChatAgents() {
+	s.profMu.Lock()
+	s.profChatAgents = map[int64]*agent.ChatAgent{}
+	s.profMu.Unlock()
+}
+
 // invalidateProfileAgents drops the per-profile ChatAgent + provider caches so a profile
 // save/activate/delete — or an agent's binding change — rebuilds pinned tasks' agents
 // (and re-resolves each agent's bound model) on their next round.
 func (s *Server) invalidateProfileAgents() {
-	s.profMu.Lock()
-	s.profChatAgents = map[int64]*agent.ChatAgent{}
-	s.profMu.Unlock()
+	s.invalidateProfChatAgents()
 	s.provCacheMu.Lock()
 	s.provCacheGen++
 	s.provByProfile = map[int64]*provEntry{}

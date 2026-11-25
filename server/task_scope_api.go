@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -129,7 +128,7 @@ func (s *Server) taskScopeAdd(w http.ResponseWriter, r *http.Request) {
 		Value  string `json:"value"`
 		Reason string `json:"reason"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeBody(w, r, &body); err != nil {
 		writeErr(w, 400, "invalid JSON")
 		return
 	}

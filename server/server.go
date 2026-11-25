@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RC-CHN/ARTEX/agent"
+	"github.com/RC-CHN/ARTEX/db"
 	"github.com/RC-CHN/ARTEX/llmpool"
 	"github.com/RC-CHN/ARTEX/norma/llm"
 	"github.com/RC-CHN/ARTEX/runner"
@@ -42,6 +43,10 @@ type Server struct {
 	// free slots off the same snapshot and over-promote past the limit.
 	concMu sync.Mutex
 
+	// admission bounds simultaneous LLM agent runs across the whole process
+	// (planner rounds, worker intents, and conversational/triggered runs).
+	admission *runAdmission
+
 	cfgMu     sync.Mutex
 	chatAgent *agent.ChatAgent // conversational runner for the chat page; nil w/o LLM
 	// llmProv is the fully-decorated global provider (recorder + failover chain)
@@ -68,14 +73,16 @@ type Server struct {
 	// the drain goroutine simply proceeds to the next queued fire.
 	chatCancel map[string]context.CancelCauseFunc
 
-	// triggerQ buffers P3 trigger fires PER AGENT. A per-agent "pump" launches runs up
-	// to a concurrency limit derived from the agent's策略: serial → limit 1 (+ optional
-	// merge); parallel → limit = trigger_max_parallel (0=∞), no merge. triggerActive
-	// counts in-flight runs per agent (replaces a boolean drain flag); a run's
-	// completion decrements it and re-pumps to fill the freed slot. triggerCfg caches
-	// the agent's last-read策略 so the pump never queries the DB while holding queueMu.
-	// Distinct agents always run concurrently. Queue is in-memory (matches chatBusy); a
-	// restart drops pending fires — the scheduler re-fires from watermarks next tick.
+	// triggerQ buffers P3 trigger fires PER AGENT (bounded by maxTriggerQueuePerAgent).
+	// A per-agent "pump" launches runs up to a concurrency limit derived from the
+	// agent's策略: serial → limit 1 (+ optional merge); parallel → limit =
+	// trigger_max_parallel (<=0 → defaultTriggerMaxParallel, capped at
+	// maxTriggerMaxParallel), no merge. triggerActive counts in-flight runs per agent
+	// (replaces a boolean drain flag); a run's completion decrements it and re-pumps
+	// to fill the freed slot. triggerCfg caches the agent's last-read策略 so the pump
+	// never queries the DB while holding queueMu. Distinct agents always run
+	// concurrently. Queue is in-memory (matches chatBusy); a restart drops pending
+	// fires — the scheduler re-fires from watermarks next tick.
 	queueMu       sync.Mutex
 	triggerQ      map[string][]triggeredRun
 	triggerActive map[string]int
@@ -155,12 +162,14 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, cancel: cancel, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, cancel: cancel, skillDir: skillDir, jwtKey: key,
+		admission: newRunAdmissionFromEnv(), chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{},
 		taskAgents:     map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	s.engine.SetRunAdmission(s.admission)
 	s.runnerJournal = newRunnerJournal(dataDir)
 	s.runnerJournal.Record(runner.Event{Kind: "controller_started", Code: "ok"})
 	s.llmHealth = newLLMHealthRegistry(m.pg, &s.persistence)
@@ -254,6 +263,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
 		s.background(s.discoverEmptyMCPsOnStartup)
+		s.background(func() { m.pg.RunRetentionWorker(s.ctx, db.RetentionConfigFromEnv()) })
+		s.background(s.sweepOrphanedDeletedTasksLoop)
 		s.logDone = logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
@@ -319,6 +330,32 @@ func (s *Server) restoreTaskRuntimes() {
 		lifecycle := t.lifecycleSnapshot()
 		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
 			s.engine.Run(s.ctx, t)
+		}
+	}
+}
+
+// sweepOrphanedDeletedTasksLoop finishes Phase 2/3 row compaction for tasks
+// whose Phase 1 deletion tombstone committed before a crash or transient error.
+func (s *Server) sweepOrphanedDeletedTasksLoop() {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return
+	}
+	sweep := func() {
+		if n, err := s.m.pg.SweepOrphanedDeletedTasks(s.ctx); err != nil && s.ctx.Err() == nil {
+			log.Printf("[tasks] sweep orphaned deleted tasks: %v", err)
+		} else if n > 0 {
+			log.Printf("[tasks] swept %d orphaned deleted task(s)", n)
+		}
+	}
+	sweep()
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
 		}
 	}
 }

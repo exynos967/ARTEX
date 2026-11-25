@@ -32,6 +32,9 @@ func (s *Server) Close() {
 		if s.engine != nil {
 			s.engine.Close()
 		}
+		// Close and wait for all cached per-task cold-graph Compactors before
+		// tearing down persistence/DB connections.
+		s.invalidateTaskAgents()
 		s.runnerLifecycleMu.Lock()
 		_, hub, _ := s.runnerSnapshot()
 		if hub != nil {
@@ -40,6 +43,7 @@ func (s *Server) Close() {
 		s.runnerLifecycleMu.Unlock()
 		s.backgroundWG.Wait()
 		s.archiveWG.Wait()
+		CloseGlobalMCPPool()
 		if s.logDone != nil {
 			<-s.logDone
 		}
@@ -63,6 +67,9 @@ func (e *Engine) Close() {
 		e.execMu.Lock()
 		for _, cancel := range e.execCancel {
 			cancel(agent.AbortShutdown)
+		}
+		for _, cancel := range e.compCancel {
+			cancel()
 		}
 		e.execMu.Unlock()
 		e.runtimeMu.Lock()

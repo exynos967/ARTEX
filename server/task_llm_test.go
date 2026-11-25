@@ -490,13 +490,13 @@ func TestTaskLLMStreamRetriesTransientPreCommitOnSameProvider(t *testing.T) {
 	}
 }
 
-// Once retries are exhausted, the transient error is surfaced (becoming a
-// model_error upstream) after exactly sameProviderStreamRetries+1 attempts.
+// Once retries are exhausted, a genuine mid-stream transient error is surfaced
+// (becoming a model_error upstream) after exactly sameProviderStreamRetries+1 attempts.
 func TestTaskLLMStreamSurfacesTransientAfterRetriesExhausted(t *testing.T) {
 	defer withZeroRetryBackoff()()
 	provider := &flakyThenOKProvider{
 		failCount: 99, // never recovers
-		failErr:   errors.New("dial tcp: connection reset by peer"),
+		failErr:   errors.New("read tcp 10.0.0.1:443: connection reset by peer"),
 	}
 	hooks := taskLLMStreamHooks{
 		current: func() (taskLLMSelection, error) {

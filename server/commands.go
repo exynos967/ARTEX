@@ -2,17 +2,23 @@ package server
 
 import (
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/RC-CHN/ARTEX/db"
 )
 
+func clampCommandPageParams(q url.Values) (page, size int) {
+	page = max(atoiDefault(q.Get("page"), 0), 0)
+	size = min(max(atoiDefault(q.Get("size"), 50), 1), 200)
+	return page, size
+}
+
 // pgListCommands returns tool executions (any tool) from the activity table.
 func (s *Server) pgListCommands(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	page := atoiDefault(q.Get("page"), 0)
-	size := atoiDefault(q.Get("size"), 50)
+	page, size := clampCommandPageParams(q)
 	keyword := q.Get("q")
 
 	records, total, err := s.m.PG().ListCommands(commandTaskFilter(q.Get("task")), keyword, page, size)
@@ -57,8 +63,7 @@ func commandTaskFilter(v string) *int64 {
 // pgListLLMRecords returns paginated LLM call records.
 func (s *Server) pgListLLMRecords(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	page := atoiDefault(q.Get("page"), 0)
-	size := atoiDefault(q.Get("size"), 50)
+	page, size := clampCommandPageParams(q)
 	model := q.Get("model")
 	session := q.Get("session")
 	task := q.Get("task")

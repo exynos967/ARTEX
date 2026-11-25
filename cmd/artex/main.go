@@ -135,12 +135,14 @@ func run() int {
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
+	serveErr := make(chan error, 1)
 	go func() {
 		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("serve: %v", err)
+			serveErr <- err
 		}
 	}()
 
@@ -149,6 +151,10 @@ func run() int {
 	// bootstrap above installs the new build).
 	code := 0
 	select {
+	case err := <-serveErr:
+		log.Printf("serve: %v", err)
+		shutdown(agent.AbortShutdown)
+		return 1
 	case <-ctx.Done():
 	case <-server.RestartRequested():
 		code = selfupdate.ExitRestart
@@ -158,7 +164,10 @@ func run() int {
 	log.Println("shutting down...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v; forcing close", err)
+		_ = httpSrv.Close()
+	}
 	return code
 }
 

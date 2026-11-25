@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/RC-CHN/ARTEX/agent"
 	"github.com/RC-CHN/ARTEX/db"
@@ -19,8 +21,9 @@ import (
 
 // wireAgentAugment connects the PG agent_visibility table into the agent runtime:
 // an agent's visible skills are loaded from the filesystem and packed into one
-// Skill meta-tool; its visible stdio MCP servers are spawned and expanded to
-// mcp__server__tool. skillDir is the root directory of all skill subdirectories.
+// Skill meta-tool; its visible MCP servers are pooled and expanded to lazy
+// mcp__server__tool proxies (global MCPs use cached discovery, while skill-gated
+// local MCPs are deferred until their skill is actually invoked).
 // hostTools, if set, returns runtime host tools (currently the traffic tools when
 // capture is on) to add to EVERY agent's base list — the DB tools table then
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
@@ -30,7 +33,6 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 		if err != nil || a == nil {
 			return nil, agent.DeferredInfo{}, nil
 		}
-		var extra []actool.CoreTool
 
 		// --- skills: load visible skills into reg (used for the Skill meta-tool
 		// and to know which MCP servers are skill-gated). ---
@@ -53,143 +55,284 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 				}
 			}
 		}
-		// A server named by any visible skill's `mcps:` is skill-gated: its tools
-		// are deferred + locked (not in the global block) until that skill loads.
-		gated := map[string]bool{}
-		if reg != nil {
-			for _, s := range reg.List() {
-				for _, srv := range s.MCPs {
-					gated[srv] = true
-				}
-			}
-		}
 
-		// --- mcp: connect enabled servers that are directly visible to this agent
-		// OR skill-gated (named in a visible skill's mcps field). Directly-visible
-		// and NOT gated → global (unlocked from session start). Skill-gated →
-		// deferred until that skill is invoked (regardless of direct visibility).
-		var closers []io.Closer
-		serverTools := map[string][]string{} // server name → its tool names
-		var allNames, globalNames []string
-		globalSet := map[string]bool{}
-		{
-			mcpIDs, _ := pg.AgentVisible(a.ID, "mcp")
-			want := idSet(mcpIDs)
-			all, _ := pg.ListMCP()
-			for _, m := range all {
-				if !m.Enabled {
-					continue
-				}
-				directVisible := want[m.ID]
-				skillGated := gated[m.Name]
-				if !directVisible && !skillGated {
-					continue // neither directly visible nor referenced by a visible skill
-				}
-				cl, err := connectAgentMCP(ctx, m)
-				if err != nil {
-					log.Printf("[mcp] %s 连接失败: %v", m.Name, err)
-					continue
-				}
-				closers = append(closers, cl)
-				ts, err := cl.Tools(ctx)
-				if err != nil {
-					log.Printf("[mcp] %s tools/list 失败: %v", m.Name, err)
-					continue
-				}
-				for _, t := range ts {
-					extra = append(extra, t)
-					allNames = append(allNames, t.Name())
-					serverTools[m.Name] = append(serverTools[m.Name], t.Name())
-					if directVisible && !skillGated {
-						// directly visible and not gated → available from session start
-						globalNames = append(globalNames, t.Name())
-						globalSet[t.Name()] = true
-					}
-					// skill-gated tools stay out of globalNames; unlocked via unlockSkill()
-				}
-			}
-		}
-
-		// Shared call-gate: global MCP tools are unlocked from the start; skill-gated
-		// ones are unlocked when their skill loads (or replayed from history — C2).
-		unlock := actool.NewUnlockSet(globalNames...)
-		unlockSkill := func(skillName string) {
-			if reg == nil {
-				return
-			}
-			if s, ok := reg.Get(skillName); ok {
-				for _, srv := range s.MCPs {
-					unlock.Add(serverTools[srv]...)
-				}
-			}
-		}
-
-		// Skill meta-tool: on load, unlock the skill's MCPs and reveal their names
-		// (the ones not already in the global block).
-		if reg != nil {
-			reg.OnInvoke = func(s skill.Skill) string {
-				unlockSkill(s.Name)
-				var reveal []string
-				for _, srv := range s.MCPs {
-					for _, n := range serverTools[srv] {
-						if !globalSet[n] {
-							reveal = append(reveal, n)
-						}
-					}
-				}
-				return actool.RenderDeferredToolsBlock(reveal)
-			}
+		mcpIDs, _ := pg.AgentVisible(a.ID, "mcp")
+		want := idSet(mcpIDs)
+		all, _ := pg.ListMCP()
+		runInfo := agent.RunInfoFrom(ctx)
+		return assembleAgentAugment(ctx, a.Key, reg, all, want, defaultMCPPool(), hostTools, func(t actool.CoreTool) actool.CoreTool {
 			// Attribution for the usage ledger: ToolAugment only gets (ctx, agentKey),
-			// so the run's task/session ids ride in on the ctx (agent.RunInfo). Read it
-			// once here — this closure is rebuilt per run, so the captured value always
-			// belongs to this run.
-			extra = append(extra, meterSkillTool(reg.Tool(), pg, reg, a.Key, agent.RunInfoFrom(ctx)))
-		}
-
-		// host tools (traffic / orchestration / custom) — added to every agent's base;
-		// ToolResolve then keeps them only for agents the tool is bound to. Custom
-		// tools flagged deferred contribute their names to the deferred wiring so
-		// their schema is withheld (SearchExtraTools/ExecuteExtraTool), same as MCP.
-		if hostTools != nil {
-			ht, deferredBinds := hostTools()
-			extra = append(extra, ht...)
-			for name, boundAgents := range deferredBinds {
-				if !contains(boundAgents, a.Key) {
-					continue // only defer names this agent is actually bound to
-				}
-				allNames = append(allNames, name)       // schema withheld from the prompt
-				globalNames = append(globalNames, name) // advertised in the deferred block
-				globalSet[name] = true
-				if unlock != nil {
-					unlock.Add(name) // global deferred → callable from the start
-				}
-			}
-		}
-
-		cleanup := func() {
-			for _, c := range closers {
-				_ = c.Close()
-			}
-		}
-		def := agent.DeferredInfo{
-			Deferred:    allNames,
-			GlobalNames: globalNames,
-			Unlock:      unlock,
-			UnlockSkill: unlockSkill,
-		}
-		def.ExecutionGuidance = toolenv.Detect("").Prompt()
-		if rt, ok := ctx.Value(remoteExecutionKey{}).(*remoteExecution); ok {
-			def.ExecutionGuidance = "\n\n本线程的执行工具在独立远程沙箱中运行。文件路径保持一致；自己的工作目录可写，同任务其他线程的产物只读。不要用文件锁协调跨机器任务，使用平台事实/图谱通信。需要GPU等能力时先list_runners并在add_intent声明runner需求。按需代理见环境说明；提示中的控制端 localhost 地址不可直接使用。当前环境：" + rt.spec.Environment + "；节点：" + rt.NodeID()
-			def.ExecutionGuidance += agent.EnvironmentPromptBlock("执行环境说明", rt.environmentPrompt)
-			def.ExecutionGuidance += agent.EnvironmentPromptBlock("当前 Runner 专属说明", rt.EnvironmentPrompt())
-			def.ExecutionGuidance += rt.EnvironmentTools().Prompt()
-			var plan runnerfiles.Plan
-			if json.Unmarshal(rt.spec.Files, &plan) == nil {
-				def.ExecutionGuidance += runnerFileGuidance(plan, rt.spec.WorkingDir)
-			}
-		}
-		return extra, def, cleanup
+			// so the run's task/session ids ride in on the ctx (agent.RunInfo).
+			return meterSkillTool(t, pg, reg, a.Key, runInfo)
+		})
 	}
+}
+
+// assembleAgentAugment wires visible skills, pooled/lazy MCP tools, host tools,
+// and deferred/unlock hooks for one agent run. Extracted from wireAgentAugment so
+// unit tests can exercise the exact production assembly flow without PostgreSQL.
+func assembleAgentAugment(
+	ctx context.Context,
+	agentKey string,
+	reg *skill.Registry,
+	mcpServers []*db.MCPServer,
+	directMCPIDs map[int64]bool,
+	pool *mcpPool,
+	hostTools func() ([]actool.CoreTool, map[string][]string),
+	wrapSkill func(actool.CoreTool) actool.CoreTool,
+) ([]actool.CoreTool, agent.DeferredInfo, func()) {
+	if pool == nil {
+		pool = defaultMCPPool()
+	}
+	var extra []actool.CoreTool
+
+	// A server named by any visible skill's `mcps:` is skill-gated: its tools
+	// are deferred + locked (not in the global block) until that skill loads.
+	gated := map[string]bool{}
+	if reg != nil {
+		for _, s := range reg.List() {
+			for _, srv := range s.MCPs {
+				gated[srv] = true
+			}
+		}
+	}
+
+	// --- mcp: global local MCPs use the process-wide pool + metadata cache;
+	// skill-gated local MCPs are NOT spawned until their skill is actually invoked;
+	// remote sandbox MCPs continue using connectAgentMCP directly because their
+	// tools are already discovered in the remote sandbox open response. ---
+	rt, hasRemote := ctx.Value(remoteExecutionKey{}).(*remoteExecution)
+	var closers []io.Closer
+	serverTools := map[string][]string{}     // server name → its tool names
+	lazyGatedMCPs := map[string]*db.MCPServer{} // local skill-gated MCPs deferred until skill load
+	var allNames, globalNames []string
+	globalSet := map[string]bool{}
+	for _, m := range mcpServers {
+		if m == nil || !m.Enabled {
+			continue
+		}
+		directVisible := directMCPIDs[m.ID]
+		skillGated := gated[m.Name]
+		if !directVisible && !skillGated {
+			continue // neither directly visible nor referenced by a visible skill
+		}
+		isRemote := hasRemote && !rt.controllerMCP[m.Name]
+		if isRemote {
+			cl, err := connectAgentMCP(ctx, m)
+			if err != nil {
+				log.Printf("[mcp] %s 连接失败: %v", m.Name, err)
+				continue
+			}
+			closers = append(closers, cl)
+			ts, err := cl.Tools(ctx)
+			if err != nil {
+				log.Printf("[mcp] %s tools/list 失败: %v", m.Name, err)
+				continue
+			}
+			for _, t := range ts {
+				extra = append(extra, t)
+				allNames = append(allNames, t.Name())
+				serverTools[m.Name] = append(serverTools[m.Name], t.Name())
+				if directVisible && !skillGated {
+					globalNames = append(globalNames, t.Name())
+					globalSet[t.Name()] = true
+				}
+			}
+			continue
+		}
+		if skillGated {
+			// Local skill-gated MCP: record config only, do NOT spawn or probe yet.
+			lazyGatedMCPs[m.Name] = cloneMCPServer(m)
+			continue
+		}
+		// Directly visible, non-gated local MCP → cached discovery + pooled lazy proxies.
+		ts, err := pool.DiscoverTools(ctx, m)
+		if err != nil {
+			log.Printf("[mcp] %s 发现失败: %v", m.Name, err)
+			continue
+		}
+		for _, t := range ts {
+			extra = append(extra, t)
+			allNames = append(allNames, t.Name())
+			serverTools[m.Name] = append(serverTools[m.Name], t.Name())
+			globalNames = append(globalNames, t.Name())
+			globalSet[t.Name()] = true
+		}
+	}
+
+	// Shared call-gate: global MCP tools are unlocked from the start; skill-gated
+	// ones are lazily discovered, registered via BindDeferred, and unlocked when
+	// their skill loads (or replayed from history — C2).
+	unlock := actool.NewUnlockSet(globalNames...)
+
+	var (
+		lazyMu           sync.Mutex
+		registerDeferred func(actool.CoreTool)
+		pendingDeferred  []actool.CoreTool
+		loadedLazyMCP    = map[string]bool{}
+	)
+	bindDeferred := func(add func(actool.CoreTool)) {
+		lazyMu.Lock()
+		registerDeferred = add
+		queued := pendingDeferred
+		pendingDeferred = nil
+		lazyMu.Unlock()
+		if add != nil {
+			for _, t := range queued {
+				add(t)
+			}
+		}
+	}
+	ensureLazyMCP := func(srvName string) ([]string, error) {
+		lazyMu.Lock()
+		srv := lazyGatedMCPs[srvName]
+		if srv == nil || loadedLazyMCP[srvName] {
+			out := append([]string(nil), serverTools[srvName]...)
+			lazyMu.Unlock()
+			return out, nil
+		}
+		lazyMu.Unlock()
+
+		callCtx := ctx
+		if callCtx == nil {
+			callCtx = context.Background()
+		}
+		ts, err := pool.DiscoverTools(callCtx, srv)
+		if err != nil {
+			log.Printf("[mcp] 延迟加载 %s 失败: %v", srv.Name, err)
+			return nil, err
+		}
+		names := make([]string, 0, len(ts))
+		for _, t := range ts {
+			names = append(names, t.Name())
+		}
+
+		lazyMu.Lock()
+		if loadedLazyMCP[srvName] {
+			out := append([]string(nil), serverTools[srvName]...)
+			lazyMu.Unlock()
+			return out, nil
+		}
+		loadedLazyMCP[srvName] = true
+		serverTools[srvName] = names
+		addFn := registerDeferred
+		if addFn == nil {
+			pendingDeferred = append(pendingDeferred, ts...)
+		}
+		lazyMu.Unlock()
+
+		if addFn != nil {
+			for _, t := range ts {
+				addFn(t)
+			}
+		}
+		return names, nil
+	}
+	unlockSkill := func(skillName string) {
+		if reg == nil {
+			return
+		}
+		if s, ok := reg.Get(skillName); ok {
+			for _, srv := range s.MCPs {
+				if names, err := ensureLazyMCP(srv); err == nil && len(names) > 0 {
+					unlock.Add(names...)
+				}
+			}
+		}
+	}
+
+	// Skill meta-tool: on load, lazily discover/register/unlock the skill's MCPs
+	// and reveal their names (the ones not already in the global block). If lazy
+	// MCP loading fails, surface a concise notice so the model knows why tools
+	// did not appear.
+	if reg != nil {
+		reg.OnInvoke = func(s skill.Skill) string {
+			var reveal []string
+			var failures []string
+			for _, srv := range s.MCPs {
+				names, err := ensureLazyMCP(srv)
+				if err != nil {
+					failures = append(failures, fmt.Sprintf("%s: %v", srv, err))
+					continue
+				}
+				if len(names) > 0 {
+					unlock.Add(names...)
+				}
+				for _, n := range names {
+					if !globalSet[n] {
+						reveal = append(reveal, n)
+					}
+				}
+			}
+			out := actool.RenderDeferredToolsBlock(reveal)
+			if len(failures) > 0 {
+				out += "\n[MCP 加载失败: " + strings.Join(failures, "; ") + "]"
+			}
+			return out
+		}
+		skillTool := reg.Tool()
+		if wrapSkill != nil {
+			skillTool = wrapSkill(skillTool)
+		}
+		extra = append(extra, skillTool)
+	}
+
+	// host tools (traffic / orchestration / custom) — added to every agent's base;
+	// ToolResolve then keeps them only for agents the tool is bound to. Custom
+	// tools flagged deferred contribute their names to the deferred wiring so
+	// their schema is withheld (SearchExtraTools/ExecuteExtraTool), same as MCP.
+	if hostTools != nil {
+		ht, deferredBinds := hostTools()
+		extra = append(extra, ht...)
+		for name, boundAgents := range deferredBinds {
+			if !contains(boundAgents, agentKey) {
+				continue // only defer names this agent is actually bound to
+			}
+			allNames = append(allNames, name)       // schema withheld from the prompt
+			globalNames = append(globalNames, name) // advertised in the deferred block
+			globalSet[name] = true
+			unlock.Add(name) // global deferred → callable from the start
+		}
+	}
+
+	cleanup := func() {
+		for _, c := range closers {
+			_ = c.Close()
+		}
+	}
+	// Pass a non-nil UnlockSet ONLY when global deferred tools OR lazy skill-gated
+	// MCPs exist, so agents without any MCP/deferred tools don't needlessly gain
+	// SearchExtraTools/ExecuteExtraTool while skill-gated agents register them at
+	// turn 0 (zero prompt-cache bust).
+	var (
+		defUnlock *actool.UnlockSet
+		defBind   func(func(actool.CoreTool))
+	)
+	if len(allNames) > 0 || len(lazyGatedMCPs) > 0 {
+		defUnlock = unlock
+	}
+	if len(lazyGatedMCPs) > 0 {
+		defBind = bindDeferred
+	}
+	def := agent.DeferredInfo{
+		Deferred:     allNames,
+		GlobalNames:  globalNames,
+		Unlock:       defUnlock,
+		UnlockSkill:  unlockSkill,
+		BindDeferred: defBind,
+	}
+	def.ExecutionGuidance = toolenv.Detect("").Prompt()
+	if hasRemote {
+		def.ExecutionGuidance = "\n\n本线程的执行工具在独立远程沙箱中运行。文件路径保持一致；自己的工作目录可写，同任务其他线程的产物只读。不要用文件锁协调跨机器任务，使用平台事实/图谱通信。需要GPU等能力时先list_runners并在add_intent声明runner需求。按需代理见环境说明；提示中的控制端 localhost 地址不可直接使用。当前环境：" + rt.spec.Environment + "；节点：" + rt.NodeID()
+		def.ExecutionGuidance += agent.EnvironmentPromptBlock("执行环境说明", rt.environmentPrompt)
+		def.ExecutionGuidance += agent.EnvironmentPromptBlock("当前 Runner 专属说明", rt.EnvironmentPrompt())
+		def.ExecutionGuidance += rt.EnvironmentTools().Prompt()
+		var plan runnerfiles.Plan
+		if json.Unmarshal(rt.spec.Files, &plan) == nil {
+			def.ExecutionGuidance += runnerFileGuidance(plan, rt.spec.WorkingDir)
+		}
+	}
+	return extra, def, cleanup
 }
 
 func idSet(ids []int64) map[int64]bool {

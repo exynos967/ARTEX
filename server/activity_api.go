@@ -20,7 +20,7 @@ func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	since := int64(atoiDefault(r.URL.Query().Get("since"), 0))
-	limit := atoiDefault(r.URL.Query().Get("limit"), 300)
+	limit := clampActivityLimit(atoiDefault(r.URL.Query().Get("limit"), 300))
 	var intentPtr *int64
 	if iv := r.URL.Query().Get("intent"); iv != "" {
 		if n, err := strconv.ParseInt(iv, 10, 64); err == nil {
@@ -45,9 +45,10 @@ func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": cursor})
 }
 
-// parseActivitySession maps a stable session key (main | plan | intent:<ID>) to a
-// DB session filter. Goal Agent + Planner both live under worker="planner" (the
-// single Plan session); a Worker session is one intent, keyed by its node id.
+// parseActivitySession maps a stable session key (main | main:<seg> | plan | system | intent:<ID>)
+// to a DB session filter. Goal Agent + Planner both live under worker="planner" (the
+// single Plan session); "system" covers task-level system audit events; a Worker
+// session is one intent, keyed by its node id.
 func parseActivitySession(sess string) (db.ActivitySessionFilter, bool) {
 	switch {
 	case sess == "" || sess == "main":
@@ -61,6 +62,8 @@ func parseActivitySession(sess string) (db.ActivitySessionFilter, bool) {
 		return db.ActivitySessionFilter{Main: true, MainSeg: &seg}, true
 	case sess == "plan":
 		return db.ActivitySessionFilter{Worker: "planner"}, true
+	case sess == "system":
+		return db.ActivitySessionFilter{System: true}, true
 	case strings.HasPrefix(sess, "intent:"):
 		id, err := strconv.ParseInt(strings.TrimPrefix(sess, "intent:"), 10, 64)
 		if err != nil {
@@ -130,7 +133,7 @@ func (s *Server) activityHistory(w http.ResponseWriter, r *http.Request) {
 		filter.MainSeg = &seg
 	}
 	before := int64(atoiDefault(q.Get("before"), 0))
-	limit := min(atoiDefault(q.Get("limit"), 200), 500) // cap so one request can't pull an unbounded slice
+	limit := clampActivityLimit(atoiDefault(q.Get("limit"), 200)) // cap so one request can't pull an unbounded slice
 	store, sourceTaskID, err := activitySessionStore(t, filter)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -218,16 +221,21 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 	ch, unsub := s.engine.Broadcaster().Subscribe(t.ID)
 	defer unsub()
 
+	ctx := r.Context()
+
 	// Emit a standard SSE id: line so the browser echoes it as Last-Event-ID on
 	// auto-reconnect (see cursor precedence above).
-	sendSSE := func(a db.Activity) {
+	sendSSE := func(a db.Activity) bool {
 		b, _ := json.Marshal(activityDTO(a))
 		cursor := a.ID
 		if cursor < since {
 			cursor = since
 		} // late transactional notices must not regress Last-Event-ID
-		fmt.Fprintf(w, "id: %d\ndata: %s\n\n", cursor, b)
+		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", cursor, b); err != nil {
+			return false
+		}
 		flusher.Flush()
+		return true
 	}
 
 	// Compensate the DB backlog after `since` in batches until caught up. This is the
@@ -239,13 +247,20 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 	// the id<=since skip below drops any that this replay already covered.
 	const replayBatch = 500
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		items, cursor, err := t.Store.ActivityList(intentPtr, since, replayBatch)
 		if err != nil {
 			log.Printf("[activity/stream] task=%s replay since=%d: %v", t.ID, since, err)
 			return
 		}
 		for _, a := range items {
-			sendSSE(a)
+			if ctx.Err() != nil || !sendSSE(a) {
+				return
+			}
 		}
 		if cursor > since {
 			since = cursor
@@ -256,7 +271,6 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
-	ctx := r.Context()
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
 	for {
@@ -278,12 +292,20 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 			if a.ID > since {
 				since = a.ID
 			}
-			sendSSE(a)
+			if !sendSSE(a) {
+				return
+			}
 		case <-ping.C:
-			fmt.Fprint(w, ": ping\n\n")
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}
+}
+
+func clampActivityLimit(limit int) int {
+	return min(max(limit, 1), 500)
 }
 
 // activityDetail lazily returns the full detail blob for one step.

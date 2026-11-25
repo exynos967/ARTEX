@@ -428,7 +428,7 @@ func recoverTaskArchiveStages(dataDir string, pg *pgdb.DB) error {
 			errs = append(errs, getErr)
 			continue
 		}
-		if archive != nil && archive.State == pgdb.ArchiveReady {
+		if archive != nil && (archive.State == pgdb.ArchiveReady || archive.State == pgdb.ArchiveCompacting) {
 			if err := os.RemoveAll(root); err != nil {
 				errs = append(errs, err)
 			}
@@ -558,7 +558,9 @@ func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchive
 	hasher := sha256.New()
 	multi := io.MultiWriter(file, hasher)
 	encoder, err := zstd.NewWriter(multi,
-		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(10)),
+		zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
+		zstd.WithLowerEncoderMem(true),
+		zstd.WithEncoderConcurrency(1),
 		zstd.WithEncoderCRC(true),
 	)
 	if err != nil {
@@ -656,7 +658,10 @@ func extractTaskArchivePackage(path, expectedSHA, destination string) error {
 			return err
 		}
 	}
-	decoder, err := zstd.NewReader(file)
+	decoder, err := zstd.NewReader(file,
+		zstd.WithDecoderMaxWindow(16<<20),
+		zstd.WithDecoderConcurrency(1),
+	)
 	if err != nil {
 		return err
 	}

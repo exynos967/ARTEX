@@ -115,7 +115,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		Attachments []chatAttachment `json:"attachments,omitempty"` // 方式1 上传的文件(路径相对任务工作目录)
 		Seg         *int             `json:"seg,omitempty"`         // 目标主会话分段;缺省=最新段
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
+	if err := validateAttachments(taskDir, req.Attachments); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}

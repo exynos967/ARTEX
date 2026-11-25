@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -263,7 +264,14 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	switch format {
 	case "md-single":
 		setDownload("text/markdown; charset=utf-8", "findings-"+stamp+".md")
-		_, _ = w.Write([]byte(report.FindingsMarkdown(fs, now)))
+		bw := bufio.NewWriterSize(w, 32*1024)
+		if err := report.WriteFindingsMarkdown(bw, fs, now); err != nil {
+			log.Printf("[findings-export] stream markdown: %v", err)
+			return
+		}
+		if err := bw.Flush(); err != nil {
+			log.Printf("[findings-export] flush markdown: %v", err)
+		}
 	case "md-zip":
 		path := filepath.Join(stage, "findings.zip")
 		if err := buildFindingsEvidenceZip(path, fs, stage, now); err != nil {
@@ -280,7 +288,14 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		http.ServeContent(w, r, "findings.zip", now, file)
 	case "csv":
 		setDownload("text/csv; charset=utf-8", "findings-"+stamp+".csv")
-		_, _ = w.Write(report.FindingsCSV(fs))
+		bw := bufio.NewWriterSize(w, 32*1024)
+		if err := report.WriteFindingsCSV(bw, fs); err != nil {
+			log.Printf("[findings-export] stream csv: %v", err)
+			return
+		}
+		if err := bw.Flush(); err != nil {
+			log.Printf("[findings-export] flush csv: %v", err)
+		}
 	case "json":
 		assets := s.resolveFindingAssets(fs)
 		out := make([]FindingDTO, 0, len(fs))
@@ -372,7 +387,7 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		Name      *string `json:"name"`
 		VulnClass *string `json:"vulnclass"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeBody(w, r, &body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}

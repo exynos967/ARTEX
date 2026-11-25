@@ -8,19 +8,23 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/RC-CHN/ARTEX/db"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
 const (
-	jwtKeyFilename = "jwt.key"
-	authPassKey    = "auth.password_hash"
-	jwtTTL         = 7 * 24 * time.Hour
-	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	jwtKeyFilename      = "jwt.key"
+	authPassKey         = "auth.password_hash"
+	authJWTNotBeforeKey = "auth.jwt_not_before"
+	jwtTTL              = 7 * 24 * time.Hour
+	keyChars            = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	// 下限与 setup 页的前端校验一致——校验只放在前端等于没放，直接打 API 就能
 	// 绕过。上限是 bcrypt 的硬限制：超过 72 字节 GenerateFromPassword 会返回
@@ -92,19 +96,111 @@ func signJWT(key []byte) (string, error) {
 	}).SignedString(key)
 }
 
+// jwtNotBeforeCache caches the persisted auth.jwt_not_before cutoff per *db.DB
+// briefly so requireAuth avoids redundant DB lookups on hot paths while still
+// applying password-change revocations immediately in-process.
+type jwtNotBeforeEntry struct {
+	cutoff    int64
+	fetchedAt time.Time
+}
+
+var (
+	jwtNotBeforeMu    sync.Mutex
+	jwtNotBeforeCache = map[*db.DB]jwtNotBeforeEntry{}
+)
+
+func setCachedJWTNotBefore(pg *db.DB, cutoff int64) {
+	if pg == nil {
+		return
+	}
+	jwtNotBeforeMu.Lock()
+	jwtNotBeforeCache[pg] = jwtNotBeforeEntry{cutoff: cutoff, fetchedAt: time.Now()}
+	jwtNotBeforeMu.Unlock()
+}
+
+func (s *Server) jwtNotBefore() int64 {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return 0
+	}
+	pg := s.m.pg
+	jwtNotBeforeMu.Lock()
+	if ent, ok := jwtNotBeforeCache[pg]; ok && time.Since(ent.fetchedAt) < 2*time.Second {
+		jwtNotBeforeMu.Unlock()
+		return ent.cutoff
+	}
+	jwtNotBeforeMu.Unlock()
+
+	raw, ok, err := pg.GetSetting(authJWTNotBeforeKey)
+	if err != nil {
+		jwtNotBeforeMu.Lock()
+		ent := jwtNotBeforeCache[pg]
+		jwtNotBeforeMu.Unlock()
+		return ent.cutoff
+	}
+	var cutoff int64
+	if ok && strings.TrimSpace(raw) != "" {
+		cutoff, _ = strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	}
+	setCachedJWTNotBefore(pg, cutoff)
+	return cutoff
+}
+
 // verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
 func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+	return verifyJWTWithNotBefore(tokenStr, key, 0)
+}
+
+// verifyJWTWithNotBefore validates tokenStr as a non-expired HS256 JWT and,
+// when notBefore > 0, rejects any token whose iat is absent or < notBefore.
+func verifyJWTWithNotBefore(tokenStr string, key []byte, notBefore int64) bool {
+	var claims jwt.RegisteredClaims
+	t, err := jwt.ParseWithClaims(tokenStr, &claims, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return key, nil
 	})
-	return err == nil && t.Valid
+	if err != nil || !t.Valid {
+		return false
+	}
+	if notBefore > 0 {
+		if claims.IssuedAt == nil || claims.IssuedAt.Unix() < notBefore {
+			return false
+		}
+	}
+	return true
+}
+
+// allowsQueryToken restricts ?token= query-string authentication strictly to
+// GET SSE streams and file download/export endpoints that cannot attach
+// Authorization headers (EventSource / browser download links).
+func allowsQueryToken(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet {
+		return false
+	}
+	p := r.URL.Path
+	switch p {
+	case "/api/logs/stream",
+		"/api/exploration/activity/stream",
+		"/api/update/stream",
+		"/api/workspace/download",
+		"/api/exploration/findings/export",
+		"/api/findings/export",
+		"/api/traffic/blob",
+		"/api/report":
+		return true
+	}
+	if strings.HasPrefix(p, "/api/side-questions/") && strings.HasSuffix(p, "/events") {
+		return true
+	}
+	if strings.HasPrefix(p, "/api/record-exports/") {
+		return true
+	}
+	return false
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
-// artex_token cookie, or ?token= query param (for SSE connections).
+// artex_token cookie, or (only for SSE/download endpoints) ?token= query param.
 func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
@@ -112,7 +208,10 @@ func extractToken(r *http.Request) string {
 	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
 		return c.Value
 	}
-	return r.URL.Query().Get("token")
+	if allowsQueryToken(r) {
+		return r.URL.Query().Get("token")
+	}
+	return ""
 }
 
 // requireAuth wraps h with JWT validation.
@@ -129,7 +228,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		if !verifyJWTWithNotBefore(tok, s.jwtKey, s.jwtNotBefore()) {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
@@ -213,7 +312,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWTWithNotBefore(extractToken(r), s.jwtKey, s.jwtNotBefore()) {
 		writeErr(w, 401, "未授权")
 		return
 	}
@@ -255,6 +354,11 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
+	notBefore := time.Now().Unix()
+	if err := pg.SetSetting(authJWTNotBeforeKey, strconv.FormatInt(notBefore, 10)); err != nil {
+		log.Printf("[auth] persist %s failed: %v", authJWTNotBeforeKey, err)
+	}
+	setCachedJWTNotBefore(pg, notBefore)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
