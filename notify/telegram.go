@@ -106,21 +106,21 @@ func telegramEndpoint(cfg map[string]any) (string, error) {
 // telegramHTML 渲染 HTML 正文，返回正文与实际写入的条目数（见 Channel.Send）。
 func telegramHTML(m Message) (string, int) {
 	var b strings.Builder
-	b.WriteString("<b>" + telegramEscape(markdownTitle(m)) + "</b>\n")
+	b.WriteString("<b>" + htmlEscape(markdownTitle(m)) + "</b>\n")
 	if m.Batch {
 		// Telegram 的上限是**字符数**，所以打包也按字符计量（runeSize）。
 		footer := ""
 		if m.HomeURL != "" {
-			footer = fmt.Sprintf("\n\n<a href=\"%s\">在平台中查看全部</a>", telegramEscapeAttr(m.HomeURL))
+			footer = fmt.Sprintf("\n\n<a href=\"%s\">在平台中查看全部</a>", htmlEscapeAttr(m.HomeURL))
 		}
 		kept := packItemCount(m.Items, telegramTextLimit, telegramReservedRunes, footer, runeSize, func(it Item, idx int) string {
 			return telegramBatchLine(it, idx+1)
 		})
 		items := m.Items[:kept]
 		b.Reset()
-		b.WriteString("<b>" + telegramEscape(telegramBatchTitle(m, items, len(m.Items))) + "</b>")
+		b.WriteString("<b>" + htmlEscape(telegramBatchTitle(m, items, len(m.Items))) + "</b>")
 		for i, it := range items {
-			b.WriteString("\n" + telegramEscape(telegramBatchLine(it, i+1)))
+			b.WriteString("\n" + htmlEscape(telegramBatchLine(it, i+1)))
 		}
 		b.WriteString(footer)
 		return TruncateHTML(b.String(), telegramTextLimit), kept
@@ -131,19 +131,19 @@ func telegramHTML(m Message) (string, int) {
 	it := m.Items[0]
 	if it.IsStatusChange() {
 		b.WriteString(fmt.Sprintf("\n<b>状态变更</b>：%s → %s",
-			telegramEscape(StatusLabel(it.FromStatus)), telegramEscape(StatusLabel(it.ToStatus))))
+			htmlEscape(StatusLabel(it.FromStatus)), htmlEscape(StatusLabel(it.ToStatus))))
 	}
 	if it.VulnClass != "" && it.VulnClass != it.Title() {
-		b.WriteString("\n<b>类型</b>：" + telegramEscape(it.VulnClass))
+		b.WriteString("\n<b>类型</b>：" + htmlEscape(it.VulnClass))
 	}
 	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
-		b.WriteString("\n<b>资产</b>：" + telegramEscape(a))
+		b.WriteString("\n<b>资产</b>：" + htmlEscape(a))
 	}
 	if s := OneLine(it.Summary, maxSummaryRunes); s != "" {
-		b.WriteString("\n<b>摘要</b>：" + telegramEscape(s))
+		b.WriteString("\n<b>摘要</b>：" + htmlEscape(s))
 	}
 	if it.DetailURL != "" {
-		b.WriteString(fmt.Sprintf("\n\n<a href=\"%s\">查看详情</a>", telegramEscapeAttr(it.DetailURL)))
+		b.WriteString(fmt.Sprintf("\n\n<a href=\"%s\">查看详情</a>", htmlEscapeAttr(it.DetailURL)))
 	}
 	return TruncateHTML(b.String(), telegramTextLimit), 1
 }
@@ -170,22 +170,4 @@ func telegramBatchTitle(m Message, items []Item, total int) string {
 		title = fmt.Sprintf("近 %d 分钟 · %s", m.WindowMinutes, title)
 	}
 	return title
-}
-
-// telegramEscape 转义 HTML 文本内容。
-// Telegram 只认这三种实体，转义后 &amp; 之类的已有实体会被二次转义——这正是
-// 期望行为：我们要显示的是原始字符，不是让用户注入 HTML。
-func telegramEscape(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	return s
-}
-
-// telegramEscapeAttr 转义 HTML 属性值。在文本转义之外还要处理引号——
-// URL 里带引号会提前闭合 href 属性，把后面的内容变成注入点。
-func telegramEscapeAttr(s string) string {
-	s = telegramEscape(s)
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	return s
 }

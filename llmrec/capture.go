@@ -2,10 +2,28 @@ package llmrec
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"unicode/utf8"
+
+	"github.com/RC-CHN/ARTEX/norma/llm"
+)
+
+const (
+	// MaxCaptureRequestBytes bounds the captured/stored request payload per LLM call.
+	MaxCaptureRequestBytes = 4 << 20 // 4 MiB
+	// MaxCaptureAttemptBytes bounds captured response bytes for a single HTTP attempt.
+	MaxCaptureAttemptBytes = 2 << 20 // 2 MiB
+	// MaxCaptureTotalResponseBytes bounds total captured response bytes across all
+	// retry attempts of one logical LLM call (and normalized ResponseBody storage).
+	MaxCaptureTotalResponseBytes = 4 << 20 // 4 MiB
+
+	requestTruncatedMarker       = "\n...[truncated by llmrec: exceeded 4 MiB]"
+	attemptTruncatedMarker       = "\n...[truncated by llmrec: exceeded 2 MiB]"
+	totalResponseTruncatedMarker = "\n...[truncated by llmrec: exceeded 4 MiB]"
 )
 
 type captureContextKey struct{}
@@ -27,14 +45,18 @@ type captureContextKey struct{}
 // The transport writes from norma's stream-reading goroutine while the Recorder
 // snapshots at stream end, so all state is mutex-guarded.
 type Capture struct {
-	mu       sync.Mutex
-	request  string
-	attempts []*attempt
+	mu             sync.Mutex
+	request        string
+	attempts       []*attempt
+	totalRespBytes int
+	totalTruncated bool
 }
 
 type attempt struct {
-	status int
-	body   strings.Builder
+	status    int
+	body      strings.Builder
+	written   int
+	truncated bool
 }
 
 // NewCapture returns a context carrying a fresh Capture, plus the Capture itself.
@@ -54,7 +76,8 @@ func CaptureFrom(ctx context.Context) *Capture {
 	return c
 }
 
-// SetRequest stores the outgoing request body. Retries re-send identical bytes,
+// SetRequest stores the outgoing request body, capping oversized payloads at
+// MaxCaptureRequestBytes on a UTF-8 boundary. Retries re-send identical bytes,
 // so only the first attempt's body is kept.
 func (c *Capture) SetRequest(body string) {
 	if c == nil || body == "" {
@@ -63,7 +86,7 @@ func (c *Capture) SetRequest(body string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.request == "" {
-		c.request = body
+		c.request = capRequestBody(body)
 	}
 }
 
@@ -142,7 +165,8 @@ func (c *Capture) Attempts() []Attempt {
 }
 
 // teeBody mirrors reads into a Capture attempt, guarded by the Capture's mutex
-// so a snapshot taken mid-stream never races the writer.
+// so a snapshot taken mid-stream never races the writer. Capture caps never
+// alter the (n, err) stream delivered to the caller.
 type teeBody struct {
 	rc io.ReadCloser
 	c  *Capture
@@ -153,10 +177,206 @@ func (t *teeBody) Read(p []byte) (int, error) {
 	n, err := t.rc.Read(p)
 	if n > 0 {
 		t.c.mu.Lock()
-		t.a.body.Write(p[:n])
+		if !t.a.truncated {
+			remAttempt := MaxCaptureAttemptBytes - t.a.written
+			remTotal := MaxCaptureTotalResponseBytes - t.c.totalRespBytes
+			if t.c.totalTruncated {
+				remTotal = 0
+			}
+			rem := remAttempt
+			hitTotal := false
+			if remTotal < rem {
+				rem = remTotal
+				hitTotal = true
+			}
+			switch {
+			case rem <= 0:
+				marker := attemptTruncatedMarker
+				if hitTotal || remTotal <= 0 && remAttempt > 0 {
+					marker = totalResponseTruncatedMarker
+					t.c.totalTruncated = true
+				}
+				t.a.body.WriteString(marker)
+				t.a.truncated = true
+			case n <= rem:
+				t.a.body.Write(p[:n])
+				t.a.written += n
+				t.c.totalRespBytes += n
+			default:
+				chunk := truncateUTF8Bytes(p[:n], rem)
+				t.a.body.Write(chunk)
+				t.a.written += len(chunk)
+				t.c.totalRespBytes += len(chunk)
+				marker := attemptTruncatedMarker
+				if hitTotal {
+					marker = totalResponseTruncatedMarker
+					t.c.totalTruncated = true
+				}
+				t.a.body.WriteString(marker)
+				t.a.truncated = true
+			}
+		}
 		t.c.mu.Unlock()
 	}
 	return n, err
 }
 
 func (t *teeBody) Close() error { return t.rc.Close() }
+
+// capRequestBody bounds body to at most MaxCaptureRequestBytes (including its
+// truncation marker) on a UTF-8 rune boundary, making it strictly idempotent.
+func capRequestBody(body string) string {
+	if len(body) <= MaxCaptureRequestBytes {
+		return body
+	}
+	budget := MaxCaptureRequestBytes - len(requestTruncatedMarker)
+	if budget < 0 {
+		budget = 0
+	}
+	return truncateUTF8(body, budget) + requestTruncatedMarker
+}
+
+func appendCappedShared(b *strings.Builder, s string, remaining *int, truncated *bool, marker string) {
+	if *truncated || s == "" {
+		return
+	}
+	if *remaining <= 0 {
+		b.WriteString(marker)
+		*truncated = true
+		return
+	}
+	if len(s) <= *remaining {
+		b.WriteString(s)
+		*remaining -= len(s)
+		return
+	}
+	cut := truncateUTF8(s, *remaining)
+	b.WriteString(cut)
+	*remaining -= len(cut)
+	b.WriteString(marker)
+	*truncated = true
+}
+
+// marshalCappedResponseBody caps text and thinking within a shared
+// MaxCaptureTotalResponseBytes budget BEFORE json.Marshal so ResponseBody is
+// always valid JSON and valid UTF-8.
+func marshalCappedResponseBody(text, thinking, stopReason string, usage llm.Usage) string {
+	mk := func(txt, thk string) []byte {
+		resp := map[string]any{
+			"text":        txt,
+			"stop_reason": stopReason,
+			"usage": map[string]int{
+				"input_tokens":       usage.InputTokens,
+				"output_tokens":      usage.OutputTokens,
+				"cache_read_tokens":  usage.CacheReadTokens,
+				"cache_write_tokens": usage.CacheWriteTokens,
+			},
+		}
+		if thk != "" {
+			resp["thinking"] = thk
+		}
+		b, _ := json.Marshal(resp)
+		return b
+	}
+
+	baseThink := ""
+	if thinking != "" {
+		baseThink = "x"
+	}
+	overhead := len(mk("", baseThink)) + 32
+	budget := MaxCaptureTotalResponseBytes - overhead
+	if budget < 0 {
+		budget = 0
+	}
+
+	curText, curThink := fitPairToBudget(text, thinking, budget)
+	encoded := mk(curText, curThink)
+	for range 4 {
+		if len(encoded) <= MaxCaptureTotalResponseBytes {
+			return string(encoded)
+		}
+		encodedFields := len(encoded) - overhead
+		if encodedFields <= 0 || budget <= 0 {
+			break
+		}
+		avail := MaxCaptureTotalResponseBytes - overhead
+		nextBudget := int(int64(budget) * int64(avail) / int64(encodedFields))
+		nextBudget -= 256
+		if nextBudget >= budget {
+			nextBudget = budget / 2
+		}
+		if nextBudget < 0 {
+			nextBudget = 0
+		}
+		budget = nextBudget
+		curText, curThink = fitPairToBudget(text, thinking, budget)
+		encoded = mk(curText, curThink)
+	}
+	if len(encoded) > MaxCaptureTotalResponseBytes {
+		encoded = mk("", "")
+	}
+	return string(encoded)
+}
+
+func fitPairToBudget(text, thinking string, budget int) (string, string) {
+	if len(text)+len(thinking) <= budget {
+		return text, thinking
+	}
+	half := budget / 2
+	var textCap, thinkCap int
+	switch {
+	case len(text) <= half:
+		textCap = len(text)
+		thinkCap = budget - textCap
+	case len(thinking) <= half:
+		thinkCap = len(thinking)
+		textCap = budget - thinkCap
+	default:
+		textCap = half
+		thinkCap = budget - half
+	}
+	return capFieldWithMarker(text, textCap, totalResponseTruncatedMarker),
+		capFieldWithMarker(thinking, thinkCap, totalResponseTruncatedMarker)
+}
+
+func capFieldWithMarker(s string, maxBytes int, marker string) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	if maxBytes <= 0 {
+		return ""
+	}
+	s = strings.TrimSuffix(s, marker)
+	if maxBytes <= len(marker) {
+		return truncateUTF8(s, maxBytes)
+	}
+	return truncateUTF8(s, maxBytes-len(marker)) + marker
+}
+
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && maxBytes-cut < utf8.UTFMax && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+func truncateUTF8Bytes(b []byte, maxBytes int) []byte {
+	if maxBytes <= 0 {
+		return nil
+	}
+	if len(b) <= maxBytes {
+		return b
+	}
+	cut := maxBytes
+	for cut > 0 && maxBytes-cut < utf8.UTFMax && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	return b[:cut]
+}

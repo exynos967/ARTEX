@@ -22,10 +22,11 @@ const MaskedPrefix = "__masked__"
 // 飞书的机器人 id），而前缀部分各机器人相同、没有辨识价值。末 6 位不足以
 // 还原凭据，但足以让配置者认出「是我那个群」。
 func MaskedValue(secret string) string {
-	if len(secret) <= 6 {
+	runes := []rune(secret)
+	if len(runes) <= 6 {
 		return MaskedPrefix
 	}
-	return MaskedPrefix + ":…" + secret[len(secret)-6:]
+	return MaskedPrefix + ":…" + string(runes[len(runes)-6:])
 }
 
 // IsMasked 报告某个值是否为掩码值（即接口回显后未被修改）。

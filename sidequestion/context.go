@@ -256,6 +256,13 @@ func (b *contextBuilder) prepare(ctx context.Context, snapshot Snapshot, questio
 	if err != nil {
 		return req, err
 	}
+	if req.PromptCacheKey == "" {
+		if snapshot.SessionID != "" {
+			req.PromptCacheKey = snapshot.SessionID
+		} else if key := llm.PromptCacheKeyFrom(ctx); key != "" {
+			req.PromptCacheKey = key
+		}
+	}
 	req.MaxTokens = outputBudget(req, options.OutputTokens)
 	base := llm.MessagesForAPI(req.Messages)
 	limit := inputBudget(snapshot, req.MaxTokens)

@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"iter"
 	"log"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/RC-CHN/ARTEX/norma/llm"
+	"github.com/RC-CHN/ARTEX/norma/transcript"
 )
 
 // Member is one LLM profile in the chain, already built into a provider (wrapped
@@ -80,10 +83,26 @@ func (p *Pool) Head() *Member { return p.members[0] }
 // credit, 401 bad key, 429, 5xx) all surface during request establishment,
 // before the body is read, so they always land in the safe window.
 func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
-	order := p.order(req)
 	return func(yield func(llm.StreamEvent, error) bool) {
+		candidates := p.orderedMembers(ctx, req)
 		var lastErr error
-		for i, m := range order {
+		var prevFailed *Member
+		tried := 0
+
+		runMember := func(m *Member, probeToken uint64) (done bool) {
+			settled := false
+			if probeToken != 0 {
+				defer func() {
+					if !settled {
+						p.health.ReleaseProbe(m.ID, probeToken)
+					}
+				}()
+			}
+			if prevFailed != nil {
+				log.Printf("[llmpool] LLM 故障转移：%q(%s) → %q(%s)，原因：%s",
+					prevFailed.Name, prevFailed.Model, m.Name, m.Model, trimErr(lastErr))
+			}
+			tried++
 			emitted := false
 			var failed error
 			for ev, err := range m.Prov.Stream(ctx, req) {
@@ -97,31 +116,53 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 					emitted = true
 				}
 				if !yield(ev, err) {
-					return // caller stopped consuming (cancel / early exit)
+					return true // caller stopped consuming (cancel / early exit)
 				}
 				if err != nil {
-					return // terminal error already handed to the caller
+					return true // terminal error already handed to the caller
 				}
 			}
 			if failed == nil {
 				p.health.Pass(m.ID) // completed (or failed in a non-failover way)
-				return
+				settled = true
+				return true
 			}
 			lastErr = failed
+			prevFailed = m
 			hard := isHardFailure(failed)
 			if p.health.Trip(m.ID, trimErr(failed), hard) {
 				log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(failed))
 			}
-			if i+1 < len(order) {
-				n := order[i+1]
-				log.Printf("[llmpool] LLM 故障转移：%q(%s) → %q(%s)，原因：%s",
-					m.Name, m.Model, n.Name, n.Model, trimErr(failed))
+			settled = true
+			return false
+		}
+
+		for _, m := range candidates {
+			allowed, token := p.health.allowProbe(m.ID)
+			if !allowed {
+				continue
+			}
+			if runMember(m, token) {
+				return
+			}
+		}
+		if tried == 0 {
+			fallback := p.members[0]
+			if len(candidates) > 0 {
+				fallback = candidates[0]
+			}
+			if allowed, token := p.health.acquireLastResort(fallback.ID); allowed {
+				if runMember(fallback, token) {
+					return
+				}
 			}
 		}
 		if lastErr == nil {
-			lastErr = ErrExhausted
+			log.Printf("[llmpool] 轮询链已耗尽(所有配置均在熔断冷却或探测中)")
+			yield(llm.StreamEvent{}, fmt.Errorf("%w：所有配置均在熔断冷却或探测中", ErrExhausted))
+			return
 		}
-		log.Printf("[llmpool] 轮询链已耗尽(%d 个配置全部失败)，最后错误：%s", len(order), trimErr(lastErr))
+		log.Printf("[llmpool] 轮询链已耗尽(%d 个配置全部失败)，最后错误：%s", tried, trimErr(lastErr))
 		yield(llm.StreamEvent{}, fmt.Errorf("%w：%v", ErrExhausted, lastErr))
 	}
 }
@@ -132,59 +173,118 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 // tried without risk of duplicated output. Mirrors Stream's health-tripping and
 // chain-exhaustion behavior.
 func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
-	order := p.order(req)
+	candidates := p.orderedMembers(ctx, req)
 	var lastErr error
-	for i, m := range order {
+	var prevFailed *Member
+	tried := 0
+
+	runMember := func(m *Member, probeToken uint64) (llm.Message, string, llm.Usage, error, bool) {
+		settled := false
+		if probeToken != 0 {
+			defer func() {
+				if !settled {
+					p.health.ReleaseProbe(m.ID, probeToken)
+				}
+			}()
+		}
+		if prevFailed != nil {
+			log.Printf("[llmpool] LLM 故障转移：%q(%s) → %q(%s)，原因：%s",
+				prevFailed.Name, prevFailed.Model, m.Name, m.Model, trimErr(lastErr))
+		}
+		tried++
 		msg, sr, usage, err := m.Prov.Complete(ctx, req)
 		if err == nil {
 			p.health.Pass(m.ID)
-			return msg, sr, usage, nil
+			settled = true
+			return msg, sr, usage, nil, true
 		}
 		if !shouldFailover(ctx, err) {
-			// Non-failover error (e.g. ctx cancel, deterministic 4xx): surface as-is
-			// without tripping health, matching Stream's non-failover path.
-			p.health.Pass(m.ID)
-			return msg, sr, usage, err
+			// Non-failover error (e.g. ctx cancel, deterministic 4xx, incomplete
+			// response): surface as-is without tripping health. On cancellation or
+			// *llm.IncompleteResponseError, leave circuit state untouched (only
+			// releasing any probe lease via defer, matching Stream).
+			var incomplete *llm.IncompleteResponseError
+			if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &incomplete) {
+				p.health.Pass(m.ID)
+				settled = true
+			}
+			return msg, sr, usage, err, true
 		}
 		lastErr = err
+		prevFailed = m
 		hard := isHardFailure(err)
 		if p.health.Trip(m.ID, trimErr(err), hard) {
 			log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(err))
 		}
-		if i+1 < len(order) {
-			n := order[i+1]
-			log.Printf("[llmpool] LLM 故障转移：%q(%s) → %q(%s)，原因：%s",
-				m.Name, m.Model, n.Name, n.Model, trimErr(err))
+		settled = true
+		return llm.Message{}, "", llm.Usage{}, nil, false
+	}
+
+	for _, m := range candidates {
+		allowed, token := p.health.allowProbe(m.ID)
+		if !allowed {
+			continue
+		}
+		if msg, sr, usage, err, done := runMember(m, token); done {
+			return msg, sr, usage, err
+		}
+	}
+	if tried == 0 {
+		fallback := p.members[0]
+		if len(candidates) > 0 {
+			fallback = candidates[0]
+		}
+		if allowed, token := p.health.acquireLastResort(fallback.ID); allowed {
+			if msg, sr, usage, err, done := runMember(fallback, token); done {
+				return msg, sr, usage, err
+			}
 		}
 	}
 	if lastErr == nil {
-		lastErr = ErrExhausted
+		log.Printf("[llmpool] 轮询链已耗尽(所有配置均在熔断冷却或探测中)")
+		return llm.Message{}, "", llm.Usage{}, fmt.Errorf("%w：所有配置均在熔断冷却或探测中", ErrExhausted)
 	}
-	log.Printf("[llmpool] 轮询链已耗尽(%d 个配置全部失败)，最后错误：%s", len(order), trimErr(lastErr))
+	log.Printf("[llmpool] 轮询链已耗尽(%d 个配置全部失败)，最后错误：%s", tried, trimErr(lastErr))
 	return llm.Message{}, "", llm.Usage{}, fmt.Errorf("%w：%v", ErrExhausted, lastErr)
 }
 
-// order picks the members to try, in order: skip those in a cooling-off window
-// and those whose context window can't hold this request, then rotate within each
-// equal-priority group so same-priority profiles share the load. Never returns an
-// empty slice — if everything is filtered out, the head of the chain is tried
-// anyway, since stalling the engine is worse than one more failed request.
-func (p *Pool) order(req llm.CompletionRequest) []*Member {
+// orderedMembers filters out members whose context window cannot hold req and
+// rotates equal-priority groups. When a session key is present (PromptCacheKey
+// or transcript session ID), a deterministic FNV-1a hash is used so repeated
+// turns of the same session stick to the same backup profile and preserve its
+// prompt cache; otherwise falls back to round-robin rotation.
+func (p *Pool) orderedMembers(ctx context.Context, req llm.CompletionRequest) []*Member {
 	est := estimateTokens(req)
-	var open []*Member
+	candidates := make([]*Member, 0, len(p.members))
 	for _, m := range p.members {
-		if p.health.IsOpen(m.ID) {
-			continue
-		}
 		if m.WindowTokens > 0 && est > m.WindowTokens {
 			continue // would 400 on length — not a useful failover target
 		}
-		open = append(open, m)
+		candidates = append(candidates, m)
 	}
-	if len(open) == 0 {
-		return p.members[:1] // last resort: probe the head rather than stall
+	var offset uint64
+	if key := sessionKey(ctx, req); key != "" {
+		offset = fnv64a(key)
+	} else {
+		offset = p.rr.Add(1) - 1
 	}
-	return rotateGroups(open, p.rr.Add(1)-1)
+	return rotateGroups(candidates, offset)
+}
+
+func sessionKey(ctx context.Context, req llm.CompletionRequest) string {
+	if k := strings.TrimSpace(req.PromptCacheKey); k != "" {
+		return k
+	}
+	if k := strings.TrimSpace(llm.PromptCacheKeyFrom(ctx)); k != "" {
+		return k
+	}
+	return strings.TrimSpace(transcript.SessionIDFrom(ctx))
+}
+
+func fnv64a(s string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum64()
 }
 
 // rotateGroups rotates each run of equal-ranked members by n, so profiles sharing
@@ -267,13 +367,17 @@ func isHardFailure(err error) bool {
 	return false
 }
 
-// trimErr shortens an error for logs/UI — provider bodies can be long.
+// trimErr shortens an error for logs/UI on a UTF-8 boundary — provider bodies can be long.
 func trimErr(err error) string {
 	s := strings.TrimSpace(strings.ReplaceAll(err.Error(), "\n", " "))
-	if len(s) > 300 {
-		s = s[:300] + "…"
+	if len(s) <= 300 {
+		return s
 	}
-	return s
+	cut := 300
+	for cut > 0 && 300-cut < utf8.UTFMax && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // estimateTokens roughly sizes a request so members whose context window clearly

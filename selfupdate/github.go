@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/RC-CHN/ARTEX/internal/httpx"
 )
 
 // Repo 是发布源。写死而不是做成配置项：更新源可配等于给任何能改配置的人一条
@@ -47,19 +50,23 @@ type Asset struct {
 	Size int64  `json:"size"`
 }
 
-// NewClient 构造一个只认 GitHub 域名的 HTTP 客户端。proxy 为空则直连。
+// NewClient 构造一个只认 GitHub 域名的 HTTP 客户端。proxy 为空则走默认共享池。
 //
-// 刻意不复用默认 Transport：升级链路必须强制走 TLS 且校验证书，不能被别处
-// 设置的 InsecureSkipVerify 之类影响到。
+// 使用 httpx.SharedTransport(InsecureTLS: false) 保证强制校验证书且复用连接池，
+// 不会被别处设置的 InsecureSkipVerify 影响到，也不会每次调用泄漏独立 Transport。
 func NewClient(proxy string) *http.Client {
-	tr := &http.Transport{
-		ForceAttemptHTTP2:   true,
-		TLSHandshakeTimeout: 15 * time.Second,
-	}
+	opts := httpx.TransportOpts{}
 	if p := strings.TrimSpace(proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
-			tr.Proxy = http.ProxyURL(pu)
+		if pu, err := url.Parse(p); err == nil && pu.Scheme != "" && pu.Host != "" {
+			opts.ProxyURL = p
+		} else {
+			log.Printf("[update] 忽略无效的代理地址，将回退到默认网络配置")
 		}
+	}
+	tr, err := httpx.SharedTransport(opts)
+	if err != nil {
+		log.Printf("[update] 初始化代理传输层失败，将回退到默认网络配置: %v", err)
+		tr, _ = httpx.SharedTransport(httpx.TransportOpts{})
 	}
 	return &http.Client{
 		Transport: tr,
@@ -100,7 +107,7 @@ func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
 	if err != nil {
 		return nil, fmt.Errorf("访问 GitHub 失败（可在系统设置里配置全局代理）: %w", err)
 	}
-	defer resp.Body.Close()
+	defer httpx.DrainAndClose(resp.Body)
 
 	switch {
 	case resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusTooManyRequests:

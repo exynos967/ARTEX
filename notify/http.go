@@ -81,18 +81,33 @@ func blockInternalDial(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-// notifyTransport 在默认 Transport 的基础上只加一个拨号守卫。
-// 用 Clone 保留默认的全部调优（连接池、HTTP/2、超时、proxy 等），
-// 避免为了加一个检查而改动其它行为。
-var notifyTransport = func() *http.Transport {
-	t, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return &http.Transport{}
+// newNotifyTransport 构造带拨号守卫且禁用环境代理的传输层。
+// 必须显式置 Proxy = nil：http.DefaultTransport 默认带 ProxyFromEnvironment，
+// 若宿主设置了 HTTP_PROXY/HTTPS_PROXY，请求会被转给代理服务器从而绕过
+// blockInternalDial（拨号地址变成代理本身而不是最终目标）。
+func newNotifyTransport() *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   blockInternalDial,
 	}
-	clone := t.Clone()
-	clone.DialContext = (&net.Dialer{Timeout: 10 * time.Second, Control: blockInternalDial}).DialContext
+	var clone *http.Transport
+	if t, ok := http.DefaultTransport.(*http.Transport); ok && t != nil {
+		clone = t.Clone()
+	} else {
+		clone = &http.Transport{
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	clone.Proxy = nil
+	clone.DialContext = dialer.DialContext
 	return clone
-}()
+}
+
+var notifyTransport = newNotifyTransport()
 
 // httpClient 是所有渠道投递共用的客户端。
 //
@@ -100,10 +115,11 @@ var notifyTransport = func() *http.Transport {
 // 目标流量用的，常是不稳定的隧道，而通知的可用性不该被目标网络的抖动绑架。
 // IM 推送直连即可。超时设为 15 秒——比这更慢的对端实际上已经是故障状态。
 //
-// 拒绝跨主机重定向：本功能的投递地址都是「一个固定 endpoint」形态，正常不会
-// 重定向到别的主机；而这几家的凭据（钉钉的 access_token、企微的 key、Telegram 的
-// bot token）**就在 URL 里**，跟随跨主机跳转等于把凭据交给重定向目标。同主机
-// 的跳转（如末尾补斜杠）仍允许。
+// 拒绝跨主机重定向与 HTTPS 降级重定向：本功能的投递地址都是「一个固定 endpoint」
+// 形态，正常不会重定向到别的主机或从 HTTPS 降级到 HTTP；而这几家的凭据（钉钉的
+// access_token、企微的 key、Telegram 的 bot token）**就在 URL 里**，跟随跨主机
+// 或降级跳转等于把凭据交给重定向目标或明文暴露在网络上。同主机的安全跳转（如末尾
+// 补斜杠）仍允许。
 var httpClient = &http.Client{
 	Timeout:   15 * time.Second,
 	Transport: notifyTransport,
@@ -111,8 +127,13 @@ var httpClient = &http.Client{
 		if len(via) >= 5 {
 			return errors.New("重定向次数过多")
 		}
-		if len(via) > 0 && req.URL.Host != via[0].URL.Host {
-			return fmt.Errorf("拒绝跨主机重定向（%s → %s）", via[0].URL.Host, req.URL.Host)
+		if len(via) > 0 {
+			if strings.EqualFold(via[0].URL.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+				return fmt.Errorf("拒绝 HTTPS 协议降级重定向（%s → %s）", via[0].URL.Scheme, req.URL.Scheme)
+			}
+			if !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+				return fmt.Errorf("拒绝跨主机重定向（%s → %s）", via[0].URL.Host, req.URL.Host)
+			}
 		}
 		return nil
 	},
@@ -223,7 +244,7 @@ func redactTransportError(err error) string {
 			host = u.Host
 		}
 		if uerr.Err != nil {
-			return fmt.Sprintf("%s %s: %s", uerr.Op, host, uerr.Err)
+			return fmt.Sprintf("%s %s: %s", uerr.Op, host, redactURLsInText(uerr.Err.Error()))
 		}
 		return fmt.Sprintf("%s %s: 未知错误", uerr.Op, host)
 	}

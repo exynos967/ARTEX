@@ -72,12 +72,28 @@ func (c feishuChannel) Send(ctx context.Context, cfg map[string]any, m Message) 
 		return 0, fmt.Errorf("解析飞书响应失败: %w (%s)", err, snippet(raw))
 	}
 	if res.Code != 0 {
+		if isFeishuRateLimitCode(res.Code) {
+			return 0, fmt.Errorf("飞书限流 (%d): %s", res.Code, res.Msg)
+		}
 		return 0, Permanent(fmt.Errorf("飞书返回错误 %d: %s", res.Code, res.Msg))
 	}
 	if res.StatusCode != 0 {
+		if isFeishuRateLimitCode(res.StatusCode) {
+			return 0, fmt.Errorf("飞书限流 (%d): %s", res.StatusCode, res.StatusMessage)
+		}
 		return 0, Permanent(fmt.Errorf("飞书返回错误 %d: %s", res.StatusCode, res.StatusMessage))
 	}
 	return kept, nil
+}
+
+// isFeishuRateLimitCode 报告飞书业务错误码是否属于频率限制（瞬时故障，应允许重试）。
+func isFeishuRateLimitCode(code int) bool {
+	switch code {
+	case 11232, 9499, 99991400:
+		return true
+	default:
+		return false
+	}
 }
 
 // feishuSign 按飞书官方规则计算签名。

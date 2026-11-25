@@ -37,13 +37,24 @@ func (s State) Open() bool { return time.Now().Before(s.OpenUntil) }
 // key) trip on the first regardless. Overridable via Registry.SetPolicy.
 const softTripAfter = 3
 
+// defaultProbeLease bounds how long a single-flight half-open/last-resort probe
+// stays reserved if the caller exits abnormally without settling Pass/Trip.
+const defaultProbeLease = 60 * time.Second
+
+type probeEntry struct {
+	token uint64
+	until time.Time
+}
+
 // Registry holds the circuit-breaker state of every profile, keyed by profile id.
 // It is process-wide and outlives any single Pool instance, so rebuilding the pool
 // (saving an unrelated profile, toggling a setting) never clears what we've learned
 // about which backends are broken.
 type Registry struct {
-	mu sync.Mutex
-	m  map[int64]*State
+	mu             sync.Mutex
+	m              map[int64]*State
+	probes         map[int64]probeEntry // active single-flight probe leases (id -> entry)
+	nextProbeToken uint64
 
 	// persist / forget mirror state to the DB so a cooling-off window survives a
 	// restart. Both may be nil (no DB); both are called off the hot path.
@@ -53,8 +64,9 @@ type Registry struct {
 	// softTrip / cooldown are the operator-set overrides (0 = use the built-in
 	// default / ladder). They live here rather than being read per failure because
 	// Trip runs on the failure path of every request.
-	softTrip int
-	cooldown time.Duration
+	softTrip     int
+	cooldown     time.Duration
+	probeTimeout time.Duration // 0 = defaultProbeLease (test hook)
 }
 
 // SetPolicy overrides the breaker's two knobs. softTrip: how many consecutive
@@ -88,9 +100,22 @@ func (r *Registry) coolFor(trips int) time.Duration {
 	return backoff[len(backoff)-1]
 }
 
+// probeLease returns the active probe lease duration. Callers hold r.mu.
+func (r *Registry) probeLease() time.Duration {
+	if r.probeTimeout > 0 {
+		return r.probeTimeout
+	}
+	return defaultProbeLease
+}
+
 // NewRegistry builds an empty registry. persist/forget may be nil.
 func NewRegistry(persist func(id int64, st State), forget func(id int64)) *Registry {
-	return &Registry{m: map[int64]*State{}, persist: persist, forget: forget}
+	return &Registry{
+		m:       map[int64]*State{},
+		probes:  map[int64]probeEntry{},
+		persist: persist,
+		forget:  forget,
+	}
 }
 
 // Restore seeds state loaded from the DB at startup (bypasses persistence).
@@ -99,6 +124,7 @@ func (r *Registry) Restore(id int64, st State) {
 	defer r.mu.Unlock()
 	cp := st
 	r.m[id] = &cp
+	delete(r.probes, id)
 }
 
 // Get returns a copy of one profile's state.
@@ -114,10 +140,94 @@ func (r *Registry) Get(id int64) State {
 // IsOpen reports whether a profile is in its cooling-off window.
 func (r *Registry) IsOpen(id int64) bool { return r.Get(id).Open() }
 
+// TryAcquireProbe reports whether a caller may send a request to profile id.
+//
+//   - Closed (never tripped / OpenUntil zero): returns (0, true).
+//   - Open (now < OpenUntil): returns (0, false).
+//   - Half-open (OpenUntil expired): admits ONLY ONE caller at a time, returning
+//     (token, true) with a non-zero lease token that must be passed to
+//     ReleaseProbe(id, token) if the call aborts before Pass/Trip; concurrent
+//     callers receive (0, false) until Pass, Trip, Reset, ReleaseProbe, or lease
+//     expiry clears the probe.
+func (r *Registry) TryAcquireProbe(id int64) (uint64, bool) {
+	allowed, token := r.allowProbe(id)
+	return token, allowed
+}
+
+// AllowProbe reports whether a caller may send a request to profile id.
+func (r *Registry) AllowProbe(id int64) bool {
+	allowed, _ := r.allowProbe(id)
+	return allowed
+}
+
+func (r *Registry) allowProbe(id int64) (allowed bool, token uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.m[id]
+	if st == nil || st.OpenUntil.IsZero() {
+		return true, 0
+	}
+	now := time.Now()
+	if now.Before(st.OpenUntil) {
+		return false, 0
+	}
+	if r.probes == nil {
+		r.probes = map[int64]probeEntry{}
+	}
+	if ent, ok := r.probes[id]; ok && now.Before(ent.until) {
+		return false, 0
+	}
+	r.nextProbeToken++
+	token = r.nextProbeToken
+	r.probes[id] = probeEntry{token: token, until: now.Add(r.probeLease())}
+	return true, token
+}
+
+// acquireLastResort admits a last-resort call when every candidate in the pool
+// was filtered out.
+//   - Closed: always allowed (token=0).
+//   - Open or half-open with no active probe: admits ONE caller (token!=0).
+//   - Open or half-open with an active probe in flight: returns (false, 0)
+//     so concurrent callers fail fast instead of hammering the tripped member.
+func (r *Registry) acquireLastResort(id int64) (allowed bool, token uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.m[id]
+	if st == nil || st.OpenUntil.IsZero() {
+		return true, 0
+	}
+	now := time.Now()
+	if r.probes == nil {
+		r.probes = map[int64]probeEntry{}
+	}
+	if ent, ok := r.probes[id]; ok && now.Before(ent.until) {
+		return false, 0
+	}
+	r.nextProbeToken++
+	token = r.nextProbeToken
+	r.probes[id] = probeEntry{token: token, until: now.Add(r.probeLease())}
+	return true, token
+}
+
+// ReleaseProbe clears an active probe lease without altering failure counters
+// ONLY when the active lease's token matches token, preventing an expired slow
+// probe from deleting a newer probe's lease.
+func (r *Registry) ReleaseProbe(id int64, token uint64) {
+	if token == 0 {
+		return
+	}
+	r.mu.Lock()
+	if ent, ok := r.probes[id]; ok && ent.token == token {
+		delete(r.probes, id)
+	}
+	r.mu.Unlock()
+}
+
 // Pass records a successful call: clears the failure counters so a profile that
 // recovers is fully trusted again (and drops the persisted row).
 func (r *Registry) Pass(id int64) {
 	r.mu.Lock()
+	delete(r.probes, id)
 	st := r.m[id]
 	if st == nil || (st.Fails == 0 && st.Trips == 0 && st.OpenUntil.IsZero()) {
 		r.mu.Unlock()
@@ -133,22 +243,27 @@ func (r *Registry) Pass(id int64) {
 
 // Trip records a failed call. hard=true marks a deterministic failure (no credit,
 // invalid key, missing model) which opens the breaker immediately; hard=false is a
-// transient one (429 / 5xx / network) that needs softTripAfter in a row. Returns
-// true when this call is what opened the breaker, so the caller can log it once.
+// transient one (429 / 5xx / network) that needs softTripAfter in a row (or fails
+// an active half-open probe). Returns true when this call is what opened the
+// breaker, so the caller can log it once.
 func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 	r.mu.Lock()
+	now := time.Now()
+	_, wasProbing := r.probes[id]
+	delete(r.probes, id)
 	st := r.m[id]
 	if st == nil {
 		st = &State{}
 		r.m[id] = st
 	}
+	wasHalfOpen := !st.OpenUntil.IsZero() && !now.Before(st.OpenUntil)
 	st.Fails++
 	st.LastError = errMsg
-	st.LastAt = time.Now()
+	st.LastAt = now
 	softTrip := r.tripAfter()
-	if hard || (softTrip > 0 && st.Fails >= softTrip) {
+	if hard || (softTrip > 0 && (st.Fails >= softTrip || wasProbing || wasHalfOpen)) {
 		st.Trips++
-		st.OpenUntil = time.Now().Add(r.coolFor(st.Trips))
+		st.OpenUntil = now.Add(r.coolFor(st.Trips))
 		st.Fails = 0 // counted into this trip; start fresh for the half-open probe
 		tripped = true
 	}
@@ -165,6 +280,7 @@ func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 func (r *Registry) Reset(id int64) {
 	r.mu.Lock()
 	delete(r.m, id)
+	delete(r.probes, id)
 	forget := r.forget
 	r.mu.Unlock()
 	if forget != nil {

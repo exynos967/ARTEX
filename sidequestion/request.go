@@ -96,6 +96,9 @@ func BuildRequest(s Snapshot, history []Exchange, question string) (llm.Completi
 	if err != nil {
 		return req, err
 	}
+	if req.PromptCacheKey == "" && s.SessionID != "" {
+		req.PromptCacheKey = s.SessionID
+	}
 	base := llm.MessagesForAPI(req.Messages)
 	req.MaxTokens = outputBudget(req, 0)
 	var success []Exchange

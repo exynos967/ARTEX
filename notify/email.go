@@ -135,22 +135,46 @@ func (c emailChannel) Send(ctx context.Context, cfg map[string]any, m Message) (
 // 而 smtp.NewClient 握手失败时会把对端返回的那一行包进错误、经 last_error
 // 由投递历史接口回显，构成半盲读原语；「连接被拒 vs 超时」的耗时差异还能
 // 用来探测端口。拨号阶段是最终生效点，也覆盖 DNS 重绑定。
+type cancelDeadlineConn struct {
+	net.Conn
+	stop func() bool
+}
+
+func (c *cancelDeadlineConn) Close() error {
+	if c.stop != nil {
+		c.stop()
+	}
+	return c.Conn.Close()
+}
+
 func emailDial(ctx context.Context, addr, host string, implicitTLS bool) (*smtp.Client, error) {
 	d := &net.Dialer{Timeout: emailDialTimeout, Control: blockInternalDial}
 	var conn net.Conn
 	var err error
 	if implicitTLS {
-		conn, err = tls.DialWithDialer(d, "tcp", addr, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		tlsDialer := &tls.Dialer{
+			NetDialer: d,
+			Config:    &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12},
+		}
+		conn, err = tlsDialer.DialContext(ctx, "tcp", addr)
 	} else {
 		conn, err = d.DialContext(ctx, "tcp", addr)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("连接 SMTP 服务器失败: %w", err)
 	}
-	_ = conn.SetDeadline(time.Now().Add(emailSessionTimeout))
-	client, err := smtp.NewClient(conn, host)
+	deadline := time.Now().Add(emailSessionTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	wrapped := &cancelDeadlineConn{Conn: conn, stop: stopCancel}
+	client, err := smtp.NewClient(wrapped, host)
 	if err != nil {
-		conn.Close()
+		_ = wrapped.Close()
 		return nil, fmt.Errorf("SMTP 握手失败: %w", err)
 	}
 	return client, nil

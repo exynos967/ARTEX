@@ -167,7 +167,7 @@ func (i *Interceptor) loadLocked() error {
 	if err != nil {
 		return err
 	}
-	var out []compiledRule
+	out := make([]compiledRule, 0, len(rules))
 	for _, r := range rules {
 		if !r.Enabled {
 			continue
@@ -182,28 +182,32 @@ func (i *Interceptor) loadLocked() error {
 		}
 		out = append(out, cr)
 	}
-	i.cached = out
 
-	// Load enabled-tools set from settings, falling back to hard-coded defaults.
-	val, ok, _ := i.db.GetSetting("intercept_enabled_tools")
+	// Load enabled-tools set from settings, falling back to hard-coded defaults
+	// only when the setting is genuinely absent (never on DB error).
+	val, ok, err := i.db.GetSetting("intercept_enabled_tools")
+	if err != nil {
+		return err
+	}
+	var enabled map[string]bool
 	if !ok {
-		m := make(map[string]bool, len(defaultEnabledTools))
+		enabled = make(map[string]bool, len(defaultEnabledTools))
 		for _, n := range defaultEnabledTools {
-			m[n] = true
+			enabled[n] = true
 		}
-		i.enabledTools = m
 	} else {
 		var names []string
 		if json.Unmarshal([]byte(val), &names) != nil {
-			i.enabledTools = map[string]bool{}
+			enabled = map[string]bool{}
 		} else {
-			m := make(map[string]bool, len(names))
+			enabled = make(map[string]bool, len(names))
 			for _, n := range names {
-				m[n] = true
+				enabled[n] = true
 			}
-			i.enabledTools = m
 		}
 	}
+	i.cached = out
+	i.enabledTools = enabled
 	return nil
 }
 

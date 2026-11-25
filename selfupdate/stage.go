@@ -21,6 +21,10 @@ const sumsAsset = "SHA256SUMS"
 // maxBinarySize 限制解压出来的二进制体积，防止畸形 zip 把磁盘写满。
 const maxBinarySize = 512 << 20 // 512 MiB
 
+// maxDownloadBytes 限制整个发布包 zip 的下载体积，防止恶意外链或异常响应把磁盘写满。
+// 变量形式仅便于单元测试注入较小阈值，生产环境始终为 maxBinarySize + 64 MiB。
+var maxDownloadBytes int64 = maxBinarySize + (64 << 20)
+
 // Phase 是升级过程中的阶段，直接用作 SSE 事件里的 phase 字段。
 type Phase string
 
@@ -189,6 +193,9 @@ func isHexSHA256(s string) bool {
 
 // download 把资产写入 dst，同时计算 SHA256 并按 Content-Length 汇报进度。
 func download(ctx context.Context, c *http.Client, a Asset, dst string, prog Progress) (string, error) {
+	if a.Size > maxDownloadBytes {
+		return "", fmt.Errorf("发布包 %s 体积 %s 超过上限 %s，拒绝下载", a.Name, humanSize(a.Size), humanSize(maxDownloadBytes))
+	}
 	body, err := get(ctx, c, a.URL)
 	if err != nil {
 		return "", fmt.Errorf("下载 %s: %w", a.Name, err)
@@ -203,8 +210,12 @@ func download(ctx context.Context, c *http.Client, a Asset, dst string, prog Pro
 
 	h := sha256.New()
 	pw := &progressWriter{total: a.Size, prog: prog, name: a.Name, last: time.Now()}
-	if _, err := io.Copy(io.MultiWriter(f, h, pw), body); err != nil {
+	n, err := io.Copy(io.MultiWriter(f, h, pw), io.LimitReader(body, maxDownloadBytes+1))
+	if err != nil {
 		return "", fmt.Errorf("下载中断: %w", err)
+	}
+	if n > maxDownloadBytes {
+		return "", fmt.Errorf("下载 %s 超过体积上限 %s，已中止", a.Name, humanSize(maxDownloadBytes))
 	}
 	if err := f.Sync(); err != nil {
 		return "", fmt.Errorf("落盘失败: %w", err)

@@ -152,6 +152,9 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 		var (
 			textBuf                             strings.Builder
 			thinkingBuf                         strings.Builder
+			respRemaining                       = MaxCaptureTotalResponseBytes
+			textTruncated                       bool
+			thinkingTruncated                   bool
 			usage                               llm.Usage
 			stopReason                          string
 			streamErr                           error
@@ -218,12 +221,12 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			case llm.SETextDelta:
 				textBytes += len(ev.Text)
 				if recordBodies {
-					textBuf.WriteString(ev.Text)
+					appendCappedShared(&textBuf, ev.Text, &respRemaining, &textTruncated, totalResponseTruncatedMarker)
 				}
 			case llm.SEThinkingDelta:
 				thinkingBytes += len(ev.Text)
 				if recordBodies {
-					thinkingBuf.WriteString(ev.Text)
+					appendCappedShared(&thinkingBuf, ev.Text, &respRemaining, &thinkingTruncated, totalResponseTruncatedMarker)
 				}
 			case llm.SEMessageStart:
 				// A new provider attempt must not inherit an earlier attempt's
@@ -350,6 +353,16 @@ func (r *Recorder) recordUsage(session, taskID string, expID int64, worker strin
 // Keeping the write inside the owning task operation means task deletion can
 // drain calls and then remove records without a late async insert recreating one.
 func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, reqBody string, capt *Capture, start time.Time, text, thinking string, usage llm.Usage, stopReason string, streamErr error) {
+	rec := r.buildRecord(req, session, taskID, worker, reqBody, capt, start, text, thinking, usage, stopReason, streamErr)
+	if r.pg == nil {
+		return
+	}
+	if err := r.pg.InsertLLMRecord(rec); err != nil {
+		log.Printf("[llmrec] insert: %v", err)
+	}
+}
+
+func (r *Recorder) buildRecord(req llm.CompletionRequest, session, taskID, worker, reqBody string, capt *Capture, start time.Time, text, thinking string, usage llm.Usage, stopReason string, streamErr error) *db.LLMRecord {
 	latency := int(time.Since(start).Milliseconds())
 	status := "ok"
 	errMsg := ""
@@ -358,29 +371,11 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		errMsg = streamErr.Error()
 	}
 
-	// Build response body JSON.
-	resp := map[string]any{
-		"text":        text,
-		"stop_reason": stopReason,
-		"usage": map[string]int{
-			"input_tokens":       usage.InputTokens,
-			"output_tokens":      usage.OutputTokens,
-			"cache_read_tokens":  usage.CacheReadTokens,
-			"cache_write_tokens": usage.CacheWriteTokens,
-		},
-	}
-	if thinking != "" {
-		resp["thinking"] = thinking
-	}
-	respBody, _ := json.Marshal(resp)
+	respBody := marshalCappedResponseBody(text, thinking, stopReason, usage)
 
-	model := ""
-	if len(req.System) > 0 {
-		// model is not in CompletionRequest; use the configured model name
-	}
-	model = r.model
+	model := r.model
 
-	rec := &db.LLMRecord{
+	return &db.LLMRecord{
 		SessionID:    session,
 		TaskID:       taskID,
 		Worker:       worker,
@@ -394,16 +389,12 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		Status:       status,
 		Error:        errMsg,
 		RequestBody:  reqBody,
-		ResponseBody: string(respBody),
+		ResponseBody: respBody,
 		// Raw wire bodies; empty when the transport did not fill the Capture
 		// (e.g. a provider dialing through a client without the capture hook, or
 		// a call that failed before any HTTP request went out).
 		RawRequest:  capt.RawRequest(),
 		RawResponse: capt.RawResponse(),
-	}
-
-	if err := r.pg.InsertLLMRecord(rec); err != nil {
-		log.Printf("[llmrec] insert: %v", err)
 	}
 }
 
@@ -440,5 +431,5 @@ func (r *Recorder) serializeRequest(req llm.CompletionRequest) string {
 		m["stop"] = req.Stop
 	}
 	b, _ := json.Marshal(m)
-	return string(b)
+	return capRequestBody(string(b))
 }

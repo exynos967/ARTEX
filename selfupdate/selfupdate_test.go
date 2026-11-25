@@ -2,6 +2,11 @@ package selfupdate
 
 import (
 	"archive/zip"
+	"bytes"
+	"context"
+	"io"
+	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -455,5 +460,89 @@ func TestSettleIsNoopWithoutMarker(t *testing.T) {
 	settle(p) // 普通启动路径，不该 panic 也不该动任何文件
 	if _, err := os.Stat(p.Current); err != nil {
 		t.Error("无标记时 settle 不应影响任何文件")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestDownloadRejectsOversizedStream(t *testing.T) {
+	prevLimit := maxDownloadBytes
+	maxDownloadBytes = 128
+	t.Cleanup(func() { maxDownloadBytes = prevLimit })
+
+	// 1. Streaming overflow (asset.Size omitted / 0, body exceeds maxDownloadBytes).
+	c := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("A"), 256))),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+	dst := filepath.Join(t.TempDir(), "out.zip")
+	_, err := download(context.Background(), c, Asset{
+		Name: "artex.zip",
+		URL:  "https://objects.githubusercontent.com/artex.zip",
+		Size: 0,
+	}, dst, func(Phase, int, string) {})
+	if err == nil || !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("期望超限下载报错，得到 %v", err)
+	}
+
+	// 2. Declared asset.Size > maxDownloadBytes rejected before downloading.
+	_, err = download(context.Background(), c, Asset{
+		Name: "artex.zip",
+		URL:  "https://objects.githubusercontent.com/artex.zip",
+		Size: 512,
+	}, dst, func(Phase, int, string) {})
+	if err == nil || !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("期望声明体积超限被提前拒绝，得到 %v", err)
+	}
+}
+
+func TestRollbackRestoresCurrentWhenRestoreOldFails(t *testing.T) {
+	p := testPaths(t)
+	if err := os.WriteFile(p.Current, []byte("current-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Point Old to Current so Stat(Old) succeeds, Rename(Current, failed) moves it,
+	// and Rename(Old, Current) deterministically fails with ENOENT across all OSes.
+	p.Old = p.Current
+
+	err := rollback(p)
+	if err == nil {
+		t.Fatal("期望 rollback 在恢复旧版本失败时返回错误")
+	}
+	got, readErr := os.ReadFile(p.Current)
+	if readErr != nil {
+		t.Fatalf("rollback 失败后未把原版本放回 p.Current: %v", readErr)
+	}
+	if string(got) != "current-binary" {
+		t.Fatalf("放回的 p.Current 内容不匹配: %q", string(got))
+	}
+	if _, statErr := os.Stat(p.Current + ".failed"); !os.IsNotExist(statErr) {
+		t.Fatalf(".failed 应已被放回 p.Current，statErr=%v", statErr)
+	}
+}
+
+func TestNewClientLogsWarningOnInvalidProxyWithoutLeakingCredentials(t *testing.T) {
+	var buf bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	c := NewClient("http://user:SUPERSECRET@bad host:8080")
+	if c == nil || c.Transport == nil {
+		t.Fatal("NewClient 遇到无效代理时应回退到默认传输层")
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "无效的代理地址") {
+		t.Fatalf("期望记录无效代理告警日志，得到: %q", logged)
+	}
+	if strings.Contains(logged, "SUPERSECRET") {
+		t.Fatalf("告警日志泄露了代理凭据: %q", logged)
 	}
 }

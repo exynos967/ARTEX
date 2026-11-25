@@ -93,8 +93,11 @@ func (c dingTalkChannel) Send(ctx context.Context, cfg map[string]any, m Message
 		return 0, fmt.Errorf("解析钉钉响应失败: %w (%s)", err, snippet(raw))
 	}
 	if res.ErrCode != 0 {
-		// 301000 是签名校验失败、310000 是关键词不匹配——都是配置错误，
-		// 重试不会自愈。
+		// 130101 是机器人频率超限（每分钟 20 条上限），属于瞬时故障，退避重试有效；
+		// 301000 签名校验失败、310000 关键词不匹配等都是配置错误，重试不会自愈。
+		if res.ErrCode == 130101 {
+			return 0, fmt.Errorf("钉钉限流 (%d): %s", res.ErrCode, res.ErrMsg)
+		}
 		return 0, Permanent(fmt.Errorf("钉钉返回错误 %d: %s", res.ErrCode, res.ErrMsg))
 	}
 	return kept, nil

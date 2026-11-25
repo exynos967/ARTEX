@@ -232,6 +232,9 @@ func rollback(p Paths) error {
 		return fmt.Errorf("移走失败的版本: %w", err)
 	}
 	if err := os.Rename(p.Old, p.Current); err != nil {
+		if rerr := os.Rename(failed, p.Current); rerr != nil {
+			return fmt.Errorf("恢复旧版本失败(%v)，且放回原版本失败: %w", err, rerr)
+		}
 		return fmt.Errorf("恢复旧版本: %w", err)
 	}
 	return nil
