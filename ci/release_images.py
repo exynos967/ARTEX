@@ -10,6 +10,9 @@ import sys
 from release_guard import require_mutable_release
 
 
+SUPPORTED_ARCHES = ("amd64",)
+
+
 def validate_settings(image, commit, tag):
     if not re.fullmatch(r"ghcr\.io/[a-z0-9_.-]+/[a-z0-9_.-]+", image):
         raise ValueError("invalid image repository")
@@ -21,7 +24,7 @@ def validate_settings(image, commit, tag):
 
 def record(candidate, directory, *, image, commit, tag, arch):
     validate_settings(image, commit, tag)
-    if arch not in {"amd64", "arm64"} or not re.fullmatch(re.escape(image) + r":build-[0-9]+-[0-9]+-" + re.escape(arch), candidate):
+    if arch not in SUPPORTED_ARCHES or not re.fullmatch(re.escape(image) + r":build-[0-9]+-[0-9]+-" + re.escape(arch), candidate):
         raise ValueError("invalid native build candidate")
     digests = json.loads(subprocess.check_output(
         ["docker", "image", "inspect", candidate, "--format", "{{json .RepoDigests}}"], text=True))
@@ -37,10 +40,11 @@ def record(candidate, directory, *, image, commit, tag, arch):
 def verified_refs(directory, *, image, commit, tag):
     validate_settings(image, commit, tag)
     directory = Path(directory)
-    if {path.name for path in directory.iterdir()} != {"amd64.json", "arm64.json"}:
-        raise ValueError("expected both native image records and no extra files")
+    expected_files = {arch + ".json" for arch in SUPPORTED_ARCHES}
+    if {path.name for path in directory.iterdir()} != expected_files:
+        raise ValueError("expected verified native image records and no extra files")
     refs = {}
-    for arch in ("amd64", "arm64"):
+    for arch in SUPPORTED_ARCHES:
         record = json.loads((directory / (arch + ".json")).read_text())
         if record.get("arch") != arch or record.get("commit") != commit or record.get("tag") != tag:
             raise ValueError("native image does not match this release")
@@ -48,7 +52,7 @@ def verified_refs(directory, *, image, commit, tag):
         if not isinstance(ref, str) or not re.fullmatch(re.escape(image) + r"@sha256:[a-f0-9]{64}", ref):
             raise ValueError("native image requires an immutable repository digest")
         refs[arch] = ref
-    if refs["amd64"] == refs["arm64"]:
+    if len(set(refs.values())) != len(refs):
         raise ValueError("native architectures must have distinct image digests")
     return refs
 

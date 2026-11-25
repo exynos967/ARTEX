@@ -24,7 +24,7 @@ def response(status, body):
 
 def release(tag, *, draft=False, prerelease=False):
     names = ["artex-" + tag[1:] + "-" + platform + ".zip" for platform in
-             ["linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64", "windows-amd64"]]
+             ["linux-amd64", "darwin-amd64", "windows-amd64"]]
     return {"tag_name": tag, "draft": draft, "prerelease": prerelease,
             "assets": [{"name": name} for name in names + ["SHA256SUMS"]]}
 
@@ -159,10 +159,9 @@ class NativeImagePublicationTests(unittest.TestCase):
     settings = {"image": "ghcr.io/rc-chn/artex", "commit": "a" * 40, "tag": "v0.9.1"}
 
     def records(self, directory):
-        for arch, digit in [("amd64", "1"), ("arm64", "2")]:
-            (Path(directory) / (arch + ".json")).write_text(json.dumps({
-                "arch": arch, "commit": self.settings["commit"], "tag": self.settings["tag"],
-                "ref": self.settings["image"] + "@sha256:" + digit * 64}))
+        (Path(directory) / "amd64.json").write_text(json.dumps({
+            "arch": "amd64", "commit": self.settings["commit"], "tag": self.settings["tag"],
+            "ref": self.settings["image"] + "@sha256:" + "1" * 64}))
 
     def test_record_uses_pushed_digest_instead_of_mutable_candidate(self):
         ref = self.settings["image"] + "@sha256:" + "1" * 64
@@ -184,21 +183,20 @@ class NativeImagePublicationTests(unittest.TestCase):
     def test_incomplete_images_cannot_mutate_version_tags(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch("subprocess.run") as run:
             self.records(directory)
-            (Path(directory) / "arm64.json").unlink()
+            (Path(directory) / "amd64.json").unlink()
             with self.assertRaises(ValueError):
                 publish(directory, **self.settings)
             run.assert_not_called()
 
     def test_wrong_commit_tag_arch_or_mutable_reference_cannot_publish(self):
-        changes = [{"commit": "b" * 40}, {"tag": "v9.0.0"}, {"arch": "amd64"},
-                   {"ref": self.settings["image"] + ":build-123-1-arm64"},
-                   {"ref": "ghcr.io/other/image@sha256:" + "2" * 64},
-                   {"ref": self.settings["image"] + "@sha256:" + "1" * 64}]
+        changes = [{"commit": "b" * 40}, {"tag": "v9.0.0"}, {"arch": "arm64"},
+                   {"ref": self.settings["image"] + ":build-123-1-amd64"},
+                   {"ref": "ghcr.io/other/image@sha256:" + "1" * 64}]
         for change in changes:
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory, \
                     mock.patch("subprocess.run") as run:
                 self.records(directory)
-                path = Path(directory) / "arm64.json"
+                path = Path(directory) / "amd64.json"
                 item = json.loads(path.read_text())
                 item.update(change)
                 path.write_text(json.dumps(item))
@@ -225,9 +223,9 @@ class NativeImagePublicationTests(unittest.TestCase):
             expected = verified_refs(directory, **self.settings)
             publish(directory, **self.settings)
             guard.assert_called_once_with(REPO, self.settings["tag"])
-            self.assertEqual(run.call_count, 3)
+            self.assertEqual(run.call_count, 2)
             commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(commands[-1][-2:], list(expected.values()))
+            self.assertEqual(commands[-1][-1:], list(expected.values()))
             self.assertFalse(any(":latest" in argument for command in commands for argument in command))
             self.assertTrue(all(call.kwargs["check"] for call in run.call_args_list))
 

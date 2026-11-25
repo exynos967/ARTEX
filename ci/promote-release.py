@@ -21,7 +21,7 @@ def complete(release):
         return False
     stem = "artex-" + release["tag_name"][1:] + "-"
     expected = {stem + platform + ".zip" for platform in
-                ["linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64", "windows-amd64"]}
+                ["linux-amd64", "darwin-amd64", "windows-amd64"]}
     expected.add("SHA256SUMS")
     return expected <= {asset["name"] for asset in release["assets"]}
 

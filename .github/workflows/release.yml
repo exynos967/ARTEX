@@ -58,9 +58,7 @@ jobs:
       matrix:
         include:
           - {goos: linux, goarch: amd64}
-          - {goos: linux, goarch: arm64}
           - {goos: darwin, goarch: amd64}
-          - {goos: darwin, goarch: arm64}
           - {goos: windows, goarch: amd64}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -109,7 +107,6 @@ jobs:
       matrix:
         include:
           - {arch: amd64, runner: ubuntu-24.04}
-          - {arch: arm64, runner: ubuntu-24.04-arm}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -129,6 +126,7 @@ jobs:
             ARTEX_BUILD_VERSION=${{ needs.metadata.outputs.version }}
             PORTABLE_TOOLS_SOURCE=portable-tools-prebuilt
             VCS_REF=${{ needs.metadata.outputs.commit }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
             GOPROXY=https://proxy.golang.org,direct
             NPM_REGISTRY=https://registry.npmjs.org
             PLAYWRIGHT_DOWNLOAD_HOST=
@@ -231,8 +229,8 @@ jobs:
       - name: Verify package set and generate checksums
         working-directory: dist
         run: |
-          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 5
-          for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; do
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 3
+          for platform in linux-amd64 darwin-amd64 windows-amd64; do
             test -s "artex-$VERSION-$platform.zip"
           done
           sha256sum -- *.zip > SHA256SUMS
@@ -266,8 +264,8 @@ jobs:
       - name: Release summary
         run: |
           {
-            echo "Published $TAG: five platform archives, SHA256SUMS, and $IMAGE:$TAG."
-            echo 'Both image architectures passed API and offline browser smoke tests.'
+            echo "Published $TAG: three amd64 platform archives, SHA256SUMS, and $IMAGE:$TAG."
+            echo 'The linux/amd64 image passed API and offline browser smoke tests.'
             echo 'Cluster upgrades use a separately verified digest; this workflow has no cluster credentials.'
             echo 'On the first GHCR publication, set the package visibility to public for anonymous installation.'
           } >> "$GITHUB_STEP_SUMMARY"
