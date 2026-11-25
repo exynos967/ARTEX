@@ -173,11 +173,7 @@ func TestProxyConcurrentHTTPAndHTTPSWhileDeletingHost(t *testing.T) {
 		t.Fatalf("concurrent proxy requests had %d errors", errCount.Load())
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := tr.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
+	waitFlushedCount(t, tr, perScheme*2)
 	if tr.DroppedFlows() != 0 {
 		t.Fatalf("unexpected dropped flows: %d", tr.DroppedFlows())
 	}
@@ -188,6 +184,33 @@ func TestProxyConcurrentHTTPAndHTTPSWhileDeletingHost(t *testing.T) {
 	}
 	if len(rows) != perScheme*2 {
 		t.Fatalf("recorded %d exchanges, want %d", len(rows), perScheme*2)
+	}
+}
+
+// waitFlushedCount waits for the proxy handler goroutines to finish enqueueing
+// their exchanges after the client reads response EOF, then flushes the async
+// writer until at least want exchanges are persisted.
+func waitFlushedCount(t *testing.T, tr *Traffic, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := tr.Flush(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("Flush: %v", err)
+		}
+		n, err := tr.Count()
+		if err != nil {
+			t.Fatalf("Count: %v", err)
+		}
+		if n >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after flush Count=%d, want >= %d", n, want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -234,11 +257,7 @@ func TestProxyResponseNeverBlocksOnWriteLock(t *testing.T) {
 	tr.wmu.Unlock()
 	unlocked = true
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := tr.Flush(ctx); err != nil {
-		t.Fatalf("Flush after unlock: %v", err)
-	}
+	waitFlushedCount(t, tr, 2)
 	if n, err := tr.Count(); err != nil || n != 2 {
 		t.Fatalf("after flush Count=(%d,%v), want (2,nil)", n, err)
 	}
@@ -369,11 +388,7 @@ func TestLargeResponseBodyStreamsCleanlyWithBoundedCapture(t *testing.T) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := tr.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
+	waitFlushedCount(t, tr, 2)
 
 	rows, err := tr.Search("127.0.0.1", 0, 10)
 	if err != nil || len(rows) != 2 {

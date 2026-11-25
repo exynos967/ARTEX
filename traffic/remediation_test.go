@@ -324,11 +324,7 @@ func TestMITMHTTPSConnectTargetAddrVsVirtualHostHeader(t *testing.T) {
 		t.Fatalf("upstream saw Host=%q, want Admin.Internal", got)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := tr.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
+	waitFlushedCount(t, tr, 1)
 	rows, err := tr.Search("127.0.0.1", 0, 10)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("recorded rows=%d err=%v, want 1", len(rows), err)

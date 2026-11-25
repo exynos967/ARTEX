@@ -234,7 +234,7 @@ func TestSandboxHardeningInvalidJSONReapsChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(exe, "-test.run=^TestSandboxInvalidJSONHelper$")
+	cmd := exec.CommandContext(t.Context(), exe, "-test.run=^TestSandboxInvalidJSONHelper$")
 	cmd.Env = append(os.Environ(), "ARTEX_INVALID_JSON_HELPER=1")
 	configureProcess(cmd)
 

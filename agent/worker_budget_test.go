@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -121,11 +122,16 @@ func TestWorkerTaskSoftBudgetDogfood(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dir := t.TempDir()
+	bashMarker := filepath.Join(dir, "bash-must-not-run.txt")
 	calls, effects := 0, 0
+	var firstTools []llm.ToolSchema
 	p := consultationProvider{complete: func(_ context.Context, r llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 		calls++
 		raw, _ := json.Marshal(r.Messages)
-		if calls == 1 {
+		switch calls {
+		case 1:
+			firstTools = append([]llm.ToolSchema(nil), r.Tools...)
 			if !strings.Contains(string(raw), "任务累计预算提醒") {
 				t.Fatal("missing advance warning")
 			}
@@ -133,25 +139,37 @@ func TestWorkerTaskSoftBudgetDogfood(t *testing.T) {
 				t.Fatal(err)
 			}
 			return consultationCall("SyntheticCheckpoint", "1", map[string]any{})
-		}
-		if calls != 2 || !strings.Contains(string(raw), "任务累计软预算已到") {
-			t.Fatal("no bounded wrapup", calls, string(raw))
-		}
-		for _, tool := range r.Tools {
-			if tool.Name == "Bash" {
-				t.Fatal("Bash advertised during settlement")
+		case 2:
+			if !strings.Contains(string(raw), "任务累计软预算已到") {
+				t.Fatal("no bounded wrapup", calls, string(raw))
 			}
+			// Prompt-cache prefix preservation keeps tool schemas byte-identical
+			// across normal and settlement turns while blocking disabled tools at
+			// execution time.
+			if !reflect.DeepEqual(firstTools, r.Tools) {
+				t.Fatalf("settlement mutated req.Tools:\nwant %+v\ngot  %+v", firstTools, r.Tools)
+			}
+			return consultationCall("Bash", "2", map[string]any{"command": "echo ran > " + bashMarker})
+		case 3:
+			if !strings.Contains(string(raw), "settlement_tool_disabled") {
+				t.Fatalf("Bash was not rejected at execution during settlement: %s", string(raw))
+			}
+			return consultationText("Synthetic checkpoint recorded; threshold reached, remaining scope incomplete.")
+		default:
+			t.Fatalf("unexpected call %d: %s", calls, string(raw))
+			return llm.Message{}, "", llm.Usage{}, nil
 		}
-		return consultationText("Synthetic checkpoint recorded; threshold reached, remaining scope incomplete.")
 	}}
 	probe := actool.Build(actool.Spec{Name: "SyntheticCheckpoint", Schema: obj(map[string]any{}), Run: func(context.Context, json.RawMessage, *actool.ToolContext) (actool.Result, error) {
 		effects++
 		return actool.Text("saved synthetic checkpoint"), nil
 	}})
-	dir := t.TempDir()
 	w := NewWorker(p, "synthetic", dir, transcript.NewStore(filepath.Join(dir, "transcripts")), 0, 150, probe)
 	reason, _, err := w.Execute(t.Context(), "worker", task.ID, nil, ts, intent, nil, nil, nil, nil)
-	if err != nil || reason != harness.ReasonMaxTurns || calls != 2 || effects != 1 {
+	if err != nil || reason != harness.ReasonMaxTurns || calls != 3 || effects != 1 {
 		t.Fatal(reason, calls, effects, err)
+	}
+	if _, statErr := os.Stat(bashMarker); !os.IsNotExist(statErr) {
+		t.Fatalf("Bash executed during settlement (marker stat err=%v)", statErr)
 	}
 }
