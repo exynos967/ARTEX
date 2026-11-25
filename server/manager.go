@@ -1420,7 +1420,8 @@ func (m *Manager) EnqueueTask(id, mode string) error {
 		        WHEN queue_mode='bootstrap' OR $2='bootstrap' THEN 'bootstrap'
 		        ELSE 'resume'
 		    END
-		WHERE id=$1 AND deleted_at IS NULL
+		WHERE id=$1 AND deleted_at IS NULL AND paused=false
+		  AND status NOT IN ('done','failed','timeout')
 		RETURNING queued_at, queue_mode`, n, mode).Scan(&queuedAt, &committedMode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("task %s is unavailable for enqueue", id)

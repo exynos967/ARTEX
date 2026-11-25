@@ -37,6 +37,10 @@ func TestTaskArchiveAPIQueueListAndLimits(t *testing.T) {
 	dataDir := t.TempDir()
 	s := New(ctx, m, dataDir, dataDir, dataDir)
 	s.archiveWG.Wait()
+	// Wait for startup background consumers (reconcileConcurrency, GC, scheduler,
+	// notifier, discovery) and the side-question writer before mutating DB state.
+	s.backgroundWG.Wait()
+	<-s.side.done
 	token, err := signJWT(s.jwtKey)
 	if err != nil {
 		t.Fatal(err)
