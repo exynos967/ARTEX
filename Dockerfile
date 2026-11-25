@@ -1,7 +1,7 @@
 # ARTEX container image.
 #
 # 多阶段构建：前端静态导出 → Go 单二进制（内嵌前端）→ 运行镜像。
-# 由本仓库源码构建并发布到 ghcr.io/rc-chn/artex：
+# 由本仓库源码构建并发布到 ghcr.io/exynos967/artex：
 #   docker compose build        # 或 docker build -t artex:local .
 # TARGETARCH 由 buildx 自动注入（amd64/arm64），Go 交叉编译无需 QEMU；
 # 运行层只装工具，编译全部在构建阶段完成。
@@ -221,7 +221,8 @@ COPY LICENSE NOTICE.md /app/
 COPY web/LICENSE /app/WEB-LICENSE
 ARG ARTEX_BUILD_VERSION=dev
 ARG VCS_REF
-LABEL org.opencontainers.image.source="https://github.com/RC-CHN/ARTEX" \
+ARG IMAGE_SOURCE=https://github.com/exynos967/ARTEX
+LABEL org.opencontainers.image.source="$IMAGE_SOURCE" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.title="ARTEX" \
       org.opencontainers.image.version="$ARTEX_BUILD_VERSION" \

@@ -48,7 +48,7 @@ services:
     init: true
     logging: *container-logging
     profiles: [runners]
-    image: ${ARTEX_IMAGE:-ghcr.io/rc-chn/artex}:${ARTEX_TAG:-latest}
+    image: ${ARTEX_IMAGE:-ghcr.io/exynos967/artex}:${ARTEX_TAG:-latest}
     entrypoint: ["/bin/sh", "-ec", "mkdir -p /var/lib/artex-runner/tmp && exec /usr/local/bin/artex-runner \"$$@\"", "--"]
     command: [-config, /etc/artex-runner/runner.json, -token-file, /run/secrets/runner_enrollment]
     depends_on:
@@ -93,7 +93,7 @@ services:
     # 本仓库的 GitHub Actions 发布到 GHCR。
     # 正常部署直接拉取本镜像；拉取失败（或想改代码）时本地构建：
     #   docker compose build
-    image: ${ARTEX_IMAGE:-ghcr.io/rc-chn/artex}:${ARTEX_TAG:-latest}
+    image: ${ARTEX_IMAGE:-ghcr.io/exynos967/artex}:${ARTEX_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile
