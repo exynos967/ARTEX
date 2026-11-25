@@ -22,6 +22,10 @@ type DeferredInfo struct {
 	GlobalNames       []string          // MCP names to list in the system-prompt block
 	Unlock            *actool.UnlockSet // shared call-gate; nil when no MCP tools
 	UnlockSkill       func(skillName string)
+	// BindDeferred wires the session's AddDeferredTool callback so lazily loaded
+	// skill-gated MCP tools can register into the live session without mutating
+	// model-visible tool schemas (zero prompt-cache bust).
+	BindDeferred func(add func(actool.CoreTool))
 }
 
 // ToolAugment, if set, returns the EXTRA tools an agent should see beyond its
@@ -64,6 +68,19 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 	out, def.FindingGuidance = findingWorkflowTools(agentKey, out)
 	for i, t := range out {
 		out[i] = guardPanic(t)
+	}
+	if def.BindDeferred != nil {
+		origBind := def.BindDeferred
+		def.BindDeferred = func(add func(actool.CoreTool)) {
+			if add == nil {
+				return
+			}
+			origBind(func(t actool.CoreTool) {
+				if t != nil {
+					add(guardPanic(t))
+				}
+			})
+		}
 	}
 	return out, def, cleanup
 }

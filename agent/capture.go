@@ -243,13 +243,22 @@ func firstLine(s string, max int) string {
 	return s
 }
 
-// Preserve the recorded session's visible messages, excluding thinking blocks.
-// This is audit context; the judge receives only bounded, paired execution
-// evidence selected from it, never assistant prose or thinking blocks.
+const maxApprovalHistoryEntries = 24
+
+// Preserve the recorded session's most recent visible messages, excluding
+// thinking blocks. Scanning backwards bounds work to O(maxApprovalHistoryEntries)
+// even on long histories. This is audit context; the judge receives only
+// bounded, paired execution evidence selected from it, never assistant prose
+// or thinking blocks.
 func approvalHistory(messages []llm.Message) []db.InterceptContextEntry {
-	var entries []db.InterceptContextEntry
-	for _, message := range messages {
-		for _, block := range message.Content {
+	if len(messages) == 0 {
+		return nil
+	}
+	entries := make([]db.InterceptContextEntry, 0, min(len(messages), maxApprovalHistoryEntries))
+	for i := len(messages) - 1; i >= 0 && len(entries) < maxApprovalHistoryEntries; i-- {
+		message := messages[i]
+		for j := len(message.Content) - 1; j >= 0 && len(entries) < maxApprovalHistoryEntries; j-- {
+			block := message.Content[j]
 			entry := db.InterceptContextEntry{Kind: string(message.Role)}
 			switch block.Type {
 			case llm.BlockText:
@@ -263,6 +272,9 @@ func approvalHistory(messages []llm.Message) []db.InterceptContextEntry {
 			}
 			entries = append(entries, entry)
 		}
+	}
+	for l, r := 0, len(entries)-1; l < r; l, r = l+1, r-1 {
+		entries[l], entries[r] = entries[r], entries[l]
 	}
 	return entries
 }

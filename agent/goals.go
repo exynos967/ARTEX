@@ -138,6 +138,7 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 		tools = append(tools, tsx.addTaskScope())
 		sys += goalsScopeTail
 	}
+	system, boundary := deferredSystem(sys, DeferredInfo{})
 	userMsg := "任务目标：\n" + goalText
 	if d := strings.TrimSpace(desc); d != "" {
 		userMsg += "\n\n任务描述（背景信息，可能含靶标范围/flag 数量/交战说明；仅供参考，不要臆造其中未提及的内容）：\n" + d
@@ -152,7 +153,8 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	}
 	captureRun(ctx, agentcore.Options{
 		Provider:               prov,
-		SystemPrompt:           []string{sys},
+		SystemPrompt:           system,
+		DynamicBoundary:        boundary,
 		Tools:                  tools,
 		PermissionMode:         acperm.ModeBypass,
 		DisableBackgroundTasks: true,

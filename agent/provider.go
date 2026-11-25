@@ -342,6 +342,7 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 	// a session-keyed prompt cache wants. Skipped when no session id is present.
 	if t.sessionHeaderKey != "" {
 		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
+			req = req.Clone(req.Context())
 			req.Header.Set(t.sessionHeaderKey, sid)
 		}
 	}
@@ -350,7 +351,7 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 	// them: norma builds the request body internally and decodes the SSE response
 	// before either reaches the recorder.
 	capt := llmrec.CaptureFrom(req.Context())
-	if capt != nil {
+	if capt != nil && capt.RawRequest() == "" {
 		capt.SetRequest(requestBodySnapshot(req))
 	}
 
@@ -366,7 +367,8 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if resp.StatusCode != http.StatusTooManyRequests {
 		return resp, nil
 	}
-	body, readErr := io.ReadAll(resp.Body)
+	const maxQuotaErrorBodyBytes = 256 << 10
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxQuotaErrorBodyBytes))
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
@@ -382,7 +384,9 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 
 // requestBodySnapshot copies an outgoing request body without consuming it.
 // norma builds every model request from a *bytes.Reader, so net/http populates
-// GetBody and the copy has no effect on what gets sent.
+// GetBody and the copy has no effect on what gets sent. Reading is bounded to
+// MaxCaptureRequestBytes+1 so giant payloads never allocate unbounded copies,
+// while still letting Capture.SetRequest detect overflow and append the marker.
 func requestBodySnapshot(req *http.Request) string {
 	if req.GetBody == nil {
 		return ""
@@ -392,7 +396,7 @@ func requestBodySnapshot(req *http.Request) string {
 		return ""
 	}
 	defer rc.Close()
-	b, err := io.ReadAll(rc)
+	b, err := io.ReadAll(io.LimitReader(rc, llmrec.MaxCaptureRequestBytes+1))
 	if err != nil {
 		return ""
 	}
@@ -401,6 +405,9 @@ func requestBodySnapshot(req *http.Request) string {
 
 func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 32
+	transport.IdleConnTimeout = 60 * time.Second
+	transport.TLSHandshakeTimeout = 10 * time.Second
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
 		transport.Proxy = nil // 留空=直连,不回退 HTTP_PROXY/HTTPS_PROXY 环境变量

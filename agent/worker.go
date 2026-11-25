@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -299,12 +301,147 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
-func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
+// workerSystemStatic renders the cross-worker cacheable static prefix of the
+// worker system prompt (role body + recording traffic spec + completion spec).
+// Per-intent details (runDir, constraints, intent mandate, target assets) are
+// placed after DynamicBoundary via buildWorkerSystemPrompt so all concurrent
+// workers share one identical static prefix.
+func workerSystemStatic(proxyAddr, caCert, dataDir string) string {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + workerCompletionSpec
+	return body + workerTrafficBlock(caCert != "") + workerCompletionSpec
+}
+
+func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
+	return workerSystemStatic(proxyAddr, caCert, dataDir) + workerArtifactSpec(runDir)
+}
+
+// buildWorkerSystemPrompt splits the worker system prompt at DynamicBoundary:
+//   - Static prefix (before DynamicBoundary): role prompt + traffic block +
+//     completion spec + FindingGuidance (+ local static ExecutionGuidance) +
+//     <available-deferred-tools>. Byte-identical across all concurrent workers.
+//   - Dynamic suffix (after DynamicBoundary, still in SystemPrompt so immune to
+//     conversation compaction): remote ExecutionGuidance (per-node/per-intent),
+//     per-intent workerArtifactSpec(runDir), constraints, intent mandate,
+//     deterministic target assets JSON, and <artex-dynamic-time>.
+func buildWorkerSystemPrompt(proxyAddr, caCert, dataDir, runDir, constraints string, intent *db.Node, assets []*db.Asset, def DeferredInfo) ([]string, int) {
+	staticSys := workerSystemStatic(proxyAddr, caCert, dataDir)
+	var dynamicBlocks []string
+	dynamicBlocks = append(dynamicBlocks, workerArtifactSpec(runDir))
+	if constraints != "" {
+		dynamicBlocks = append(dynamicBlocks, constraints)
+	}
+	var intentSection strings.Builder
+	intentSection.WriteString(renderIntentTask(intent))
+	if len(assets) > 0 {
+		if b, err := marshalWorkerPromptAssets(assets); err == nil && len(b) > 0 {
+			intentSection.WriteString("\n\n本意图 asset_ids 对应的目标资产：\n")
+			intentSection.Write(b)
+		}
+	}
+	intentSection.WriteString("\n\n需要主 Agent 查证、判断或协调时调用 ask_main_agent；它立即返回回执，你继续独立工作，答复稍后通过 steering 注入。不要轮询等待或把回复当作人类授权。")
+	intentSection.WriteString("\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。")
+	dynamicBlocks = append(dynamicBlocks, intentSection.String())
+	return deferredSystemWithDynamic(staticSys, def, dynamicBlocks...)
+}
+
+// marshalWorkerPromptAssets serializes target assets deterministically for the
+// worker's post-boundary system segment: sorted by id ASC, volatile timestamps
+// (last_seen / updated_at) stripped, and set-like slices sorted, so enrichment
+// or sibling workers touching last_seen never invalidate prompt stability on resume.
+func marshalWorkerPromptAssets(assets []*db.Asset) ([]byte, error) {
+	if len(assets) == 0 {
+		return nil, nil
+	}
+	sorted := make([]*db.Asset, len(assets))
+	copy(sorted, assets)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i] == nil {
+			return false
+		}
+		if sorted[j] == nil {
+			return true
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+	out := make([]map[string]any, 0, len(sorted))
+	for _, a := range sorted {
+		if a == nil {
+			continue
+		}
+		raw, err := json.Marshal(a)
+		if err != nil {
+			return nil, err
+		}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			return nil, err
+		}
+		stripVolatileAssetFields(m)
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(out)
+}
+
+func stripVolatileAssetFields(v any) {
+	switch x := v.(type) {
+	case map[string]any:
+		delete(x, "last_seen")
+		delete(x, "updated_at")
+		for k, val := range x {
+			switch k {
+			case "task_ids":
+				sortJSONNumberSlice(val)
+			case "bound_domains", "record_value", "technologies":
+				sortJSONStringSlice(val)
+			default:
+				stripVolatileAssetFields(val)
+			}
+		}
+		if extra, ok := x["extra"].(map[string]any); ok && len(extra) == 0 {
+			delete(x, "extra")
+		}
+	case []any:
+		for _, elem := range x {
+			stripVolatileAssetFields(elem)
+		}
+	}
+}
+
+func sortJSONStringSlice(v any) {
+	arr, ok := v.([]any)
+	if !ok || len(arr) < 2 {
+		return
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		si, _ := arr[i].(string)
+		sj, _ := arr[j].(string)
+		return si < sj
+	})
+}
+
+func sortJSONNumberSlice(v any) {
+	arr, ok := v.([]any)
+	if !ok || len(arr) < 2 {
+		return
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		ni, _ := arr[i].(json.Number)
+		nj, _ := arr[j].(json.Number)
+		vi, ei := ni.Int64()
+		vj, ej := nj.Int64()
+		if ei == nil && ej == nil {
+			return vi < vj
+		}
+		return ni.String() < nj.String()
+	})
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -414,9 +551,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	defer cleanup()
 
 	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
-	// 原始数据一起放进 system prompt：system 每次 run 都重新拼一遍、绝不会被 compaction 压掉，
-	// 长 run 里意图永远在场，续跑时也不依赖 transcript 历史是否留住那条首消息。代价是 system
-	// 混入 per-intent 易变数据、失去跨意图缓存复用；这是刻意的取舍（意图丢失比省 token 严重得多）。
+	// 原始数据一起放进 system prompt 的 DynamicBoundary 之后：既免疫 conversation compaction
+	// （长 run / 续跑时意图永远在场），又把静态角色/流量/收尾/deferred-tools 前缀留在边界之前，
+	// 让所有并发 worker 共享同一份静态提示词缓存；目标资产经确定性序列化剔除易变时间戳以保持续跑稳定。
 	// 与 planner「态势块放 user turn」分叉是有意的：planner 本身是产意图的那个、没有单一 mandate，
 	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
 	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
@@ -424,18 +561,15 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	var constraints string
 	if w.wantConstraints() {
-		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
+		constraints = constraintBlock(ts) // 操作约束(若有)注入系统提示动态段,worker 执行时严格遵守
 	}
-	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
-	sysBody += renderIntentTask(intent)
+	var targetAssets []*db.Asset
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
-				if b, err := json.Marshal(assets); err == nil {
-					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
-				}
+				targetAssets = assets
 				// 意图明确针对的这些资产 → 自动纳入任务测试范围（与 insertAssets 同一套
 				// 保守粒度）。upsertTaskScope 的 ON CONFLICT DO NOTHING + uq_task_scope
 				// 唯一索引保证不会重复添加；重跑/重试同样是幂等 no-op。
@@ -448,9 +582,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			}
 		}
 	}
-	sysBody += "\n\n需要主 Agent 查证、判断或协调时调用 ask_main_agent；它立即返回回执，你继续独立工作，答复稍后通过 steering 注入。不要轮询等待或把回复当作人类授权。"
-	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
-	system, boundary := deferredSystem(sysBody, def)
+	system, boundary := buildWorkerSystemPrompt(w.proxyAddr, w.proxyCACert, w.workDir, runDir, constraints, intent, targetAssets, def)
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
@@ -535,6 +667,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)
+	if def.BindDeferred != nil {
+		def.BindDeferred(s.AddDeferredTool)
+	}
 
 	// Resume prior conversation if this intent was paused/blocked/exhausted and is
 	// being re-run. The transcript ID is deterministic per intent, so if a prior

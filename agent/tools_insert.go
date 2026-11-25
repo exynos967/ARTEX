@@ -320,11 +320,15 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					}
 
 				case "endpoint":
+					svcIP := item.ServiceIP
+					if svcIP == "" {
+						svcIP = item.IP
+					}
 					id, err = t.as.UpsertEndpoint(db.UpsertEndpointReq{
 						URL:    item.URL,
 						Method: item.Method,
 						Params: item.Params,
-						IP:     item.ServiceIP,
+						IP:     svcIP,
 						TaskID: taskID,
 					})
 

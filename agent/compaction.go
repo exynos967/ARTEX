@@ -31,6 +31,22 @@ import (
 	"github.com/RC-CHN/ARTEX/norma/transcript"
 )
 
+type compactionLifecycleCtxKey struct{}
+
+// WithCompactionLifecycle attaches a long-lived lifecycle context (such as a
+// task runtime or engine shutdown context) to ctx. Compactor.OnPlannerRound
+// detaches from a single planner round's cancellation via context.WithoutCancel
+// while still cancelling background compactions as soon as lifecycle ends.
+func WithCompactionLifecycle(ctx, lifecycle context.Context) context.Context {
+	if lifecycle == nil {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, compactionLifecycleCtxKey{}, lifecycle)
+}
+
 // Compactor performs background cold-node compaction for many explorations.
 type Compactor struct {
 	prov     llm.Provider
@@ -41,8 +57,12 @@ type Compactor struct {
 	maxDur   time.Duration // hard cap on one background compaction
 
 	mu      sync.Mutex
+	baseCtx context.Context
+	closed  bool
 	running map[int64]bool
+	cancels map[int64]context.CancelFunc
 	lastRun map[int64]time.Time
+	wg      sync.WaitGroup
 }
 
 // NewCompactor builds a compactor. prov/model are used for the §4 body LLM call
@@ -57,14 +77,67 @@ func NewCompactor(prov llm.Provider, model string) *Compactor {
 		cooldown: 60 * time.Second,
 		maxDur:   5 * time.Minute,
 		running:  map[int64]bool{},
+		cancels:  map[int64]context.CancelFunc{},
 		lastRun:  map[int64]time.Time{},
 	}
+}
+
+// SetBaseContext binds background compactions launched by this Compactor to a
+// parent runtime context (e.g. task or engine context). Cancelling ctx aborts
+// all active compactions derived from it.
+func (c *Compactor) SetBaseContext(ctx context.Context) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.baseCtx = ctx
+	c.mu.Unlock()
+}
+
+// Stop cancels any in-flight background compaction for expID and clears its
+// tracking entries. Safe to call on a nil Compactor or unknown expID.
+func (c *Compactor) Stop(expID int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	cancel := c.cancels[expID]
+	delete(c.cancels, expID)
+	delete(c.lastRun, expID)
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// Close marks the compactor closed, cancels all in-flight background
+// compactions, and waits until every background goroutine exits. Safe to call
+// repeatedly or on a nil Compactor.
+func (c *Compactor) Close() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.closed = true
+	cancels := make([]context.CancelFunc, 0, len(c.cancels))
+	for id, cancel := range c.cancels {
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+		delete(c.cancels, id)
+	}
+	c.lastRun = map[int64]time.Time{}
+	c.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	c.wg.Wait()
 }
 
 // OnPlannerRound is the single entry the planner calls each wake-up. It bumps the
 // round, maintains the cold stamps synchronously, then (if a threshold is hit and
 // no compaction is running / cooling down) launches a background compaction that
-// outlives this planner round.
+// outlives this planner round while remaining bound to task/compactor lifecycle.
 func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore) {
 	if c == nil || c.prov == nil || ts == nil {
 		return
@@ -79,26 +152,35 @@ func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore)
 	if !needMinor && !needMajor {
 		return
 	}
-	if !c.tryStart(ts.ID()) {
-		return // already running, or within cooldown —派生态最终一致，下轮再压
-	}
-	go func() {
-		defer c.finish(ts.ID())
-		bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.maxDur)
-		defer cancel()
-		// 压缩是裸 provider 调用（compress 里直接 prov.Complete），不经过 agentcore
-		// 的会话循环，所以 ctx 上没有 session id；按 session-id 头做提示缓存/粘性
-		// 路由的网关（opencode zen 缺 x-opencode-session 直接 400）就收不到该头。
-		// 这里补一个按探索稳定的 id：同一探索的所有压缩请求共享它，既能带上头，
-		// 也让 llmrec 能把这次调用的 token 归因回该探索（此前记不到）。
-		bg = transcript.WithSessionID(bg, fmt.Sprintf("exp%d-compactor", ts.ID()))
+	c.launchBackground(ctx, ts.ID(), func(bg context.Context) {
 		if needMajor {
 			c.major(bg, ts)
 		} else {
 			c.minor(bg, ts)
 		}
-	}()
+	})
 	_ = round
+}
+
+// launchBackground starts fn in a tracked background goroutine for expID,
+// detaching from a single planner round's cancellation while remaining bound to
+// baseCtx, any compaction-lifecycle context on ctx, Stop(expID), and Close().
+func (c *Compactor) launchBackground(ctx context.Context, expID int64, fn func(context.Context)) bool {
+	bg, cancel, ok := c.startBackground(ctx, expID)
+	if !ok {
+		return false
+	}
+	go func() {
+		defer c.finishBackground(expID, cancel)
+		// 压缩是裸 provider 调用（compress 里直接 prov.Complete），不经过 agentcore
+		// 的会话循环，所以 ctx 上没有 session id；按 session-id 头做提示缓存/粘性
+		// 路由的网关（opencode zen 缺 x-opencode-session 直接 400）就收不到该头。
+		// 这里补一个按探索稳定的 id：同一探索的所有压缩请求共享它，既能带上头，
+		// 也让 llmrec 能把这次调用的 token 归因回该探索（此前记不到）。
+		bg = transcript.WithSessionID(bg, fmt.Sprintf("exp%d-compactor", expID))
+		fn(bg)
+	}()
+	return true
 }
 
 // maintain bumps round_no, recomputes hot/cold over the whole graph, and applies
@@ -146,6 +228,9 @@ func (c *Compactor) maintain(ts *db.ExplorationStore) (round int64, uncompressed
 // minor folds the not-yet-covered eligible-cold set into new digest segments
 // (tiered append, §5). Existing digests are untouched.
 func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
+	if ctx.Err() != nil {
+		return
+	}
 	round, err := ts.RoundNo()
 	if err != nil {
 		return
@@ -179,7 +264,13 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
 	for _, b := range blocks {
+		if ctx.Err() != nil {
+			return
+		}
 		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil))
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	// A minor may have pushed the segment count over M → merge in the same run.
 	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
@@ -193,6 +284,9 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 // new/changed blocks are compressed afresh. This is where tiered fragments of one
 // direction merge and where "later became connected" blocks unify (§5.2).
 func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
+	if ctx.Err() != nil {
+		return
+	}
 	round, err := ts.RoundNo()
 	if err != nil {
 		return
@@ -241,10 +335,16 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 			stale = append(stale, d.ID)
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if err := ts.SupersedeDigests(stale); err != nil {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
 	for _, b := range toCreate {
+		if ctx.Err() != nil {
+			return
+		}
 		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
 	}
 }
@@ -254,14 +354,26 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 // changed, so any member that has since gone hot (revived) is dropped from the
 // covers set. If the block dissolves below K it is skipped.
 func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int, generation int) {
+	if ctx.Err() != nil {
+		return
+	}
 	body, err := c.compress(ctx, g, b, nodeByID)
 	if err != nil {
-		log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
+		if ctx.Err() == nil {
+			var expID int64
+			if ts != nil {
+				expID = ts.ID()
+			}
+			log.Printf("[compaction] compress exp=%d block=%v: %v", expID, b.Members, err)
+		}
+		return
+	}
+	if ctx.Err() != nil || ts == nil {
 		return
 	}
 	// Re-read fresh state and drop any member that revived while we compressed.
 	fresh, _, err := loadColdStructure(ts)
-	if err != nil {
+	if err != nil || ctx.Err() != nil {
 		return
 	}
 	freshHot := fresh.hotSet()
@@ -276,6 +388,9 @@ func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *c
 	}
 	final := block{Members: members, Anchors: b.Anchors}
 	payload := digestPayload(body, final, nodeByID, generation, blockSignature(final, cvers))
+	if ctx.Err() != nil {
+		return
+	}
 	if _, err := ts.AddDigest(payload, members); err != nil {
 		log.Printf("[compaction] add digest exp=%d: %v", ts.ID(), err)
 	}
@@ -307,25 +422,77 @@ func (c *Compactor) generationFor(b block, active []*db.Node) int {
 	return best + 1
 }
 
-// tryStart acquires the per-task compaction lock, honoring the cooldown.
-func (c *Compactor) tryStart(expID int64) bool {
+// startBackground acquires the per-exploration compaction slot, honoring
+// closed state, parent lifecycle contexts, and cooldown, and registers the
+// goroutine in c.wg under c.mu so Close() can never race Add with Wait.
+func (c *Compactor) startBackground(ctx context.Context, expID int64) (context.Context, context.CancelFunc, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lifecycle, _ := ctx.Value(compactionLifecycleCtxKey{}).(context.Context)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return nil, nil, false
+	}
+	if c.baseCtx != nil && c.baseCtx.Err() != nil {
+		return nil, nil, false
+	}
+	if lifecycle != nil && lifecycle.Err() != nil {
+		return nil, nil, false
+	}
 	if c.running[expID] {
-		return false
+		return nil, nil, false
 	}
 	if t, ok := c.lastRun[expID]; ok && time.Since(t) < c.cooldown {
-		return false
+		return nil, nil, false
+	}
+
+	bg, rawCancel := context.WithTimeout(context.WithoutCancel(ctx), c.maxDur)
+	var stopBase, stopLifecycle func() bool
+	if c.baseCtx != nil {
+		stopBase = context.AfterFunc(c.baseCtx, rawCancel)
+	}
+	if lifecycle != nil && lifecycle != c.baseCtx {
+		stopLifecycle = context.AfterFunc(lifecycle, rawCancel)
+	}
+	cancel := func() {
+		rawCancel()
+		if stopBase != nil {
+			stopBase()
+		}
+		if stopLifecycle != nil {
+			stopLifecycle()
+		}
+	}
+
+	if c.running == nil {
+		c.running = map[int64]bool{}
+	}
+	if c.cancels == nil {
+		c.cancels = map[int64]context.CancelFunc{}
 	}
 	c.running[expID] = true
-	return true
+	c.cancels[expID] = cancel
+	c.wg.Add(1)
+	return bg, cancel, true
 }
 
-func (c *Compactor) finish(expID int64) {
+func (c *Compactor) finishBackground(expID int64, cancel context.CancelFunc) {
+	cancel()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.running[expID] = false
-	c.lastRun[expID] = time.Now()
+	_, active := c.cancels[expID]
+	delete(c.running, expID)
+	delete(c.cancels, expID)
+	if active && !c.closed {
+		if c.lastRun == nil {
+			c.lastRun = map[int64]time.Time{}
+		}
+		c.lastRun[expID] = time.Now()
+	}
+	c.mu.Unlock()
+	c.wg.Done()
 }
 
 // --- helpers: db ↔ coldgraph ---
@@ -535,10 +702,11 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 // runs on; thinking disabled (a pure summarization step).
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
 	req := llm.CompletionRequest{
-		System:    []string{compressionSystemPrompt},
-		Messages:  []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
-		MaxTokens: 1500,
-		Thinking:  "disabled",
+		System:          []string{compressionSystemPrompt},
+		DynamicBoundary: 1,
+		Messages:        []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
+		MaxTokens:       1500,
+		Thinking:        "disabled",
 	}
 	msg, _, _, err := c.prov.Complete(ctx, req)
 	if err != nil {

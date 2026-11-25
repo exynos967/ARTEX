@@ -3,7 +3,10 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -41,15 +44,41 @@ type Planner struct {
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
-	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
-	// session, but the shared store lets it record a serial exploit chain once and
-	// dispatch it step-by-step over rounds instead of front-loading it in parallel.
-	todoMu sync.Mutex
-	todos  map[int64]*actool.TodoStore
+	// planner's multi-step plan survives across wake-ups and session rotations.
+	// sessionEpoch tracks the active resumable transcript epoch per exploration
+	// (0 → exp<id>-planner, N → exp<id>-planner-r<N>).
+	// deltaState tracks fingerprints of cold_digests / coverage.scope / related_tasks
+	// delivered in the current epoch so resumed rounds re-emit them whenever they change.
+	todoMu       sync.Mutex
+	todos        map[int64]*actool.TodoStore
+	sessionEpoch map[int64]int
+	deltaState   map[int64]plannerDeltaState
 }
 
+type plannerDeltaState struct {
+	epoch       int
+	coldDigests string
+	scope       string
+	related     string
+}
+
+type plannerDeltaOpts struct {
+	includeColdDigests bool
+	includeScope       bool
+	includeRelated     bool
+}
+
+// plannerMaxSessionMessages caps the resumed planner transcript length before
+// rotating to a fresh baseline epoch, keeping context bounded across long tasks.
+const plannerMaxSessionMessages = 80
+
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
-	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}}
+	return &Planner{
+		prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns,
+		todos:        map[int64]*actool.TodoStore{},
+		sessionEpoch: map[int64]int{},
+		deltaState:   map[int64]plannerDeltaState{},
+	}
 }
 
 func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
@@ -279,6 +308,335 @@ func truncOutput(s string, n int) string {
 	return string(r[:n]) + " …（已截断，完整见 get_worker_output）"
 }
 
+// plannerSessionID returns the transcript / noa session ID for a planner epoch.
+// Epoch 0 keeps the canonical "exp<id>-planner" name; subsequent rotations append
+// "-r<epoch>" (still parsed as role="planner" by llmrec.parseSession).
+func plannerSessionID(expID int64, epoch int) string {
+	if epoch <= 0 {
+		return fmt.Sprintf("exp%d-planner", expID)
+	}
+	return fmt.Sprintf("exp%d-planner-r%d", expID, epoch)
+}
+
+func (p *Planner) plannerEpoch(expID int64) int {
+	p.todoMu.Lock()
+	defer p.todoMu.Unlock()
+	if p.sessionEpoch == nil {
+		p.sessionEpoch = map[int64]int{}
+	}
+	if epoch, ok := p.sessionEpoch[expID]; ok {
+		return epoch
+	}
+	epoch := 0
+	if p.tx != nil {
+		for {
+			if _, err := os.Stat(p.tx.MainPath(plannerSessionID(expID, epoch+1))); err != nil {
+				break
+			}
+			epoch++
+		}
+	}
+	p.sessionEpoch[expID] = epoch
+	return epoch
+}
+
+func (p *Planner) advancePlannerEpoch(expID int64) int {
+	p.todoMu.Lock()
+	defer p.todoMu.Unlock()
+	if p.sessionEpoch == nil {
+		p.sessionEpoch = map[int64]int{}
+	}
+	p.sessionEpoch[expID]++
+	return p.sessionEpoch[expID]
+}
+
+// shouldRotatePlannerSession reports whether a resumed planner transcript should
+// roll over to a fresh baseline epoch: when it grows past plannerMaxSessionMessages,
+// after an AutoCompact boundary (which drops the original baseline graph_overview),
+// or when a crashed prior round left no complete assistant turn at the tail.
+func shouldRotatePlannerSession(msgs []llm.Message) bool {
+	if len(msgs) == 0 {
+		return false
+	}
+	if len(msgs) >= plannerMaxSessionMessages {
+		return true
+	}
+	if llm.LastBoundaryIndex(msgs) >= 0 {
+		return true
+	}
+	cleaned := msgs
+	for len(cleaned) > 0 {
+		last := cleaned[len(cleaned)-1]
+		if last.Role == llm.RoleAssistant && len(last.ToolUses()) > 0 {
+			cleaned = cleaned[:len(cleaned)-1]
+			continue
+		}
+		break
+	}
+	if len(cleaned) == 0 {
+		return true
+	}
+	return cleaned[len(cleaned)-1].Role != llm.RoleAssistant
+}
+
+func capAnySlice(v any, limit int) any {
+	if limit <= 0 || v == nil {
+		return v
+	}
+	switch s := v.(type) {
+	case []map[string]any:
+		if len(s) > limit {
+			return s[:limit]
+		}
+		return s
+	case []any:
+		if len(s) > limit {
+			return s[:limit]
+		}
+		return s
+	default:
+		return v
+	}
+}
+
+func jsonFingerprint(v any) string {
+	if v == nil {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func overviewDeltaState(epoch int, overview map[string]any) plannerDeltaState {
+	st := plannerDeltaState{epoch: epoch}
+	if overview == nil {
+		return st
+	}
+	cd, hasCD := overview["cold_digests"]
+	cm, hasCM := overview["cold_digests_more"]
+	if hasCD || hasCM {
+		st.coldDigests = jsonFingerprint(struct {
+			Digests any `json:"d,omitempty"`
+			More    any `json:"m,omitempty"`
+		}{Digests: cd, More: cm})
+	}
+	if cov, ok := overview["coverage"].(map[string]any); ok {
+		if scope, exists := cov["scope"]; exists {
+			st.scope = jsonFingerprint(scope)
+		}
+	}
+	if rel, ok := overview["related_tasks"]; ok {
+		st.related = jsonFingerprint(rel)
+	}
+	return st
+}
+
+func (p *Planner) prepareDeltaOpts(expID int64, epoch int, resumed bool, overview map[string]any) plannerDeltaOpts {
+	cur := overviewDeltaState(epoch, overview)
+	p.todoMu.Lock()
+	defer p.todoMu.Unlock()
+	if p.deltaState == nil {
+		p.deltaState = map[int64]plannerDeltaState{}
+	}
+	if !resumed {
+		p.deltaState[expID] = cur
+		return plannerDeltaOpts{}
+	}
+	prev, ok := p.deltaState[expID]
+	sameEpoch := ok && prev.epoch == epoch
+	opts := plannerDeltaOpts{
+		includeColdDigests: (!sameEpoch && cur.coldDigests != "") || (sameEpoch && cur.coldDigests != prev.coldDigests),
+		includeScope:       (!sameEpoch && cur.scope != "") || (sameEpoch && cur.scope != prev.scope),
+		includeRelated:     (!sameEpoch && cur.related != "") || (sameEpoch && cur.related != prev.related),
+	}
+	p.deltaState[expID] = cur
+	return opts
+}
+
+// noaSessionCompressed reports whether a noa archive directory for sessionID
+// already has compressed blocks (or unreadable/corrupt state.json), meaning the
+// original baseline graph_overview may have been folded and the planner should
+// rotate to a fresh epoch.
+func noaSessionCompressed(workDir, sessionID string) bool {
+	if workDir == "" || sessionID == "" {
+		return false
+	}
+	raw, err := os.ReadFile(filepath.Join(workDir, "noa", sessionID, "state.json"))
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	var st struct {
+		Blocks []struct {
+			Active bool `json:"active"`
+		} `json:"blocks"`
+		Stats struct {
+			CompressionCount int `json:"compressionCount"`
+		} `json:"stats"`
+	}
+	if json.Unmarshal(raw, &st) != nil {
+		return true
+	}
+	if st.Stats.CompressionCount > 0 {
+		return true
+	}
+	for _, b := range st.Blocks {
+		if b.Active {
+			return true
+		}
+	}
+	return false
+}
+
+// plannerDeltaData extracts a compact live-state subset of graph_overview for
+// resumed planner rounds. Round 1 already delivered the full task description,
+// inherited related_tasks blackboard, cold_digests, and detailed coverage;
+// subsequent rounds only append live counts, active/recent intents, goals/hints,
+// latest findings/facts, and any changed cold_digests / coverage.scope / related_tasks.
+func plannerDeltaData(overview map[string]any) map[string]any {
+	return plannerDeltaDataWithOpts(overview, plannerDeltaOpts{includeColdDigests: true})
+}
+
+func plannerDeltaDataWithOpts(overview map[string]any, opts plannerDeltaOpts) map[string]any {
+	delta := map[string]any{}
+	for _, key := range []string{
+		"goals", "hints",
+		"frontier_open", "running_intents_total", "running_intents_truncated",
+		"done_intents_total", "findings_total", "facts",
+		"open_intents", "running_intents",
+		"incomplete", "totals_unavailable", "query_errors", "next_action",
+	} {
+		if val, ok := overview[key]; ok {
+			delta[key] = val
+		}
+	}
+	if opts.includeColdDigests {
+		if val, ok := overview["cold_digests"]; ok {
+			delta["cold_digests"] = val
+		} else {
+			delta["cold_digests"] = []any{}
+		}
+		if val, ok := overview["cold_digests_more"]; ok {
+			delta["cold_digests_more"] = val
+		}
+	}
+	if opts.includeRelated {
+		if val, ok := overview["related_tasks"]; ok {
+			delta["related_tasks"] = val
+		} else {
+			delta["related_tasks"] = []any{}
+		}
+	}
+	if val, ok := overview["recent_done_intents"]; ok {
+		delta["recent_done_intents"] = capAnySlice(val, 6)
+	}
+	if val, ok := overview["finding_list"]; ok {
+		delta["finding_list"] = capAnySlice(val, 5)
+	}
+	if val, ok := overview["recent_facts"]; ok {
+		delta["recent_facts"] = capAnySlice(val, 5)
+	}
+	if cov, ok := overview["coverage"].(map[string]any); ok && len(cov) > 0 {
+		compactCov := map[string]any{}
+		for _, k := range []string{"pct", "tested", "denominator", "status", "host_count"} {
+			if v, exists := cov[k]; exists {
+				compactCov[k] = v
+			}
+		}
+		if opts.includeScope {
+			if v, exists := cov["scope"]; exists {
+				compactCov["scope"] = v
+			}
+		}
+		if len(compactCov) > 0 {
+			delta["coverage"] = compactCov
+		}
+	}
+	return delta
+}
+
+// renderPlannerDelta formats the compact incremental state summary appended on
+// resumed planner wake-ups (len(s.Messages()) > 0).
+func renderPlannerDelta(data map[string]any, opts plannerDeltaOpts) string {
+	b, err := json.Marshal(plannerDeltaDataWithOpts(data, opts))
+	if err != nil {
+		return ""
+	}
+	return "\n\n【本轮增量态势摘要（已续接上一轮规划上下文；仅列出当前活跃/最新状态，如需完整全局态势或历史细节请调用 graph_overview / node_detail / list_facts / list_findings）】：\n" + string(b)
+}
+
+func buildPlannerRoundInput(resumed bool, lead, triggersText string, overview map[string]any, deltaOpts plannerDeltaOpts, finalDirective string, todos []actool.Todo) string {
+	var situational string
+	if resumed {
+		situational = triggersText + renderPlannerDelta(overview, deltaOpts) + finalDirective
+	} else {
+		situational = triggersText + renderGraphOverview(overview) + finalDirective
+	}
+	return lead + situational + "\n\n据上面的态势，判定目标。目标已【真正达成】（已拿到目标成果/已确认目标漏洞）时用 prove_goal 逐个标记。**硬底线：只要目标尚未达成、且当前没有任何 open 或 running 意图（frontier_open=0 且 running_intents 为空），本轮就必须产出至少一个向目标推进的意图——此时没有在跑的 work 可等、也没有在排队的方向，产出 0 意图=任务停摆。仅当已有 open/running 意图在推进、或目标已达成时，本轮才可以不产出新意图。**" +
+		"\n复查待领取的 open 意图：已过时、重复或因其他工作完成而不再必要的，使用 cancel_pending_intent 写明原因后关闭。若返回状态冲突，重新查看态势，不要把它当作已取消。" +
+		renderPlannerTodos(todos)
+}
+
+func (p *Planner) runPlannerSession(ctx context.Context, expID int64, opts agentcore.Options, def DeferredInfo, lead, triggersText string, overview map[string]any, finalDirective string, emit func(db.Activity)) (string, error) {
+	sessionID := ""
+	epoch := 0
+	if p.tx != nil {
+		epoch = p.plannerEpoch(expID)
+		sessionID = plannerSessionID(expID, epoch)
+		rotate := false
+		if recs, loadErr := p.tx.Load(p.tx.MainPath(sessionID)); loadErr == nil {
+			priorMsgs, _ := transcript.Messages(recs)
+			if shouldRotatePlannerSession(priorMsgs) || noaSessionCompressed(p.workDir, sessionID) {
+				rotate = true
+			}
+		} else if !errors.Is(loadErr, os.ErrNotExist) {
+			rotate = true
+		}
+		if rotate {
+			epoch = p.advancePlannerEpoch(expID)
+			sessionID = plannerSessionID(expID, epoch)
+		}
+		opts.Transcript = p.tx
+		opts.SessionID = sessionID
+	}
+	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
+	noaSession := sessionID
+	if noaSession == "" {
+		noaSession = plannerSessionID(expID, epoch)
+	}
+	enableNoa(&opts, p.noaEnabledFn, p.workDir, noaSession, noaWarn(noaSession))
+
+	s := agentcore.NewSession(opts)
+	defer s.Close()
+	if def.BindDeferred != nil {
+		def.BindDeferred(s.AddDeferredTool)
+	}
+	if p.tx != nil {
+		_ = s.Resume(opts.SessionID)
+	}
+	resumed := len(s.Messages()) > 0
+	if resumed {
+		seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
+	}
+	deltaOpts := p.prepareDeltaOpts(expID, epoch, resumed, overview)
+	var todoItems []actool.Todo
+	if opts.Todos != nil {
+		todoItems = opts.Todos.List()
+	}
+	input := buildPlannerRoundInput(resumed, lead, triggersText, overview, deltaOpts, finalDirective, todoItems)
+	// MaxDuration 现在会在墙钟到点打断在跑工具并就地进收尾(在活 ctx 上),单轮卡死不再
+	// 绕过收尾,无需外部硬 ctx 兜底。ctx 只承载 pause / kill / shutdown。
+	text, _, err := captureFinalSession(ctx, s, input, func(r db.Activity) {
+		if emit != nil {
+			r.Worker = "planner" // planner activity has no intent_id (it generates them)
+			emit(r)
+		}
+	})
+	return text, err
+}
+
 // renderGraphOverview folds the pre-computed graph_overview snapshot into the
 // wake-up prompt so the planner starts each round with the full situation in
 // hand — saving the round-trip it would otherwise spend calling the tool. It is
@@ -382,24 +740,27 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	defer releaseExecution()
 	tools, def, cleanup := AugmentTools(ctx, "planner", base)
 	defer cleanup()
-	// 关键态势（刚完成的意图 + 预取的完整图）改放【本轮 user 输入】(见下方 input)，system
-	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
-	// 被 compaction 压缩（planner 单轮通常短，风险低）。situational 会拼进下方 input。
-	situational := renderTriggers(ts, triggers) + renderGraphOverview(tsx.graphOverviewData())
+	// 关键态势（刚完成的意图 + 预取态势）放进本轮 user 输入：首轮下发完整 graph_overview，
+	// 后续唤醒续接同一 planner 会话并只追加紧凑增量摘要，避免每次唤醒改写 messages[0] 破坏缓存。
+	overview := tsx.graphOverviewData()
+	triggersText := renderTriggers(ts, triggers)
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
-	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入(随 situational),让它只做最后
-	// 目标判定、不产新意图。
+	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入,让它只做最后目标判定、不产新意图。
 	tc := taskClockFrom(ctx)
+	finalDirective := ""
 	if tc.Final {
-		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + resolveTaskTimeoutWrapup("planner")
+		finalDirective = "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + resolveTaskTimeoutWrapup("planner")
 	}
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
 	sysBody := plannerSystem(goal, p.workDir, taskDir)
+	var dynamicBlocks []string
 	if p.wantConstraints() {
-		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
+		if cb := constraintBlock(ts); cb != "" {
+			dynamicBlocks = append(dynamicBlocks, cb) // 操作约束(若有)放动态系统段,不破坏静态缓存前缀
+		}
 	}
-	system, boundary := deferredSystem(sysBody, def)
+	system, boundary := deferredSystemWithDynamic(sysBody, def, dynamicBlocks...)
 	// planner 无自身墙钟预算;有 deadline 时把 MaxDuration 夹逼到剩余,让在跑的规划轮在
 	// 任务到点时进收尾(因超时→任务超时词,因步数→per-run 词)。
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, 0)
@@ -435,7 +796,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		MaxTurns:              p.maxTurns, // 0 = unlimited (configurable in agent management)
 		MaxDuration:           maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
 		Compaction:            compactionConfig(p.compactionWindow()),
-		// 跨唤醒共享的规划待办：让串行链在多轮之间保留（session 是新的，store 不是）。
+		// 跨唤醒共享的规划待办：让串行链在多轮之间保留（session 轮转后仍不丢）。
 		Todos: p.todoFor(ts.ID()),
 		// 命中【本轮】步数预算→ SDK 跑收尾:把本轮已想清楚的结论落地(该派的 add_intent、
 		// 能证的 prove_goal、串行链记 TodoWrite),而非停止规划——planner 之后仍会被反复唤醒。
@@ -444,15 +805,6 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
-	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
-		opts.Transcript = p.tx
-		opts.SessionID = fmt.Sprintf("exp%d-planner", ts.ID())
-	}
-	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
-	noaSession := fmt.Sprintf("exp%d-planner", ts.ID())
-	enableNoa(&opts, p.noaEnabledFn, p.workDir, noaSession, noaWarn(noaSession))
-	// 态势（刚完成的意图 + 完整图）现在拼进本轮 user 输入（见下方 input）。user 里还有
-	// 指令 + 跨唤醒待办（todo 是模型自己的规划便签，可再生，放 user 即可）。
 	// 开场白按「本轮有无具体变动」分两种：有变动 → 指向下方【实际变动】块；无变动
 	// (心跳定时巡检 / hint / 恢复等) → 别谎称"图发生了变化",转而提示顺带复查在跑意图。
 	lead := "刚有具体变动（见下面的【本次触发本轮的实际变动】），据此规划下一步："
@@ -464,17 +816,6 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 			lead = "本轮是**定时巡检（心跳到点）**的唤醒,且当前**已没有任何 open 或 running 的意图**——没有 worker 在跑、也没有排队中的方向,探索已停摆。你**必须**在本轮产出一个或多个向目标推进、且与图中既有意图**互不重复**的新意图(不得产出 0 意图);先据下面的态势判定目标是否已达成,未达成则立即补方向："
 		}
 	}
-	input := lead + situational + "\n\n据上面的态势，判定目标。目标已【真正达成】（已拿到目标成果/已确认目标漏洞）时用 prove_goal 逐个标记。**硬底线：只要目标尚未达成、且当前没有任何 open 或 running 意图（frontier_open=0 且 running_intents 为空），本轮就必须产出至少一个向目标推进的意图——此时没有在跑的 work 可等、也没有在排队的方向，产出 0 意图=任务停摆。仅当已有 open/running 意图在推进、或目标已达成时，本轮才可以不产出新意图。**" +
-		"\n复查待领取的 open 意图：已过时、重复或因其他工作完成而不再必要的，使用 cancel_pending_intent 写明原因后关闭。若返回状态冲突，重新查看态势，不要把它当作已取消。" +
-		renderPlannerTodos(opts.Todos.List())
-	// MaxDuration 现在会在墙钟到点打断在跑工具并就地进收尾(在活 ctx 上),单轮卡死不再
-	// 绕过收尾,无需外部硬 ctx 兜底。ctx 只承载 pause / kill / shutdown。
-	_, _, err = captureRun(ctx, opts, input,
-		func(r db.Activity) {
-			if emit != nil {
-				r.Worker = "planner" // planner activity has no intent_id (it generates them)
-				emit(r)
-			}
-		})
+	_, err = p.runPlannerSession(ctx, ts.ID(), opts, def, lead, triggersText, overview, finalDirective, emit)
 	return tsx.GoalMet, tsx.Reason, err
 }

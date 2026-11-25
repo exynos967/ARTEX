@@ -237,6 +237,9 @@ func (m *MainAgent) chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	}
 	s := agentcore.NewSession(opts)
 	defer s.Close()
+	if def.BindDeferred != nil {
+		def.BindDeferred(s.AddDeferredTool)
+	}
 	// reload the prior conversation from the transcript so the agent has context
 	// across turns (each Chat is a fresh session; without this it can't see earlier
 	// messages). First turn: no file yet → Resume loads nothing and proceeds.
