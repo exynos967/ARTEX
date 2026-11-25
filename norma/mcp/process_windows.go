@@ -58,3 +58,12 @@ func killStdioProcess(cmd *exec.Cmd, done <-chan struct{}) error {
 	}
 	return nil
 }
+
+// killStdioAfterEOF terminates the child tree on Windows if the leader has not
+// already exited on EOF (Windows has no PGID pin once the leader PID is reaped).
+func killStdioAfterEOF(cmd *exec.Cmd, done <-chan struct{}, leaderExited bool) error {
+	if leaderExited {
+		return nil
+	}
+	return killStdioProcess(cmd, done)
+}

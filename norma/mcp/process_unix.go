@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	stdioTermGraceTimeout = 2 * time.Second
-	stdioTermPollInterval = 50 * time.Millisecond
+	stdioTermGraceTimeout = 1500 * time.Millisecond
+	stdioTermPollInterval = 20 * time.Millisecond
 )
 
 func configureStdioProcess(cmd *exec.Cmd) {
@@ -30,8 +30,9 @@ func configureStdioProcessWithDone(cmd *exec.Cmd, done <-chan struct{}) {
 
 // killStdioProcess gracefully shuts down the subprocess's entire process group:
 // sends SIGTERM to -pgid first so Node/Playwright MCP servers have time to close
-// Chromium child trees cleanly, watching done and polling up to 2s before
-// escalating to SIGKILL. Never signals -pgid once done has closed (pid reaped).
+// Chromium child trees cleanly, polling until the entire group exits before
+// escalating to SIGKILL. Never signals -pgid if done was already closed before
+// entry (reaped leader / potentially recycled PID).
 func killStdioProcess(cmd *exec.Cmd, done <-chan struct{}) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
@@ -43,13 +44,28 @@ func killStdioProcess(cmd *exec.Cmd, done <-chan struct{}) error {
 		default:
 		}
 	}
-	pid := cmd.Process.Pid
+	return signalStdioProcessGroup(cmd.Process.Pid)
+}
+
+// killStdioAfterEOF tears down the subprocess's process group after stdin EOF.
+// Even if the leader already exited and was reaped on EOF, POSIX/Linux keeps
+// the PGID reserved as long as any descendant remains in the group, so
+// signalling -pgid cleans up orphaned children (or returns ESRCH immediately if
+// the group is already empty).
+func killStdioAfterEOF(cmd *exec.Cmd, _ <-chan struct{}, _ bool) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	return signalStdioProcessGroup(cmd.Process.Pid)
+}
+
+func signalStdioProcessGroup(pid int) error {
 	if pid <= 0 {
 		return nil
 	}
 	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
+			return nil
 		}
 		return err
 	}
@@ -62,18 +78,7 @@ func killStdioProcess(cmd *exec.Cmd, done <-chan struct{}) error {
 			return nil
 		}
 		select {
-		case <-done:
-			// Leader has been reaped by cmd.Wait(); do NOT signal -pid after reap
-			// to prevent any PID-reuse kill hazard.
-			return nil
 		case <-deadline.C:
-			if done != nil {
-				select {
-				case <-done:
-					return nil
-				default:
-				}
-			}
 			err := syscall.Kill(-pid, syscall.SIGKILL)
 			if errors.Is(err, syscall.ESRCH) {
 				return nil

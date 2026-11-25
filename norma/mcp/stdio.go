@@ -31,13 +31,13 @@ type stdioCloser struct {
 
 func (s *stdioCloser) Close() error {
 	s.once.Do(func() {
-		// Check whether cmd.Wait() has already reaped the process BEFORE closing
-		// stdin or signalling anything so a recycled PID is never signalled.
-		exited := false
+		// Check whether cmd.Wait() had ALREADY reaped the process BEFORE Close()
+		// was invoked so a long-dead recycled PID is never signalled.
+		exitedBeforeClose := false
 		if s.done != nil {
 			select {
 			case <-s.done:
-				exited = true
+				exitedBeforeClose = true
 			default:
 			}
 		}
@@ -45,23 +45,25 @@ func (s *stdioCloser) Close() error {
 		if s.stdin != nil {
 			_ = s.stdin.Close()
 		}
-		// 2. Briefly wait for a clean EOF-driven exit before signalling the process/group.
-		if !exited && s.done != nil {
+		// 2. Briefly wait for a clean EOF-driven leader exit before signalling.
+		leaderExited := exitedBeforeClose
+		if !exitedBeforeClose && s.done != nil {
 			timer := time.NewTimer(stdioEOFGraceTimeout)
 			select {
 			case <-s.done:
-				exited = true
+				leaderExited = true
 			case <-timer.C:
 			}
 			timer.Stop()
 		}
-		// 3. Only signal the process group / child tree while the child is still
-		// unreaped (done not closed), avoiding any post-reap PID-reuse kill hazard.
-		if !exited && s.cmd != nil && s.cmd.Process != nil {
-			_ = killStdioProcess(s.cmd, s.done)
+		// 3. Even when the leader exits promptly on stdin EOF, spawned descendants
+		// can still be alive inside the process group (-pgid on Unix). As long as
+		// the child was live at Close() entry, tear down the remaining group/tree.
+		if !exitedBeforeClose && s.cmd != nil && s.cmd.Process != nil {
+			_ = killStdioAfterEOF(s.cmd, s.done, leaderExited)
 		}
 		// 4. Wait up to 3s for the single Wait() owner goroutine to reap the process.
-		if !exited && s.done != nil {
+		if !leaderExited && s.done != nil {
 			timer := time.NewTimer(stdioWaitCloseTimeout)
 			select {
 			case <-s.done:
