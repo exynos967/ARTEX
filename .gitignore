@@ -62,6 +62,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+!.env.*.example
 
 # 私有部署覆盖与本地工具状态（不提交）
 /deploy/private/
