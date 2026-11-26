@@ -61,6 +61,7 @@ type Worker struct {
 	workDir           string
 	proxyAddr         string
 	proxyCACert       string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
+	proxyStrict       bool              // disable WebFetch direct fallback when global egress proxy is active
 	webSearch         WebSearchOpts     // web_search tool backend selection (off by default)
 	tx                *transcript.Store // raw LLM conversation persistence (nil = off)
 	window            int               // context window in tokens (for compaction)
@@ -193,20 +194,26 @@ func (w *Worker) compactionWindow() int {
 // that MITM proxy. Empty addr disables the hint.
 func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = addr, caCert }
 
+// SetProxyStrict disables WebFetch's direct no-proxy fallback (fail closed when
+// a global egress proxy is configured).
+func (w *Worker) SetProxyStrict(strict bool) { w.proxyStrict = strict }
+
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
 
-// proxyEnv builds the Bash-subprocess env that routes child-command HTTP through
-// the egress proxy (the recording MITM when capture is on, or the global proxy
+// ProxyEnv builds the subprocess env that routes child-command HTTP through the
+// egress proxy (the recording MITM when capture is on, or the global proxy
 // directly when it is off) and, only when a MITM CA is present, makes the common
 // toolchain trust it — so tools need no manual -x/--proxy/-k. Each ecosystem reads
 // a different CA var (verified empirically): SSL_CERT_FILE→curl/urllib/Go/openssl,
 // REQUESTS_CA_BUNDLE→python requests (it ignores SSL_CERT_FILE), CURL_CA_BUNDLE→curl,
-// GIT_SSL_CAINFO→git, NODE_EXTRA_CA_CERTS→node; NODE_USE_ENV_PROXY makes Node 24+
+// GIT_SSL_CAINFO→git, NODE_EXTRA_CA_CERTS→node; NODE_USE_ENV_PROXY makes Node 22.21+/24+
 // honor the proxy vars. ALL_PROXY is set too so a socks5 egress proxy (which curl
 // only reads from ALL_PROXY, not HTTP(S)_PROXY) works in the capture-off path.
+// NO_PROXY/no_proxy are explicitly cleared so host bypass rules cannot leak
+// target traffic around the configured egress proxy.
 // Empty proxyAddr → nil (direct, unchanged env).
-func proxyEnv(proxyAddr, caCert string) []string {
+func ProxyEnv(proxyAddr, caCert string) []string {
 	if proxyAddr == "" {
 		return nil
 	}
@@ -214,7 +221,8 @@ func proxyEnv(proxyAddr, caCert string) []string {
 		"HTTP_PROXY=" + proxyAddr, "HTTPS_PROXY=" + proxyAddr,
 		"http_proxy=" + proxyAddr, "https_proxy=" + proxyAddr,
 		"ALL_PROXY=" + proxyAddr, "all_proxy=" + proxyAddr, // socks5 egress: curl reads only this
-		"NODE_USE_ENV_PROXY=1", // Node 24+: honor HTTP(S)_PROXY in built-in fetch/http
+		"NO_PROXY=", "no_proxy=", // override inherited host bypass rules
+		"NODE_USE_ENV_PROXY=1", // Node 22.21+/24+: honor HTTP(S)_PROXY in built-in fetch/http
 	}
 	if caCert != "" {
 		env = append(env,
@@ -227,6 +235,8 @@ func proxyEnv(proxyAddr, caCert string) []string {
 	}
 	return env
 }
+
+func proxyEnv(proxyAddr, caCert string) []string { return ProxyEnv(proxyAddr, caCert) }
 
 // workerDefaultTmpl is the built-in EDITABLE body (段 [A]) of the worker system
 // prompt, seeded into agent_prompts. Traffic, artifact and completion rules are
@@ -601,9 +611,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		PermissionMode:  permission.ModeBypass,
 		// WebFetch 走记录代理，其 HTTP 与 curl 一样被留痕；载入代理 CA 让经 MITM
 		// 重签的 HTTPS 证书能【正常校验通过】（而非关掉校验）。proxy 空则直连。
-		EnableWebFetch: true,
-		WebFetchProxy:  w.proxyAddr,
-		WebFetchCACert: w.proxyCACert,
+		EnableWebFetch:                true,
+		WebFetchProxy:                 w.proxyAddr,
+		WebFetchCACert:                w.proxyCACert,
+		WebFetchDisableDirectFallback: w.proxyStrict,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立的出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
 		EnableWebSearch:       w.webSearch.Enabled,

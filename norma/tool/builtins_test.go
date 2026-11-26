@@ -263,6 +263,32 @@ func TestWebFetchProxyFallback(t *testing.T) {
 	}
 }
 
+// TestWebFetchDisableDirectFallback proves DisableDirectFallback fails closed
+// when the configured proxy fails instead of leaking a direct request to the target.
+func TestWebFetchDisableDirectFallback(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("content-type", "text/html")
+		w.Write([]byte(`<html><body><h1>Leaked Direct</h1></body></html>`))
+	}))
+	defer srv.Close()
+	raw, _ := json.Marshal(map[string]any{"url": srv.URL})
+	res, err := NewWebFetch(WebFetchConfig{
+		Proxy:                 "http://127.0.0.1:1",
+		DisableDirectFallback: true,
+	}).Call(context.Background(), raw, &ToolContext{})
+	if err != nil {
+		t.Fatalf("webfetch: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected error result when proxy fails with DisableDirectFallback, got: %q", res.Flatten())
+	}
+	if hits != 0 {
+		t.Fatalf("target received %d direct requests despite DisableDirectFallback=true", hits)
+	}
+}
+
 // TestWebFetchCompact verifies the HTML→Markdown output is token-lean: nested
 // blocks don't leave blank lines, and per-line indentation is stripped, while
 // content and list structure are preserved.

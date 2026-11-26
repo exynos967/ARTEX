@@ -122,6 +122,17 @@ func CloseGlobalMCPPool() {
 	}
 }
 
+// evictGlobalMCPServer drops a single server's live client and metadata cache if
+// the process-wide pool has already been initialized.
+func evictGlobalMCPServer(name string) {
+	globalMCPPoolMu.Lock()
+	p := globalMCPPool
+	globalMCPPoolMu.Unlock()
+	if p != nil {
+		p.evictServer(name)
+	}
+}
+
 func newMCPPool(connector mcpConnector, idleTTL time.Duration) *mcpPool {
 	if connector == nil {
 		connector = connectMCP

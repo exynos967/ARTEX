@@ -86,6 +86,28 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _resolve_proxy_handler(config):
+    """Build the ProxyHandler for target HTTP requests.
+
+    Explicit ``config["proxy"]`` (or ``ARTEX_KIT_PROXY`` env var) routes both
+    http and https requests through that proxy; ``config["use_env_proxy"]``
+    opts into standard ``HTTP(S)_PROXY`` inheritance. Otherwise proxies stay
+    disabled so ambient host proxy settings never intercept identity secrets.
+    """
+    raw = config.get("proxy")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = os.environ.get("ARTEX_KIT_PROXY", "")
+    if isinstance(raw, str) and raw.strip():
+        proxy_url = raw.strip()
+        parsed = urllib.parse.urlsplit(proxy_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("coordinator proxy must be an http:// or https:// URL")
+        return urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    if config.get("use_env_proxy"):
+        return urllib.request.ProxyHandler()
+    return urllib.request.ProxyHandler({})
+
+
 class Coordinator:
     def __init__(self, config, directory):
         self.config = config
@@ -99,6 +121,7 @@ class Coordinator:
                 p.setdefault(k, default)
                 if not isinstance(p[k], (int, float)) or not 0 < p[k] <= 1000000:
                     raise ValueError("invalid budget " + k)
+        self.proxy_handler = _resolve_proxy_handler(config)
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.directory.is_symlink() or self.directory.stat().st_mode & 0o077:
@@ -180,7 +203,7 @@ class Coordinator:
                     raise ValueError("unknown identity reference")
                 cfg = {} if name == "anonymous" else self.config.get("identities", {}).get(name, {})
                 jar = http.cookiejar.CookieJar()
-                handlers = [urllib.request.ProxyHandler({}), NoRedirect()]
+                handlers = [self.proxy_handler, NoRedirect()]
                 if name != "anonymous":
                     handlers.append(urllib.request.HTTPCookieProcessor(jar))
                 opener = urllib.request.build_opener(*handlers)

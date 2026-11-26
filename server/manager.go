@@ -695,14 +695,18 @@ func (m *Manager) syncBrowserMCPProxy() {
 		return // user removed/renamed it — leave it alone
 	}
 
-	proxy := m.ProxyAddr()  // "" when capture off
+	proxy := m.ProxyAddr()  // "" when capture off and no global proxy
 	cert := m.ProxyCACert() // "" when capture off
+	browserProxy, warn := browserProxyArg(proxy)
+	if warn != "" {
+		log.Printf("[mcp] %s", warn)
+	}
 
 	args := stripProxyArgs(decodeStrSlice(srv.Args))
 	env := decodeStrMap(srv.Env)
 	delete(env, "NODE_EXTRA_CA_CERTS")
-	if proxy != "" {
-		args = append(args, "--proxy-server", proxy)
+	if browserProxy != "" {
+		args = append(args, "--proxy-server", browserProxy)
 		if cert != "" {
 			env["NODE_EXTRA_CA_CERTS"] = cert
 		}
@@ -713,11 +717,48 @@ func (m *Manager) syncBrowserMCPProxy() {
 		log.Printf("[mcp] browser 代理同步失败: %v", err)
 		return
 	}
-	if proxy != "" {
-		log.Printf("[mcp] browser MCP 已挂捕获代理 %s (CA %s)", proxy, cert)
+	// Evict any already-running pooled browser MCP process so subsequent calls
+	// spawn a fresh Chromium instance with the updated proxy flags.
+	evictGlobalMCPServer(browserMCPName)
+	if browserProxy != "" {
+		log.Printf("[mcp] browser MCP 已挂代理 %s (CA %s)", redactProxyForLog(browserProxy), cert)
 	} else {
-		log.Printf("[mcp] browser MCP 已移除捕获代理配置")
+		log.Printf("[mcp] browser MCP 已移除代理配置")
 	}
+}
+
+// browserProxyArg normalizes a proxy URL for Playwright/Chromium's --proxy-server
+// flag. Chromium does not recognize the "socks5h://" scheme (its "socks5://"
+// handler already resolves DNS on the proxy side), and it does not support
+// username/password authentication on SOCKS5 proxies.
+func browserProxyArg(raw string) (arg string, warn string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw, ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "socks5h" {
+		cp := *u
+		cp.Scheme = "socks5"
+		u = &cp
+		raw = u.String()
+		scheme = "socks5"
+	}
+	if scheme == "socks5" && u.User != nil {
+		warn = fmt.Sprintf("browser MCP 使用带认证的 SOCKS5 代理 %s 时 Chromium 不支持直接鉴权，建议开启「流量捕获」由本地 MITM 代理中转认证", u.Redacted())
+	}
+	return raw, warn
+}
+
+func redactProxyForLog(raw string) string {
+	if u, err := url.Parse(strings.TrimSpace(raw)); err == nil && u.Host != "" {
+		return u.Redacted()
+	}
+	return raw
 }
 
 // stripProxyArgs removes any --proxy-server/--proxy-bypass flags (both "--flag val"

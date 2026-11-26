@@ -223,3 +223,63 @@ func TestRunnerNetworkWebSearchProxyIsolation(t *testing.T) {
 		}
 	})
 }
+
+func TestBrowserProxyArgNormalization(t *testing.T) {
+	if got, warn := browserProxyArg("socks5h://10.0.0.2:1080"); got != "socks5://10.0.0.2:1080" || warn != "" {
+		t.Fatalf("socks5h without auth = (%q, %q), want (socks5://10.0.0.2:1080, \"\")", got, warn)
+	}
+	got, warn := browserProxyArg("socks5h://alice:topsecret@10.0.0.2:1080")
+	if got != "socks5://alice:topsecret@10.0.0.2:1080" {
+		t.Fatalf("socks5h with auth arg = %q, want socks5://alice:topsecret@10.0.0.2:1080", got)
+	}
+	if warn == "" || strings.Contains(warn, "topsecret") {
+		t.Fatalf("socks5h with auth warn = %q, want non-empty redacted warning", warn)
+	}
+	if got, warn := browserProxyArg("http://user:pass@10.0.0.2:8080"); got != "http://user:pass@10.0.0.2:8080" || warn != "" {
+		t.Fatalf("http with auth = (%q, %q), want unchanged with empty warn", got, warn)
+	}
+}
+
+func TestRunnerNetworkStrictGlobalProxy(t *testing.T) {
+	s := &Server{
+		m: &Manager{
+			dir:         t.TempDir(),
+			globalProxy: "http://10.0.0.5:8080",
+		},
+	}
+	customRaw, _ := json.Marshal(httpExec{URL: "https://target.example.invalid"})
+	spec := runner.RunSpec{
+		Env: map[string]string{},
+		MCPs: []runner.MCPConfig{
+			{Name: browserMCPName, Args: []string{"@playwright/mcp", "--headless"}, Env: map[string]string{}},
+		},
+		Tools: []runner.ToolDefinition{
+			{Name: "WebFetch", Kind: "builtin"},
+			{Name: "custom_http", Kind: "http", Exec: customRaw},
+		},
+	}
+	if err := s.runnerNetwork(&spec, &runnerfiles.Plan{}, runnerEnvironment{ProxyURL: "socks5h://10.0.0.5:1080"}, defaultRunnerConfig()); err != nil {
+		t.Fatalf("runnerNetwork: %v", err)
+	}
+
+	var wf actool.WebFetchConfig
+	if err := json.Unmarshal(spec.Tools[0].Exec, &wf); err != nil {
+		t.Fatalf("unmarshal WebFetch: %v", err)
+	}
+	if !wf.DisableDirectFallback || wf.Proxy != "socks5h://10.0.0.5:1080" {
+		t.Fatalf("WebFetch = %+v, want DisableDirectFallback=true and Proxy set", wf)
+	}
+
+	var custom httpExec
+	if err := json.Unmarshal(spec.Tools[1].Exec, &custom); err != nil {
+		t.Fatalf("unmarshal custom_http: %v", err)
+	}
+	if custom.Proxy != "socks5h://10.0.0.5:1080" {
+		t.Fatalf("custom_http.Proxy = %q, want socks5h://10.0.0.5:1080", custom.Proxy)
+	}
+
+	joined := strings.Join(spec.MCPs[0].Args, " ")
+	if !strings.Contains(joined, "--proxy-server socks5://10.0.0.5:1080") {
+		t.Fatalf("browser MCP args = %v, want normalized socks5:// proxy", spec.MCPs[0].Args)
+	}
+}

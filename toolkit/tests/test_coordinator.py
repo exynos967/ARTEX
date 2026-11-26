@@ -221,3 +221,37 @@ class CoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "history limit"):
             self.coordinator.run(self.plan())
         self.assertEqual(len(self.seen), 1)
+
+    def test_explicit_proxy_config_and_validation(self):
+        proxied_paths = []
+
+        class ProxyHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                proxied_paths.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({"owner": "A", "via": "proxy"}).encode())
+
+        proxy_srv = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        proxy_thread = threading.Thread(target=proxy_srv.serve_forever, daemon=True)
+        proxy_thread.start()
+        self.addCleanup(proxy_thread.join)
+        self.addCleanup(proxy_srv.server_close)
+        self.addCleanup(proxy_srv.shutdown)
+
+        proxy_url = f"http://127.0.0.1:{proxy_srv.server_port}"
+        cfg = {**self.config, "proxy": proxy_url}
+        coord = Coordinator(cfg, self.root / "state-proxy")
+        self.addCleanup(coord.close)
+        res = coord.run(self.plan("/private", "anonymous"))
+        self.assertEqual(res["state"], "observed")
+        self.assertEqual(len(proxied_paths), 1)
+        self.assertTrue(proxied_paths[0].endswith("/private"))
+        self.assertEqual(self.seen, [])
+
+        # Invalid proxy scheme must fail closed instead of silently dialing direct.
+        with self.assertRaisesRegex(ValueError, "http:// or https://"):
+            Coordinator({**self.config, "proxy": "socks5://127.0.0.1:1080"}, self.root / "state-bad-proxy")

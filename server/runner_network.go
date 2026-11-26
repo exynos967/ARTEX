@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	actool "github.com/RC-CHN/ARTEX/norma/tool"
@@ -90,7 +92,11 @@ func (s *Server) runnerNetwork(spec *runner.RunSpec, plan *runnerfiles.Plan, env
 		m.Args = stripProxyArgs(m.Args)
 		delete(m.Env, "NODE_EXTRA_CA_CERTS")
 		if proxy != "" {
-			m.Args = append(m.Args, "--proxy-server", proxy)
+			browserProxy, warn := browserProxyArg(proxy)
+			if warn != "" {
+				log.Printf("[runner-mcp] %s", warn)
+			}
+			m.Args = append(m.Args, "--proxy-server", browserProxy)
 			if cert != "" {
 				if m.Env == nil {
 					m.Env = map[string]string{}
@@ -99,10 +105,11 @@ func (s *Server) runnerNetwork(spec *runner.RunSpec, plan *runnerfiles.Plan, env
 			}
 		}
 	}
+	strictProxy := proxy != "" && s.m.GlobalProxy() != ""
 	for i := range spec.Tools {
 		t := &spec.Tools[i]
 		if t.Name == "WebFetch" {
-			t.Exec, _ = json.Marshal(actool.WebFetchConfig{Proxy: proxy, CACert: cert})
+			t.Exec, _ = json.Marshal(actool.WebFetchConfig{Proxy: proxy, CACert: cert, DisableDirectFallback: strictProxy})
 		}
 		// web_search 使用独立配置的 web_search_proxy（见 runner_execution.go / agent/worker.go），
 		// 不应被目标流量录制代理 proxy/cert 覆盖，避免搜索流量被错误劫持到靶场 MITM 代理。
@@ -117,6 +124,12 @@ func (s *Server) runnerNetwork(spec *runner.RunSpec, plan *runnerfiles.Plan, env
 				}
 				conf.Proxy = proxy
 				conf.UseRecordingProxy = false
+				t.Exec, _ = json.Marshal(struct {
+					httpExec
+					CACert string `json:"ca_cert,omitempty"`
+				}{conf, cert})
+			} else if strings.TrimSpace(conf.Proxy) == "" && strictProxy {
+				conf.Proxy = proxy
 				t.Exec, _ = json.Marshal(struct {
 					httpExec
 					CACert string `json:"ca_cert,omitempty"`

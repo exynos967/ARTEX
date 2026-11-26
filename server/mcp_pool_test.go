@@ -429,3 +429,57 @@ func TestMCPPoolInvalidatesOnConfigChangeAndReapsIdle(t *testing.T) {
 		t.Fatalf("expected idle v2 client to be reaped automatically after idleTTL, closed=%d", c2.closed.Load())
 	}
 }
+
+func TestEvictGlobalMCPServerClosesLiveBrowserClient(t *testing.T) {
+	// No-op when global pool has not been initialized yet.
+	globalMCPPoolMu.Lock()
+	prev := globalMCPPool
+	globalMCPPool = nil
+	globalMCPPoolMu.Unlock()
+	t.Cleanup(func() {
+		globalMCPPoolMu.Lock()
+		globalMCPPool = prev
+		globalMCPPoolMu.Unlock()
+	})
+	evictGlobalMCPServer(browserMCPName)
+
+	var fake *fakeMCPClient
+	pool := newMCPPool(func(_ context.Context, m *db.MCPServer) (mcpClient, error) {
+		fake = &fakeMCPClient{
+			tools: []actool.CoreTool{
+				actool.Build(actool.Spec{
+					Name:        "mcp__browser__navigate",
+					Description: "navigate",
+					Schema:      map[string]any{"type": "object"},
+					Run:         func(context.Context, json.RawMessage, *actool.ToolContext) (actool.Result, error) { return actool.Text("ok"), nil },
+				}),
+			},
+		}
+		return fake, nil
+	}, 5*time.Minute)
+	defer pool.Close()
+
+	globalMCPPoolMu.Lock()
+	globalMCPPool = pool
+	globalMCPPoolMu.Unlock()
+
+	srv := &db.MCPServer{
+		ID:        77,
+		Name:      browserMCPName,
+		Transport: "stdio",
+		Command:   "npx",
+		Args:      json.RawMessage(`["@playwright/mcp","--headless"]`),
+		Enabled:   true,
+	}
+	if _, err := pool.DiscoverTools(context.Background(), srv); err != nil {
+		t.Fatalf("DiscoverTools: %v", err)
+	}
+	if fake == nil || fake.closed.Load() != 0 {
+		t.Fatalf("expected live browser client before eviction")
+	}
+
+	evictGlobalMCPServer(browserMCPName)
+	if fake.closed.Load() != 1 {
+		t.Fatalf("expected evictGlobalMCPServer to close live browser client, closed=%d", fake.closed.Load())
+	}
+}

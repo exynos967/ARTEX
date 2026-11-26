@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RC-CHN/ARTEX/agent"
 	"github.com/RC-CHN/ARTEX/db"
 	"github.com/RC-CHN/ARTEX/internal/httpx"
 	"github.com/RC-CHN/ARTEX/norma/permission"
@@ -160,7 +161,10 @@ func (s *Server) pgTestCustomTool(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
-	tc := &actool.ToolContext{WorkingDir: s.m.dir} // run in the project dir, like a real call
+	tc := &actool.ToolContext{
+		WorkingDir: s.m.dir, // run in the project dir, like a real call
+		Env:        agent.ProxyEnv(s.m.ProxyAddr(), s.m.ProxyCACert()),
+	}
 	var res actool.Result
 	switch req.Kind {
 	case "command":
@@ -566,9 +570,13 @@ func validateProxyURL(raw string) error {
 }
 
 // httpProxyTransport returns a pooled shared Transport for the http tool's
-// proxy config, or (nil, nil) for direct connections. A configured proxy that
-// fails validation/transport construction returns an error (fail closed) rather
-// than silently falling back to direct egress.
+// proxy config, or (nil, nil) for direct connections. Precedence:
+//  1. spec.UseRecordingProxy → server ProxyAddr (+ MITM CA when capturing)
+//  2. spec.Proxy (tool-specific override)
+//  3. server GlobalProxy (so target HTTP tools do not bypass the global egress proxy)
+//
+// A configured proxy that fails validation/transport construction returns an
+// error (fail closed) rather than silently falling back to direct egress.
 func (s *Server) httpProxyTransport(spec httpExec) (*http.Transport, error) {
 	proxyStr := strings.TrimSpace(spec.Proxy)
 	var caFile string
@@ -576,6 +584,11 @@ func (s *Server) httpProxyTransport(spec httpExec) (*http.Transport, error) {
 		if addr := s.m.ProxyAddr(); addr != "" {
 			proxyStr = addr
 			caFile = s.m.ProxyCACert()
+		}
+	}
+	if proxyStr == "" && s.m != nil {
+		if gp := s.m.GlobalProxy(); gp != "" {
+			proxyStr = gp
 		}
 	}
 	proxyStr = normalizeProxyURL(proxyStr)

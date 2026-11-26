@@ -109,6 +109,9 @@ type Options struct {
 	// WebFetchInsecureTLS skips TLS verification for WebFetch (curl -k). Blunt
 	// fallback when no CA cert is available; prefer WebFetchCACert.
 	WebFetchInsecureTLS bool
+	// WebFetchDisableDirectFallback disables WebFetch's direct no-proxy retry on
+	// proxy/TLS errors so traffic fails closed instead of leaking the host IP.
+	WebFetchDisableDirectFallback bool
 	// EnableWebSearch adds the network-facing web_search tool (permission-gated).
 	EnableWebSearch bool
 	// WebSearchBackend selects the search backend: "ddgs" (DuckDuckGo, no key),
@@ -289,7 +292,12 @@ func NewSession(opts Options) *Session {
 		tools = append(tools, opts.Skills.Tool())
 	}
 	if opts.EnableWebFetch {
-		tools = append(tools, tool.NewWebFetch(tool.WebFetchConfig{Proxy: opts.WebFetchProxy, CACert: opts.WebFetchCACert, InsecureTLS: opts.WebFetchInsecureTLS}))
+		tools = append(tools, tool.NewWebFetch(tool.WebFetchConfig{
+			Proxy:                 opts.WebFetchProxy,
+			CACert:                opts.WebFetchCACert,
+			InsecureTLS:           opts.WebFetchInsecureTLS,
+			DisableDirectFallback: opts.WebFetchDisableDirectFallback,
+		}))
 	}
 	if opts.EnableWebSearch {
 		// A misconfigured backend (unknown name, or brave-free without a key)

@@ -23,13 +23,29 @@ func TestProxyEnvSetsAllProxyForSocks5(t *testing.T) {
 		}
 		return false
 	}
-	for _, want := range []string{"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "all_proxy="} {
+	for _, want := range []string{"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "all_proxy=", "NO_PROXY=", "no_proxy="} {
 		if !has(want) {
 			t.Errorf("proxyEnv missing %s: %v", want, env)
 		}
 	}
 	if has("SSL_CERT_FILE=") || has("CURL_CA_BUNDLE=") {
 		t.Errorf("proxyEnv without CA must not inject CA vars: %v", env)
+	}
+}
+
+func TestProxyEnvClearsNoProxy(t *testing.T) {
+	env := ProxyEnv("http://10.0.0.2:8080", "")
+	foundUpper, foundLower := false, false
+	for _, entry := range env {
+		if entry == "NO_PROXY=" {
+			foundUpper = true
+		}
+		if entry == "no_proxy=" {
+			foundLower = true
+		}
+	}
+	if !foundUpper || !foundLower {
+		t.Fatalf("ProxyEnv must explicitly clear NO_PROXY/no_proxy, got: %v", env)
 	}
 }
 

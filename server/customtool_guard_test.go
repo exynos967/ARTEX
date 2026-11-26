@@ -84,6 +84,31 @@ func TestHTTPProxyTransportRecordingProxyHasNoDoubleScheme(t *testing.T) {
 	}
 }
 
+func TestHTTPProxyTransportFallsBackToGlobalProxy(t *testing.T) {
+	s := &Server{m: &Manager{globalProxy: "http://10.0.0.9:8080"}}
+
+	// Unspecified custom proxy and UseRecordingProxy=false must still honor GlobalProxy.
+	tr, err := s.httpProxyTransport(httpExec{})
+	if err != nil || tr == nil {
+		t.Fatalf("expected global proxy transport, got (%v, %v)", tr, err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com", nil)
+	gotProxy, err := tr.Proxy(req)
+	if err != nil || gotProxy == nil || gotProxy.String() != "http://10.0.0.9:8080" {
+		t.Fatalf("fallback proxy = (%v, %v), want http://10.0.0.9:8080", gotProxy, err)
+	}
+
+	// Explicit per-tool proxy overrides GlobalProxy.
+	trCustom, err := s.httpProxyTransport(httpExec{Proxy: "socks5://10.0.0.8:1080"})
+	if err != nil || trCustom == nil {
+		t.Fatalf("expected custom proxy transport, got (%v, %v)", trCustom, err)
+	}
+	gotCustom, err := trCustom.Proxy(req)
+	if err != nil || gotCustom == nil || gotCustom.String() != "socks5://10.0.0.8:1080" {
+		t.Fatalf("custom proxy = (%v, %v), want socks5://10.0.0.8:1080", gotCustom, err)
+	}
+}
+
 func TestLimitedBufferCapsMemoryAndMarksTruncation(t *testing.T) {
 	lb := newLimitedBuffer(16)
 	var wg sync.WaitGroup
