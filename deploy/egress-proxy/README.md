@@ -24,7 +24,7 @@
 
 需要 Docker Compose `v2.20+`（支持 `!reset` 覆盖语义）及 Linux 宿主机 `/dev/net/tun`。
 
-1. 将 [.env.socks5.example](./.env.socks5.example) 中的配置追加到项目根目录 `.env`，并填写 `EGRESS_SOCKS5_URL`：
+1. 从根目录 [.env.example](../../.env.example) 复制（或更新）根目录 `.env`，填写 `EGRESS_SOCKS5_URL`（其余网关参数均已内置在 `.env.example` 中）：
 
    ```bash
    # 上游在远程节点

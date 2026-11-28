@@ -41,9 +41,13 @@ SAMPLE_ROUTES = """172.18.0.0/16 dev eth0 proto kernel scope link src 172.18.0.3
 
 class TestEgressProxyConfig(unittest.TestCase):
     def test_shell_and_python_files_use_lf_and_valid_syntax(self) -> None:
-        for name in ("Dockerfile", "entrypoint.sh", "render_config.py", "docker-compose.socks5.yml", ".env.socks5.example", "README.md"):
+        for name in ("Dockerfile", "entrypoint.sh", "render_config.py", "docker-compose.socks5.yml", "README.md"):
             raw = (EGRESS_DIR / name).read_bytes()
             self.assertNotIn(b"\r\n", raw, f"{name} must use LF line endings")
+
+        env_example = (REPO_ROOT / ".env.example").read_bytes()
+        self.assertNotIn(b"\r\n", env_example, ".env.example must use LF line endings")
+        self.assertIn(b"EGRESS_SOCKS5_URL=", env_example)
 
         proc = subprocess.run(
             ["sh", "-n", str(EGRESS_DIR / "entrypoint.sh")],
