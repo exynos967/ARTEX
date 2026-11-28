@@ -283,3 +283,82 @@ func TestRunnerNetworkStrictGlobalProxy(t *testing.T) {
 		t.Fatalf("browser MCP args = %v, want normalized socks5:// proxy", spec.MCPs[0].Args)
 	}
 }
+
+func TestRunnerNetworkOOBAndCallbackEnv(t *testing.T) {
+	t.Setenv("ARTEX_OOB_SERVER", "https://oob.example.com")
+	t.Setenv("ARTEX_OOB_TOKEN", "oob-secret")
+	t.Setenv("ARTEX_OOB_DISABLE_PUBLIC", "1")
+	t.Setenv("ARTEX_CALLBACK_PUBLIC_HOST", "203.0.113.20")
+	t.Setenv("ARTEX_CALLBACK_PORTS", "20001-20005")
+	t.Setenv("ARTEX_RUNNER_CALLBACK_PORTS", "")
+
+	s := &Server{m: &Manager{dir: t.TempDir()}}
+
+	// Without ARTEX_RUNNER_CALLBACK_PORTS, OOB vars propagate, but controller's callback ports do NOT.
+	spec := runner.RunSpec{Env: map[string]string{"ARTEX_OOB_SERVER": "https://env-override.example"}}
+	if err := s.runnerNetwork(&spec, &runnerfiles.Plan{}, runnerEnvironment{DirectNetwork: true}, defaultRunnerConfig()); err != nil {
+		t.Fatalf("runnerNetwork: %v", err)
+	}
+	if spec.Env["ARTEX_OOB_SERVER"] != "https://env-override.example" {
+		t.Fatalf("per-env ARTEX_OOB_SERVER override lost: %q", spec.Env["ARTEX_OOB_SERVER"])
+	}
+	if spec.Env["ARTEX_OOB_TOKEN"] != "oob-secret" || spec.Env["ARTEX_OOB_DISABLE_PUBLIC"] != "1" {
+		t.Fatalf("OOB env not forwarded: %+v", spec.Env)
+	}
+	if spec.Env["ARTEX_CALLBACK_PORTS"] != "" || spec.Env["ARTEX_CALLBACK_PUBLIC_HOST"] != "" {
+		t.Fatalf("controller callback ports should not leak to runner without ARTEX_RUNNER_CALLBACK_PORTS: %+v", spec.Env)
+	}
+
+	// With ARTEX_RUNNER_CALLBACK_PORTS configured, runner receives its dedicated ports + public host.
+	t.Setenv("ARTEX_RUNNER_CALLBACK_PORTS", "20011-20015")
+	t.Setenv("NORMA_GREP_TIMEOUT_MS", "45000")
+	t.Setenv("NORMA_BASH_MAX_FILE_MB", "1024")
+	spec2 := runner.RunSpec{Env: map[string]string{}}
+	if err := s.runnerNetwork(&spec2, &runnerfiles.Plan{}, runnerEnvironment{DirectNetwork: true}, defaultRunnerConfig()); err != nil {
+		t.Fatalf("runnerNetwork with runner callback: %v", err)
+	}
+	if spec2.Env["ARTEX_OOB_SERVER"] != "https://oob.example.com" {
+		t.Fatalf("ARTEX_OOB_SERVER = %q, want https://oob.example.com", spec2.Env["ARTEX_OOB_SERVER"])
+	}
+	if spec2.Env["ARTEX_CALLBACK_PORTS"] != "20011-20015" || spec2.Env["ARTEX_CALLBACK_PUBLIC_HOST"] != "203.0.113.20" {
+		t.Fatalf("runner callback env = %+v, want 20011-20015 / 203.0.113.20", spec2.Env)
+	}
+	if spec2.Env["NORMA_GREP_TIMEOUT_MS"] != "45000" || spec2.Env["NORMA_BASH_MAX_FILE_MB"] != "1024" {
+		t.Fatalf("runner tool env = %+v, want NORMA_GREP_TIMEOUT_MS=45000 NORMA_BASH_MAX_FILE_MB=1024", spec2.Env)
+	}
+}
+
+func TestOOBCallbackGuidance(t *testing.T) {
+	mapLookup := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+
+	// Empty or ports-without-host must emit nothing (preserve static prompt cache).
+	if got := oobCallbackGuidance(mapLookup(map[string]string{"ARTEX_CALLBACK_PORTS": "20001-20005"})); got != "" {
+		t.Fatalf("expected empty guidance when host unset, got %q", got)
+	}
+
+	// Private OOB + SSH callback emits sanitized host/ports and NEVER leaks tokens or URL credentials.
+	got := oobCallbackGuidance(mapLookup(map[string]string{
+		"ARTEX_OOB_SERVER":           "https://user:urlsecret@oob.example.com",
+		"ARTEX_OOB_TOKEN":            "super-secret-oob-token",
+		"ARTEX_CALLBACK_PUBLIC_HOST": "203.0.113.20",
+		"ARTEX_CALLBACK_PORTS":       "20001-20005,8080:18080",
+	}))
+	for _, want := range []string{"https://oob.example.com", "203.0.113.20", "20001-20005,8080:18080", "0.0.0.0:<本地端口>"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("guidance missing %q:\n%s", want, got)
+		}
+	}
+	for _, forbidden := range []string{"urlsecret", "super-secret-oob-token"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("guidance leaked secret %q:\n%s", forbidden, got)
+		}
+	}
+
+	// Disable-public OOB without private server notifies worker.
+	gotDisable := oobCallbackGuidance(mapLookup(map[string]string{"ARTEX_OOB_DISABLE_PUBLIC": "1"}))
+	if !strings.Contains(gotDisable, "-ni") {
+		t.Fatalf("expected disable-public notice, got %q", gotDisable)
+	}
+}

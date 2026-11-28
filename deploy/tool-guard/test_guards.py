@@ -201,6 +201,38 @@ class TestNucleiPythonGuard(unittest.TestCase):
         )
         self.assertIn("-headless", got)
 
+    def test_debug_file_log_rejected_unless_env_enabled_and_stdout_debug_preserved(self):
+        import io
+        from contextlib import redirect_stderr
+
+        for bad_args in (
+            ["-u", "https://t", "-elog", "error.log"],
+            ["-u", "https://t", "--elog=error.log"],
+            ["-u", "https://t", "-error-log", "error.log"],
+            ["-u", "https://t", "--error-log=error.log"],
+            ["-u", "https://t", "-trace-log", "trace.log"],
+            ["-u", "https://t", "--trace-log=trace.log"],
+        ):
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    self.mod.guard_args(bad_args, env={})
+            self.assertEqual(cm.exception.code, 2, f"{bad_args} must exit 2")
+            self.assertIn("nuclei error/trace file logging is disabled by resource guard", buf.getvalue())
+            self.assertNotIn("ARTEX_ALLOW_TOOL_DEBUG_LOG", buf.getvalue())
+
+        # Stdout -debug remains allowed (bounded by streaming task writer).
+        got_stdout_debug = self.mod.guard_args(["-u", "https://t", "-debug"], env={})
+        self.assertIn("-debug", got_stdout_debug)
+
+        # Explicit opt-in allows -elog.
+        got_allowed = self.mod.guard_args(
+            ["-u", "https://t", "-elog", "error.log"],
+            env={"ARTEX_ALLOW_TOOL_DEBUG_LOG": "1"},
+        )
+        self.assertIn("-elog", got_allowed)
+        self.assertIn("error.log", got_allowed)
+
     def test_ensure_templates_config_atomic_creation(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_dir = Path(tmp) / "cfg"
@@ -215,6 +247,52 @@ class TestNucleiPythonGuard(unittest.TestCase):
             self.assertTrue(target.is_file())
             parsed = json.loads(target.read_text(encoding="utf-8"))
             self.assertEqual(parsed["nuclei-templates-version"], "v10.5.0")
+
+    def test_oob_env_injection_and_audit_redaction(self):
+        # Private OOB server + token injected when caller did not specify -iserver/-ni.
+        got = self.mod.guard_args(
+            ["-u", "https://t"],
+            env={"ARTEX_OOB_SERVER": "https://oob.example.com", "ARTEX_OOB_TOKEN": "topsecret-tok"},
+        )
+        self.assertIn("-iserver", got)
+        self.assertEqual(got[got.index("-iserver") + 1], "https://oob.example.com")
+        self.assertIn("-itoken", got)
+        self.assertEqual(got[got.index("-itoken") + 1], "topsecret-tok")
+
+        # Explicit caller -iserver or -ni wins and prevents auto-injection.
+        got_explicit = self.mod.guard_args(
+            ["-u", "https://t", "-iserver", "https://custom.oob"],
+            env={"ARTEX_OOB_SERVER": "https://oob.example.com", "ARTEX_OOB_TOKEN": "topsecret-tok"},
+        )
+        self.assertNotIn("https://oob.example.com", got_explicit)
+        self.assertNotIn("-itoken", got_explicit)
+
+        got_ni = self.mod.guard_args(
+            ["-u", "https://t", "-ni"],
+            env={"ARTEX_OOB_SERVER": "https://oob.example.com", "ARTEX_OOB_TOKEN": "topsecret-tok"},
+        )
+        self.assertNotIn("-iserver", got_ni)
+        self.assertNotIn("-itoken", got_ni)
+
+        # ARTEX_OOB_DISABLE_PUBLIC=1 injects -ni when ARTEX_OOB_SERVER is unset.
+        got_disable = self.mod.guard_args(
+            ["-u", "https://t"],
+            env={"ARTEX_OOB_DISABLE_PUBLIC": "1"},
+        )
+        self.assertIn("-ni", got_disable)
+
+        # Audit log redacts -itoken / -interactsh-token values.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = Path(tmp) / "audit.log"
+            self.mod._audit_log(
+                str(log_file),
+                ["-iserver", "https://oob.example.com", "-itoken", "topsecret-tok", "--interactsh-token=tok2", "-u", "https://t"],
+            )
+            text = log_file.read_text(encoding="utf-8")
+            self.assertNotIn("topsecret-tok", text)
+            self.assertNotIn("tok2", text)
+            self.assertIn("-itoken [REDACTED]", text)
+            self.assertIn("--interactsh-token=[REDACTED]", text)
 
 
 @unittest.skipIf(POSIX_SH is None, "POSIX sh not available")
@@ -398,6 +476,22 @@ class TestShellGuardShims(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(argv[argv.index("-rate") + 1], "70")
 
+        for bad_args in (["-u", "https://t/FUZZ", "-debug-log", "dbg.log"], ["-u", "https://t/FUZZ", "--debug-log=dbg.log"]):
+            rc, argv, err = self.run_shim("ffuf", bad_args)
+            self.assertEqual(rc, 2, f"ffuf {bad_args} should exit 2")
+            self.assertIn("ffuf debug file logging is disabled by resource guard", err)
+            self.assertNotIn("ARTEX_ALLOW_TOOL_DEBUG_LOG", err)
+            self.assertEqual(argv, [])
+
+        rc, argv, err = self.run_shim(
+            "ffuf",
+            ["-u", "https://t/FUZZ", "-debug-log", "dbg.log"],
+            extra_env={"ARTEX_ALLOW_TOOL_DEBUG_LOG": "1"},
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-debug-log", argv)
+        self.assertIn("dbg.log", argv)
+
     def test_naabu_defaults_clamping_and_passthrough(self):
         rc, argv, err = self.run_shim("naabu", ["-host", "example.com"])
         self.assertEqual(rc, 0, err)
@@ -517,6 +611,68 @@ class TestShellGuardShims(unittest.TestCase):
         )
         self.assertEqual(rc, 0, err)
         self.assertIn("-headless", argv)
+
+        # OOB server/token injection, explicit override, disable-public, and audit redaction.
+        audit_log = self.tmp / "nuclei-audit.log"
+        rc, argv, err = self.run_shim(
+            "nuclei",
+            ["-u", "https://t"],
+            extra_env={
+                "ARTEX_OOB_SERVER": "https://oob.example.com",
+                "ARTEX_OOB_TOKEN": "shell-secret-token",
+                "ARTEX_TOOL_GUARD_LOG": to_posix_path(audit_log),
+            },
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(argv[argv.index("-iserver") + 1], "https://oob.example.com")
+        self.assertEqual(argv[argv.index("-itoken") + 1], "shell-secret-token")
+        audit_text = audit_log.read_text(encoding="utf-8")
+        self.assertNotIn("shell-secret-token", audit_text)
+        self.assertIn("-itoken [REDACTED]", audit_text)
+
+        rc, argv, err = self.run_shim(
+            "nuclei",
+            ["-u", "https://t"],
+            extra_env={"ARTEX_OOB_DISABLE_PUBLIC": "1"},
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-ni", argv)
+
+        rc, argv, err = self.run_shim(
+            "nuclei",
+            ["-u", "https://t", "-ni"],
+            extra_env={"ARTEX_OOB_SERVER": "https://oob.example.com", "ARTEX_OOB_TOKEN": "shell-secret-token"},
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("-iserver", argv)
+        self.assertNotIn("-itoken", argv)
+
+        for bad_args in (
+            ["-u", "https://t", "-elog", "err.log"],
+            ["-u", "https://t", "--error-log=err.log"],
+            ["-u", "https://t", "-trace-log", "trace.log"],
+        ):
+            rc, argv, err = self.run_shim("nuclei", bad_args)
+            self.assertEqual(rc, 2, f"nuclei {bad_args} should exit 2")
+            self.assertIn("nuclei error/trace file logging is disabled by resource guard", err)
+            self.assertNotIn("ARTEX_ALLOW_TOOL_DEBUG_LOG", err)
+            self.assertEqual(argv, [])
+
+        rc, argv, err = self.run_shim(
+            "nuclei",
+            ["-u", "https://t", "-debug"],
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-debug", argv)
+
+        rc, argv, err = self.run_shim(
+            "nuclei",
+            ["-u", "https://t", "-elog", "err.log"],
+            extra_env={"ARTEX_ALLOW_TOOL_DEBUG_LOG": "1"},
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-elog", argv)
+        self.assertIn("err.log", argv)
 
     def test_path_fallback_skips_self_without_loop(self):
         # Put GUARD_DIR first in PATH, followed by a fake real binary directory.

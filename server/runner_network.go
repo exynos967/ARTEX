@@ -137,6 +137,57 @@ func (s *Server) runnerNetwork(spec *runner.RunSpec, plan *runnerfiles.Plan, env
 			}
 		}
 	}
+	applyRunnerOOBEnv(spec)
+	applyRunnerToolEnv(spec)
 	plan.Mounts = append(plan.Mounts, env.Inputs...)
 	return nil
+}
+
+// applyRunnerToolEnv forwards controller-level tool safety knobs (such as
+// Grep/Glob search timeout and per-file RLIMIT_FSIZE cap) to runner sandboxes
+// unless explicitly overridden.
+func applyRunnerToolEnv(spec *runner.RunSpec) {
+	if spec.Env == nil {
+		spec.Env = map[string]string{}
+	}
+	for _, key := range []string{"NORMA_GREP_TIMEOUT_MS", "NORMA_BASH_MAX_FILE_MB"} {
+		if strings.TrimSpace(spec.Env[key]) != "" {
+			continue
+		}
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			spec.Env[key] = v
+		}
+	}
+}
+
+// applyRunnerOOBEnv forwards controller-level optional OOB settings to runner
+// sandboxes unless explicitly overridden by the runner environment config.
+// Reverse-callback metadata is only forwarded when dedicated runner ports are
+// declared so runners never collide with the controller's own callback ports.
+func applyRunnerOOBEnv(spec *runner.RunSpec) {
+	if spec.Env == nil {
+		spec.Env = map[string]string{}
+	}
+	for _, key := range []string{"ARTEX_OOB_SERVER", "ARTEX_OOB_TOKEN", "ARTEX_OOB_DISABLE_PUBLIC"} {
+		if strings.TrimSpace(spec.Env[key]) != "" {
+			continue
+		}
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			spec.Env[key] = v
+		}
+	}
+	if runnerPorts := strings.TrimSpace(os.Getenv("ARTEX_RUNNER_CALLBACK_PORTS")); runnerPorts != "" {
+		if strings.TrimSpace(spec.Env["ARTEX_CALLBACK_PORTS"]) == "" {
+			spec.Env["ARTEX_CALLBACK_PORTS"] = runnerPorts
+		}
+		if strings.TrimSpace(spec.Env["ARTEX_CALLBACK_PUBLIC_HOST"]) == "" {
+			host := strings.TrimSpace(os.Getenv("ARTEX_RUNNER_CALLBACK_PUBLIC_HOST"))
+			if host == "" {
+				host = strings.TrimSpace(os.Getenv("ARTEX_CALLBACK_PUBLIC_HOST"))
+			}
+			if host != "" {
+				spec.Env["ARTEX_CALLBACK_PUBLIC_HOST"] = host
+			}
+		}
+	}
 }

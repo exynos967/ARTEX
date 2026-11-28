@@ -79,6 +79,35 @@ func dockerSandboxUser(uid, gid int, hasMounts bool) (string, string) {
 	return strconv.Itoa(uid), strconv.Itoa(gid)
 }
 
+const (
+	defaultRunnerMaxFileMiB int64 = 2048 // 2 GiB per-file ceiling for sandbox containers
+	maxRunnerMaxFileMiB     int64 = 1 << 20
+)
+
+// dockerFsizeLimitBytes resolves NORMA_BASH_MAX_FILE_MB (spec.Env overrides host
+// process env) into a byte ceiling for Docker `--ulimit=fsize`. Returns 0 when
+// explicitly disabled ("0"); invalid or negative values fall back to 2048 MiB.
+func dockerFsizeLimitBytes(specEnv map[string]string) int64 {
+	raw := strings.TrimSpace(specEnv["NORMA_BASH_MAX_FILE_MB"])
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("NORMA_BASH_MAX_FILE_MB"))
+	}
+	if raw == "" {
+		return defaultRunnerMaxFileMiB << 20
+	}
+	mb, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || mb < 0 {
+		return defaultRunnerMaxFileMiB << 20
+	}
+	if mb == 0 {
+		return 0
+	}
+	if mb > maxRunnerMaxFileMiB {
+		mb = maxRunnerMaxFileMiB
+	}
+	return mb << 20
+}
+
 // DockerArgs keeps all host-side authority in the daemon. The session receives
 // no socket, credentials, host PID namespace, privileged mode or host network.
 func (d *DockerExecutor) DockerArgs(id string, spec runner.RunSpec, plan runnerfiles.Plan, roots map[string]string, gpus []string) ([]string, error) {
@@ -100,10 +129,15 @@ func (d *DockerExecutor) DockerArgs(id string, spec runner.RunSpec, plan runnerf
 		"--label", "site.artex.session=" + safeID(id),
 		"--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
 		fmt.Sprintf("--shm-size=%dm", shmMiB), "--ulimit=nofile=8192:8192",
-		"--user", uid + ":" + gid, "--workdir", spec.WorkingDir,
+	}
+	if fsizeBytes := dockerFsizeLimitBytes(spec.Env); fsizeBytes > 0 {
+		args = append(args, fmt.Sprintf("--ulimit=fsize=%d:%d", fsizeBytes, fsizeBytes))
+	}
+	args = append(args,
+		"--user", uid+":"+gid, "--workdir", spec.WorkingDir,
 		"--tmpfs", fmt.Sprintf("/tmp:rw,nosuid,nodev,size=%dm,mode=1777", tmpMiB),
 		"--tmpfs", fmt.Sprintf("/home/runner:rw,nosuid,nodev,size=%dm,mode=0700,uid=%s,gid=%s", homeMiB, uid, gid),
-	}
+	)
 	if includeWorkspace {
 		args = append(args, "--tmpfs", fmt.Sprintf("/workspace:rw,nosuid,nodev,size=%dm,mode=0700,uid=%s,gid=%s", workspaceMiB, uid, gid))
 	}

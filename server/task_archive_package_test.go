@@ -346,3 +346,102 @@ func TestTaskArchivePackageNDJSONTablesAndLowMemZstdRoundTrip(t *testing.T) {
 		t.Fatalf("resolveArchivePayloadPath rejected valid table path: %v", err)
 	}
 }
+
+func TestTaskArchivePackageSlimsOversizedLogsAndSkipsCmdOutput(t *testing.T) {
+	dataDir := t.TempDir()
+	taskID := "55"
+	explorationID := int64(88)
+
+	// Build a realistic task directory with:
+	// - cmd-output/ spill caches (both task root and worker subdir) -> skipped
+	// - >10 MiB error.log and scan.err -> slimmed to head+tail in archive, source untouched
+	// - small <=10 MiB small.log, PoC evidence.py, and transcript .jsonl -> preserved verbatim
+	taskRoot := filepath.Join(dataDir, "tasks", taskID)
+	bigPayload := make([]byte, maxArchiveLogFileBytes+512*1024)
+	copy(bigPayload, "LOG_HEAD_START\n")
+	for i := len("LOG_HEAD_START\n"); i < len(bigPayload)-len("LOG_TAIL_END\n"); i++ {
+		bigPayload[i] = 'X'
+	}
+	copy(bigPayload[len(bigPayload)-len("LOG_TAIL_END\n"):], "LOG_TAIL_END\n")
+
+	files := map[string][]byte{
+		filepath.Join(taskRoot, "cmd-output", "output-1.txt"):       []byte("transient spill"),
+		filepath.Join(taskRoot, "i7", "cmd-output", "output-2.txt"): []byte("worker spill"),
+		filepath.Join(taskRoot, "i7", "error.log"):                  bigPayload,
+		filepath.Join(taskRoot, "scan.err"):                         bigPayload,
+		filepath.Join(taskRoot, "i7", "small.log"):                  []byte("keep small log verbatim"),
+		filepath.Join(taskRoot, "i7", "poc.py"):                     []byte("print('poc-ok')"),
+		filepath.Join(dataDir, "transcripts", "exp88-main.jsonl"):   []byte(`{"type":"message"}` + "\n"),
+	}
+	for p, body := range files {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stage, err := stageTaskArchiveFiles(dataDir, 12, taskID, explorationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archivePath := taskArchivePath(dataDir, 12, taskID)
+	snapshot := &pgdb.TaskArchiveSnapshot{FormatVersion: pgdb.TaskArchiveFormatVersion, TaskID: 55, ExplorationID: explorationID}
+	_, _, checksum, err := writeTaskArchivePackage(archivePath, stage.payload, snapshot)
+	if err != nil {
+		t.Fatalf("writeTaskArchivePackage: %v", err)
+	}
+
+	// Rollback safety: staged source error.log must NOT be mutated on disk.
+	stagedLogInfo, err := os.Stat(filepath.Join(stage.payload, "files", "tasks", taskID, "i7", "error.log"))
+	if err != nil || stagedLogInfo.Size() != int64(len(bigPayload)) {
+		t.Fatalf("staged source log mutated: size=%v err=%v", stagedLogInfo, err)
+	}
+
+	extracted := filepath.Join(dataDir, "extracted")
+	if err := extractTaskArchivePackage(archivePath, checksum, extracted); err != nil {
+		t.Fatalf("extractTaskArchivePackage: %v", err)
+	}
+
+	// cmd-output directories must be absent from the archive.
+	for _, omitted := range []string{
+		filepath.Join(extracted, "files", "tasks", taskID, "cmd-output"),
+		filepath.Join(extracted, "files", "tasks", taskID, "i7", "cmd-output"),
+	} {
+		if _, err := os.Stat(omitted); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be omitted from archive, err=%v", omitted, err)
+		}
+	}
+
+	// Oversized *.log and *.err must be slimmed while preserving head + notice + tail.
+	for _, rel := range []string{
+		filepath.Join("files", "tasks", taskID, "i7", "error.log"),
+		filepath.Join("files", "tasks", taskID, "scan.err"),
+	} {
+		got, err := os.ReadFile(filepath.Join(extracted, rel))
+		if err != nil {
+			t.Fatalf("read slimmed %s: %v", rel, err)
+		}
+		if len(got) > archiveLogHeadBytes+archiveLogTailBytes+512 {
+			t.Fatalf("%s was not slimmed: len=%d", rel, len(got))
+		}
+		if !bytes.Contains(got, []byte("LOG_HEAD_START")) ||
+			!bytes.Contains(got, []byte("ARTEX archive: oversized log truncated")) ||
+			!bytes.Contains(got, []byte("LOG_TAIL_END")) {
+			t.Fatalf("%s missing head/notice/tail markers", rel)
+		}
+	}
+
+	// Small logs, PoCs, and transcripts must stay byte-identical.
+	for rel, want := range map[string]string{
+		filepath.Join("files", "tasks", taskID, "i7", "small.log"): "keep small log verbatim",
+		filepath.Join("files", "tasks", taskID, "i7", "poc.py"):    "print('poc-ok')",
+		filepath.Join("files", "transcripts", "exp88-main.jsonl"):  `{"type":"message"}` + "\n",
+	} {
+		got, err := os.ReadFile(filepath.Join(extracted, rel))
+		if err != nil || string(got) != want {
+			t.Fatalf("preserved %s mismatch: got=%q err=%v", rel, got, err)
+		}
+	}
+}

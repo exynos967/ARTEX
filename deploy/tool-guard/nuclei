@@ -50,12 +50,16 @@ DEF_TIMEOUT=$(guard_effective_default 10 "$MAX_TIMEOUT")
 MAX_RETRIES=$(guard_env_max "${ARTEX_NUCLEI_MAX_RETRIES:-}" 1 0)
 DEF_RETRIES=$(guard_effective_default 1 "$MAX_RETRIES")
 ALLOW_HEADLESS="${ARTEX_ALLOW_NUCLEI_HEADLESS:-0}"
+ALLOW_DEBUG_LOG="${ARTEX_ALLOW_TOOL_DEBUG_LOG:-0}"
 
 seen_rl=0
 seen_c=0
 seen_bs=0
 seen_timeout=0
 seen_retries=0
+seen_oob_server=0
+seen_oob_token=0
+seen_oob_disable=0
 passthrough_rest=0
 
 _rem=$#
@@ -79,6 +83,52 @@ while [ "$_rem" -gt 0 ]; do
         printf '%s\n' "nuclei headless mode is disabled by resource guard; use Browser MCP" >&2
         exit 2
       fi
+      set -- "$@" "$_arg"
+      ;;
+    -elog|--elog|-error-log|--error-log|-trace-log|--trace-log)
+      if [ "$ALLOW_DEBUG_LOG" != "1" ]; then
+        printf '%s\n' "nuclei error/trace file logging is disabled by resource guard to prevent unbounded disk growth" >&2
+        exit 2
+      fi
+      set -- "$@" "$_arg"
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        set -- "$@" "$_val"
+      fi
+      ;;
+    -elog=*|--elog=*|-error-log=*|--error-log=*|-trace-log=*|--trace-log=*)
+      if [ "$ALLOW_DEBUG_LOG" != "1" ]; then
+        printf '%s\n' "nuclei error/trace file logging is disabled by resource guard to prevent unbounded disk growth" >&2
+        exit 2
+      fi
+      set -- "$@" "$_arg"
+      ;;
+    -iserver|--iserver|-interactsh-server|--interactsh-server)
+      seen_oob_server=1
+      set -- "$@" "$_arg"
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        set -- "$@" "$_val"
+      fi
+      ;;
+    -iserver=*|--iserver=*|-interactsh-server=*|--interactsh-server=*)
+      seen_oob_server=1
+      set -- "$@" "$_arg"
+      ;;
+    -itoken|--itoken|-interactsh-token|--interactsh-token)
+      seen_oob_token=1
+      set -- "$@" "$_arg"
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        set -- "$@" "$_val"
+      fi
+      ;;
+    -itoken=*|--itoken=*|-interactsh-token=*|--interactsh-token=*)
+      seen_oob_token=1
+      set -- "$@" "$_arg"
+      ;;
+    -ni|--ni|-no-interactsh|--no-interactsh|-ni=*|--ni=*|-no-interactsh=*|--no-interactsh=*)
+      seen_oob_disable=1
       set -- "$@" "$_arg"
       ;;
     -rl|--rl|-rate-limit|--rate-limit)
@@ -172,6 +222,16 @@ done
 [ "$seen_bs" = 0 ]      && set -- -bs "$DEF_BS" "$@"
 [ "$seen_c" = 0 ]       && set -- -c "$DEF_C" "$@"
 [ "$seen_rl" = 0 ]      && set -- -rl "$DEF_RL" "$@"
+if [ "$seen_oob_disable" = 0 ] && [ "$seen_oob_server" = 0 ]; then
+  if [ -n "${ARTEX_OOB_SERVER:-}" ]; then
+    if [ -n "${ARTEX_OOB_TOKEN:-}" ] && [ "$seen_oob_token" = 0 ]; then
+      set -- -itoken "$ARTEX_OOB_TOKEN" "$@"
+    fi
+    set -- -iserver "$ARTEX_OOB_SERVER" "$@"
+  elif [ "${ARTEX_OOB_DISABLE_PUBLIC:-}" = "1" ] || [ "${ARTEX_OOB_DISABLE_PUBLIC:-}" = "true" ]; then
+    set -- -ni "$@"
+  fi
+fi
 
 REAL=""
 [ -z "$DEBUG" ] && { REAL=$(guard_find_real_bin nuclei "$0" "/usr/local/libexec/artex/nuclei") || exit $?; }

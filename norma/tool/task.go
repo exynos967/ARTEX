@@ -47,9 +47,13 @@ const (
 
 // Tunables for the on-disk output store and background task bounds.
 const (
-	// maxTaskOutputBytes caps a single task's output file; a task that exceeds it
-	// is terminated to keep a runaway process from filling the disk.
-	maxTaskOutputBytes = 50 << 20 // 50 MiB
+	// maxTaskOutputBytes caps a single task's on-disk output file. Writes beyond
+	// this cap are absorbed into a rolling tail buffer instead of growing the file
+	// or killing the running process, so legitimate long scanners finish cleanly.
+	maxTaskOutputBytes = 32 << 20 // 32 MiB
+	// boundedTaskTailBytes is the rolling tail kept in memory once a task output
+	// file hits maxTaskOutputBytes, appended to the file on exit.
+	boundedTaskTailBytes = 256 << 10 // 256 KiB
 	// maxRunningBackgroundTasks caps concurrent active backgrounded tasks per session.
 	maxRunningBackgroundTasks = 4
 	// maxBackgroundTTL caps wall-clock lifetime of any backgrounded task.
@@ -60,6 +64,147 @@ const (
 	// before it is garbage-collected on the next Manager creation.
 	staleSessionTTL = 24 * time.Hour
 )
+
+// boundedTaskWriter streams stdout/stderr to a task's output file up to capBytes.
+// Once capped, further output stops growing the file on disk and instead rolls
+// through a fixed-size in-memory tail buffer, returning len(p), nil so the child
+// process never receives SIGPIPE or gets terminated mid-scan.
+type boundedTaskWriter struct {
+	mu           sync.Mutex
+	f            *os.File
+	capBytes     int64
+	tailLimit    int
+	written      int64
+	totalBytes   int64
+	droppedBytes int64
+	tail         []byte
+	closed       bool
+}
+
+func newBoundedTaskWriter(f *os.File, capBytes int64) *boundedTaskWriter {
+	if capBytes <= 0 {
+		capBytes = maxTaskOutputBytes
+	}
+	tailLimit := boundedTaskTailBytes
+	if int64(tailLimit) > capBytes/2 {
+		tailLimit = max(int(capBytes/2), 128)
+	}
+	return &boundedTaskWriter{
+		f:         f,
+		capBytes:  capBytes,
+		tailLimit: tailLimit,
+	}
+}
+
+func (w *boundedTaskWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.totalBytes += int64(len(p))
+	if w.closed || w.f == nil {
+		return len(p), nil
+	}
+	rest := p
+	if w.written < w.capBytes {
+		rem := w.capBytes - w.written
+		if int64(len(rest)) <= rem {
+			if n, err := w.f.Write(rest); err == nil {
+				w.written += int64(n)
+			} else {
+				w.written = w.capBytes
+			}
+			return len(p), nil
+		}
+		if n, err := w.f.Write(rest[:rem]); err == nil {
+			w.written += int64(n)
+		} else {
+			w.written = w.capBytes
+		}
+		rest = rest[rem:]
+	}
+	w.droppedBytes += int64(len(rest))
+	w.appendTailLocked(rest)
+	return len(p), nil
+}
+
+func (w *boundedTaskWriter) appendTailLocked(p []byte) {
+	if w.tailLimit <= 0 || len(p) == 0 {
+		return
+	}
+	if len(p) >= w.tailLimit {
+		w.tail = append(w.tail[:0], p[len(p)-w.tailLimit:]...)
+		return
+	}
+	if len(w.tail)+len(p) > w.tailLimit {
+		skip := len(w.tail) + len(p) - w.tailLimit
+		copy(w.tail, w.tail[skip:])
+		w.tail = w.tail[:len(w.tail)-skip]
+	}
+	w.tail = append(w.tail, p...)
+}
+
+func (w *boundedTaskWriter) truncationNotice(omitted int64, tailLen int) string {
+	return fmt.Sprintf(
+		"\n\n... [task output capped at %d bytes on disk (%d bytes total, %d bytes omitted); showing final %d bytes] ...\n\n",
+		w.capBytes, w.totalBytes, omitted, tailLen,
+	)
+}
+
+// LiveTail returns the rolling tail when the task is still running and has
+// already exceeded capBytes, so live TaskOutput reads always see fresh output.
+func (w *boundedTaskWriter) LiveTail(maxBytes int) (string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.droppedBytes == 0 {
+		return "", false
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxOutput
+	}
+	if maxBytes > maxTailReadBytes {
+		maxBytes = maxTailReadBytes
+	}
+	buf := w.tail
+	if len(buf) > maxBytes {
+		buf = buf[len(buf)-maxBytes:]
+	}
+	kept := trimUTF8SuffixBytes(buf)
+	omitted := w.totalBytes - w.written - int64(len(kept))
+	if omitted < 0 {
+		omitted = w.droppedBytes
+	}
+	return w.truncationNotice(omitted, len(kept)) + string(kept), true
+}
+
+func (w *boundedTaskWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if w.f == nil {
+		w.tail = nil
+		return nil
+	}
+	if w.droppedBytes > 0 {
+		kept := trimUTF8SuffixBytes(w.tail)
+		omitted := w.droppedBytes - int64(len(kept))
+		if omitted < 0 {
+			omitted = 0
+		}
+		_, _ = io.WriteString(w.f, w.truncationNotice(omitted, len(kept)))
+		if len(kept) > 0 {
+			_, _ = w.f.Write(kept)
+		}
+	}
+	w.tail = nil
+	err := w.f.Close()
+	w.f = nil
+	return err
+}
 
 // Task is a single background process tracked by a Manager. Its mutable fields
 // are guarded by Manager.mu; read snapshots through Manager methods (which copy
@@ -76,11 +221,11 @@ type Task struct {
 	OutputPath  string
 
 	// internal, guarded by Manager.mu
-	backgrounded bool          // surfaced as a background task: notify on exit
-	notified     bool          // completion already enqueued into pending
-	oversize     bool          // terminated by the size watchdog
-	timedOut     bool          // terminated by the background TTL watchdog
-	cg           *cmdCgroup    // optional Linux cgroup v2 handle
+	backgrounded bool               // surfaced as a background task: notify on exit
+	notified     bool               // completion already enqueued into pending
+	timedOut     bool               // terminated by the background TTL watchdog
+	outWriter    *boundedTaskWriter // streaming on-disk cap + rolling tail
+	cg           *cmdCgroup         // optional Linux cgroup v2 handle
 	cmd          *exec.Cmd
 	done         chan struct{} // closed by watch when the process exits
 }
@@ -154,14 +299,15 @@ func withEnv(extra []string) []string {
 
 // Manager owns the background tasks of one Session.
 type Manager struct {
-	mu      sync.Mutex
-	tasks   map[string]*Task
-	order   []string
-	pending []Notification
-	dir     string
-	seq     int
-	maxBG   int
-	maxTTL  time.Duration
+	mu        sync.Mutex
+	tasks     map[string]*Task
+	order     []string
+	pending   []Notification
+	dir       string
+	seq       int
+	maxBG     int
+	maxTTL    time.Duration
+	maxOutput int64
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -269,9 +415,18 @@ func cleanStaleSessions(base, current string) {
 	}
 }
 
+func (m *Manager) maxOutputBytes() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.maxOutput > 0 {
+		return m.maxOutput
+	}
+	return maxTaskOutputBytes
+}
+
 // Spawn launches a process detached from the per-turn context. Its output streams
-// to a file; a watch goroutine records the exit status and (if backgrounded) a
-// completion notification.
+// to a bounded file; a watch goroutine records the exit status and (if backgrounded)
+// a completion notification.
 func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	m.mu.Lock()
 	m.seq++
@@ -283,25 +438,27 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	if err != nil {
 		return nil, err
 	}
+	bw := newBoundedTaskWriter(f, m.maxOutputBytes())
 
 	kind := spec.Kind
 	if kind == "" {
 		kind = KindBash
 	}
 	shell, flags := shellCmd()
-	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, spec.Command)...)
+	execCommand := wrapCommandWithFsize(spec.Command, spec.Env)
+	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, execCommand)...)
 	cmd.Dir = spec.WorkingDir
 	if env := withEnv(spec.Env); env != nil {
 		cmd.Env = env
 	}
-	cmd.Stdout = f
-	cmd.Stderr = f
+	cmd.Stdout = bw
+	cmd.Stderr = bw
 	cg := newCmdCgroup()
 	setDetachedWithCgroup(cmd, cg)
 
 	if err := cmd.Start(); err != nil {
 		cg.cleanup()
-		_ = f.Close()
+		_ = bw.Close()
 		_ = os.Remove(outPath)
 		return nil, err
 	}
@@ -317,6 +474,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 		Status:      TaskRunning,
 		StartTime:   time.Now(),
 		OutputPath:  outPath,
+		outWriter:   bw,
 		cg:          cg,
 		cmd:         cmd,
 		done:        make(chan struct{}),
@@ -326,17 +484,17 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	m.order = append(m.order, id)
 	m.mu.Unlock()
 
-	go m.watch(t, f)
+	go m.watch(t, bw)
 	return t, nil
 }
 
-func (m *Manager) watch(t *Task, f *os.File) {
+func (m *Manager) watch(t *Task, bw *boundedTaskWriter) {
 	stop := make(chan struct{})
 	go m.watchLimits(t, stop)
 
 	err := t.cmd.Wait()
 	close(stop)
-	_ = f.Close()
+	_ = bw.Close()
 
 	m.mu.Lock()
 	if t.Status == TaskRunning { // not pre-empted by Kill / watchdog
@@ -365,8 +523,9 @@ func (m *Manager) watch(t *Task, f *os.File) {
 	t.cg.cleanup()
 }
 
-// watchLimits terminates a task whose output file grows past the size cap or
-// whose backgrounded wall-clock runtime exceeds MaxBackgroundTTL.
+// watchLimits terminates a backgrounded task whose wall-clock runtime exceeds
+// MaxBackgroundTTL. Output volume is bounded in-stream by boundedTaskWriter
+// without killing valid long-running scanners.
 func (m *Manager) watchLimits(t *Task, stop chan struct{}) {
 	interval := 2 * time.Second
 	if ttl := m.MaxBackgroundTTL(); ttl > 0 && ttl/4 < interval {
@@ -379,10 +538,6 @@ func (m *Manager) watchLimits(t *Task, stop chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			if fi, err := os.Stat(t.OutputPath); err == nil && fi.Size() > maxTaskOutputBytes {
-				m.terminate(t, TaskFailed, true, false)
-				return
-			}
 			m.mu.Lock()
 			bg := t.backgrounded
 			start := t.StartTime
@@ -392,7 +547,7 @@ func (m *Manager) watchLimits(t *Task, stop chan struct{}) {
 			}
 			m.mu.Unlock()
 			if bg && ttl > 0 && time.Since(start) > ttl {
-				m.terminate(t, TaskFailed, false, true)
+				m.terminate(t, TaskFailed, true)
 				return
 			}
 		}
@@ -401,14 +556,13 @@ func (m *Manager) watchLimits(t *Task, stop chan struct{}) {
 
 // terminate kills a still-running task, recording the given terminal status. The
 // watch goroutine observes the exit and finalizes EndTime / notifications.
-func (m *Manager) terminate(t *Task, status TaskStatus, oversize, timedOut bool) {
+func (m *Manager) terminate(t *Task, status TaskStatus, timedOut bool) {
 	m.mu.Lock()
 	if t.Status != TaskRunning {
 		m.mu.Unlock()
 		return
 	}
 	t.Status = status
-	t.oversize = oversize
 	t.timedOut = timedOut
 	proc := t.cmd.Process
 	done := t.done
@@ -422,8 +576,6 @@ func (m *Manager) terminate(t *Task, status TaskStatus, oversize, timedOut bool)
 func (m *Manager) notifFor(t *Task) Notification {
 	var sum string
 	switch {
-	case t.oversize:
-		sum = fmt.Sprintf("Task %q 输出超过上限已被终止 (%s)。", short(t.Command), t.Kind)
 	case t.timedOut:
 		sum = fmt.Sprintf("Task %q 运行超时已被终止 (%s)。", short(t.Command), t.Kind)
 	case t.Status == TaskCompleted:
@@ -508,7 +660,7 @@ func (m *Manager) Kill(id string) bool {
 	if !ok {
 		return false
 	}
-	m.terminate(t, TaskKilled, false, false)
+	m.terminate(t, TaskKilled, false)
 	return true
 }
 
@@ -527,7 +679,7 @@ func (m *Manager) KillAll() int {
 		wg.Add(1)
 		go func(task *Task) {
 			defer wg.Done()
-			m.terminate(task, TaskKilled, false, false)
+			m.terminate(task, TaskKilled, false)
 		}(t)
 	}
 	wg.Wait()
@@ -589,6 +741,11 @@ func (m *Manager) Output(id string, maxBytes int) (string, error) {
 	m.mu.Unlock()
 	if !ok {
 		return "", fmt.Errorf("unknown task %q", id)
+	}
+	if t.outWriter != nil {
+		if live, capped := t.outWriter.LiveTail(maxBytes); capped {
+			return live, nil
+		}
 	}
 	return tailFile(t.OutputPath, maxBytes)
 }

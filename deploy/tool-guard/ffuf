@@ -39,6 +39,7 @@ MAX_RATE=$(guard_env_max "${ARTEX_FFUF_MAX_RATE:-}" 40 1)
 DEF_RATE=$(guard_effective_default 30 "$MAX_RATE")
 MAX_TIMEOUT=$(guard_env_max "${ARTEX_FFUF_MAX_TIMEOUT:-}" 10 1)
 DEF_TIMEOUT=$(guard_effective_default 10 "$MAX_TIMEOUT")
+ALLOW_DEBUG_LOG="${ARTEX_ALLOW_TOOL_DEBUG_LOG:-0}"
 
 seen_t=0
 seen_rate=0
@@ -59,6 +60,24 @@ while [ "$_rem" -gt 0 ]; do
   case "$_arg" in
     --)
       passthrough_rest=1
+      set -- "$@" "$_arg"
+      ;;
+    -debug-log|--debug-log)
+      if [ "$ALLOW_DEBUG_LOG" != "1" ]; then
+        printf '%s\n' "ffuf debug file logging is disabled by resource guard to prevent unbounded disk growth" >&2
+        exit 2
+      fi
+      set -- "$@" "$_arg"
+      if [ "$_rem" -gt 0 ]; then
+        _val="$1"; shift; _rem=$((_rem - 1))
+        set -- "$@" "$_val"
+      fi
+      ;;
+    -debug-log=*|--debug-log=*)
+      if [ "$ALLOW_DEBUG_LOG" != "1" ]; then
+        printf '%s\n' "ffuf debug file logging is disabled by resource guard to prevent unbounded disk growth" >&2
+        exit 2
+      fi
       set -- "$@" "$_arg"
       ;;
     -t|--t)

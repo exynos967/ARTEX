@@ -9,10 +9,17 @@ import tempfile
 
 PASSTHROUGH_FLAGS = frozenset({"-version", "--version", "-h", "-help", "--help"})
 HEADLESS_FLAGS = frozenset({"-headless", "--headless", "-hl", "--hl"})
+DEBUG_LOG_FLAGS = frozenset({
+    "-elog", "--elog", "-error-log", "--error-log",
+    "-trace-log", "--trace-log",
+})
 UPDATE_FLAGS = frozenset({
     "-ut", "--ut", "-update-templates", "--update-templates",
     "-up", "--up", "-update", "--update",
 })
+OOB_SERVER_FLAGS = frozenset({"-iserver", "--iserver", "-interactsh-server", "--interactsh-server"})
+OOB_TOKEN_FLAGS = frozenset({"-itoken", "--itoken", "-interactsh-token", "--interactsh-token"})
+OOB_DISABLE_FLAGS = frozenset({"-ni", "--ni", "-no-interactsh", "--no-interactsh"})
 
 # (canonical_flag, aliases, env_var, default_max, default_inject, min_val)
 GUARD_RULES = (
@@ -74,9 +81,13 @@ def guard_args(argv, env=None):
             alias_map[alias] = rule
 
     allow_headless = env.get("ARTEX_ALLOW_NUCLEI_HEADLESS") == "1"
+    allow_debug_log = env.get("ARTEX_ALLOW_TOOL_DEBUG_LOG") == "1"
     seen = set()
     rewritten = []
     explicit_update = False
+    seen_oob_server = False
+    seen_oob_token = False
+    seen_oob_disable = False
     i = 0
     n = len(args)
     while i < n:
@@ -88,8 +99,17 @@ def guard_args(argv, env=None):
         if head in HEADLESS_FLAGS and not allow_headless:
             sys.stderr.write("nuclei headless mode is disabled by resource guard; use Browser MCP\n")
             raise SystemExit(2)
+        if head in DEBUG_LOG_FLAGS and not allow_debug_log:
+            sys.stderr.write("nuclei error/trace file logging is disabled by resource guard to prevent unbounded disk growth\n")
+            raise SystemExit(2)
         if head in UPDATE_FLAGS:
             explicit_update = True
+        if head in OOB_SERVER_FLAGS:
+            seen_oob_server = True
+        elif head in OOB_TOKEN_FLAGS:
+            seen_oob_token = True
+        elif head in OOB_DISABLE_FLAGS:
+            seen_oob_disable = True
         if "=" in arg:
             flag, val = arg.split("=", 1)
             rule = alias_map.get(flag)
@@ -119,6 +139,16 @@ def guard_args(argv, env=None):
     injected = []
     if not explicit_update:
         injected.append("-disable-update-check")
+    if not seen_oob_disable and not seen_oob_server:
+        oob_server = str(env.get("ARTEX_OOB_SERVER") or "").strip()
+        oob_token = str(env.get("ARTEX_OOB_TOKEN") or "").strip()
+        disable_public = str(env.get("ARTEX_OOB_DISABLE_PUBLIC") or "").strip().lower() in {"1", "true", "yes"}
+        if oob_server:
+            injected.extend(["-iserver", oob_server])
+            if oob_token and not seen_oob_token:
+                injected.extend(["-itoken", oob_token])
+        elif disable_public:
+            injected.append("-ni")
     for canonical, _max_val, eff_def, _min_val in resolved:
         if canonical not in seen:
             injected.extend([canonical, str(eff_def)])
@@ -152,13 +182,33 @@ def ensure_templates_config(env=None):
         os.unlink(temporary)
 
 
+def _redact_audit_args(final_args):
+    redacted = []
+    redact_next = False
+    for arg in final_args:
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+            continue
+        head = arg.split("=", 1)[0]
+        if head in OOB_TOKEN_FLAGS:
+            if "=" in arg:
+                redacted.append(f"{head}=[REDACTED]")
+            else:
+                redacted.append(arg)
+                redact_next = True
+            continue
+        redacted.append(arg)
+    return redacted
+
+
 def _audit_log(log_path, final_args):
     if not log_path:
         return
     try:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         with open(log_path, "a", encoding="utf-8") as stream:
-            stream.write(f"{ts}  [nuclei] {' '.join(final_args)}\n")
+            stream.write(f"{ts}  [nuclei] {' '.join(_redact_audit_args(final_args))}\n")
     except OSError:
         pass
 

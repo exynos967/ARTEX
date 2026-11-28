@@ -72,7 +72,8 @@ func TestSandboxHardeningDockerArgsAndTmpfsBudget(t *testing.T) {
 			}
 			joined := strings.Join(args, " ")
 			wantShm := fmt.Sprintf("--shm-size=%dm", tc.wantShmMiB)
-			for _, flag := range []string{"--init", wantShm, "--ulimit=nofile=8192:8192"} {
+			wantFsize := fmt.Sprintf("--ulimit=fsize=%d:%d", int64(2048)<<20, int64(2048)<<20)
+			for _, flag := range []string{"--init", wantShm, "--ulimit=nofile=8192:8192", wantFsize} {
 				if !strings.Contains(joined, flag) {
 					t.Errorf("missing expected docker flag %q in %s", flag, joined)
 				}
@@ -257,5 +258,33 @@ func TestSandboxHardeningInvalidJSONReapsChild(t *testing.T) {
 	}
 	if cmd.ProcessState == nil {
 		t.Fatal("child process was not reaped by cmd.Wait() on invalid JSON")
+	}
+}
+
+func TestSandboxHardeningDockerFsizeUlimitOverrides(t *testing.T) {
+	t.Setenv("NORMA_BASH_MAX_FILE_MB", "")
+	d := &DockerExecutor{NodeID: "node-fsize"}
+
+	// Custom override via spec.Env (512 MiB).
+	spec := baseSpec("/workspace")
+	spec.Env = map[string]string{"NORMA_BASH_MAX_FILE_MB": "512"}
+	args, err := d.DockerArgs("sess-custom", spec, runnerfiles.Plan{}, map[string]string{}, nil)
+	if err != nil {
+		t.Fatalf("DockerArgs custom: %v", err)
+	}
+	wantCustom := fmt.Sprintf("--ulimit=fsize=%d:%d", int64(512)<<20, int64(512)<<20)
+	if !strings.Contains(strings.Join(args, " "), wantCustom) {
+		t.Fatalf("missing custom fsize flag %q in %v", wantCustom, args)
+	}
+
+	// Explicit disable via spec.Env ("0") omits --ulimit=fsize.
+	specOff := baseSpec("/workspace")
+	specOff.Env = map[string]string{"NORMA_BASH_MAX_FILE_MB": "0"}
+	argsOff, err := d.DockerArgs("sess-off", specOff, runnerfiles.Plan{}, map[string]string{}, nil)
+	if err != nil {
+		t.Fatalf("DockerArgs disabled: %v", err)
+	}
+	if strings.Contains(strings.Join(argsOff, " "), "--ulimit=fsize=") {
+		t.Fatalf("expected --ulimit=fsize omitted when NORMA_BASH_MAX_FILE_MB=0, got %v", argsOff)
 	}
 }

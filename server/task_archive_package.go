@@ -2,6 +2,7 @@ package server
 
 import (
 	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,16 +15,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	pgdb "github.com/RC-CHN/ARTEX/db"
 	"github.com/klauspost/compress/zstd"
 )
 
 const (
-	archiveDirMode  = 0o700
-	archiveFileMode = 0o600
-	maxArchiveFiles = 1_000_000
-	maxArchiveBytes = int64(1 << 47) // 128 TiB safety ceiling for corrupt headers.
+	archiveDirMode         = 0o700
+	archiveFileMode        = 0o600
+	maxArchiveFiles        = 1_000_000
+	maxArchiveBytes        = int64(1 << 47) // 128 TiB safety ceiling for corrupt headers.
+	maxArchiveLogFileBytes = 10 << 20       // 10 MiB: slim oversized *.log/*.err files in archives
+	archiveLogHeadBytes    = 64 << 10       // 64 KiB head preserved when slimming oversized logs
+	archiveLogTailBytes    = 64 << 10       // 64 KiB tail preserved when slimming oversized logs
 )
 
 type archiveFileMove struct {
@@ -519,6 +524,77 @@ func stageTaskArchivePackageDelete(archivePath string, archiveID int64) (string,
 	return staged, false, nil
 }
 
+func isArchiveTransientSpillDir(slashRel string, entry fs.DirEntry) bool {
+	return entry.IsDir() && strings.HasPrefix(slashRel, "files/tasks/") && entry.Name() == "cmd-output"
+}
+
+func isArchiveSlimmableLog(slashRel string) bool {
+	if !strings.HasPrefix(slashRel, "files/tasks/") {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(slashRel))
+	return ext == ".log" || ext == ".err"
+}
+
+func trimArchiveUTF8Prefix(b []byte) []byte {
+	n := len(b)
+	for i := n - 1; i >= 0 && n-i < utf8.UTFMax; i-- {
+		if utf8.RuneStart(b[i]) {
+			if utf8.FullRune(b[i:]) {
+				return b
+			}
+			return b[:i]
+		}
+	}
+	return b
+}
+
+func trimArchiveUTF8Suffix(b []byte) []byte {
+	skipped := 0
+	for len(b) > 0 && skipped < utf8.UTFMax-1 && !utf8.RuneStart(b[0]) {
+		b = b[1:]
+		skipped++
+	}
+	return b
+}
+
+// buildSlimmedArchiveLog reads only the head and tail of an oversized *.log /
+// *.err file without modifying the staged file on disk (preserving rollback
+// safety if archiving fails before commit).
+func buildSlimmedArchiveLog(path string, totalSize int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	head, err := io.ReadAll(io.LimitReader(f, archiveLogHeadBytes))
+	if err != nil {
+		return nil, err
+	}
+	tailOff := totalSize - archiveLogTailBytes
+	if tailOff < 0 {
+		tailOff = 0
+	}
+	if _, err := f.Seek(tailOff, io.SeekStart); err != nil {
+		return nil, err
+	}
+	tail, err := io.ReadAll(io.LimitReader(f, archiveLogTailBytes))
+	if err != nil {
+		return nil, err
+	}
+	notice := fmt.Sprintf(
+		"\n\n... [ARTEX archive: oversized log truncated from %d bytes to head %d KiB + tail %d KiB] ...\n\n",
+		totalSize, archiveLogHeadBytes>>10, archiveLogTailBytes>>10,
+	)
+	var out bytes.Buffer
+	out.Grow(len(head) + len(notice) + len(tail))
+	out.Write(trimArchiveUTF8Prefix(head))
+	out.WriteString(notice)
+	out.Write(trimArchiveUTF8Suffix(tail))
+	return out.Bytes(), nil
+}
+
 func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchiveSnapshot) (originalSize, compressedSize int64, checksum string, err error) {
 	if snapshot == nil {
 		return 0, 0, "", errors.New("nil task archive snapshot")
@@ -575,6 +651,11 @@ func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchive
 		if err != nil || relative == "." {
 			return err
 		}
+		slashRel := filepath.ToSlash(relative)
+		if isArchiveTransientSpillDir(slashRel, entry) {
+			log.Printf("[task-archive] 跳过临时命令溢出缓存目录：%s", slashRel)
+			return filepath.SkipDir
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return err
@@ -586,11 +667,32 @@ func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchive
 			log.Printf("[task-archive] 跳过符号链接（归档不支持，不影响其它文件）：%s", current)
 			return nil
 		}
+		if !entry.IsDir() && info.Size() > maxArchiveLogFileBytes && isArchiveSlimmableLog(slashRel) {
+			slimmed, err := buildSlimmedArchiveLog(current, info.Size())
+			if err != nil {
+				return err
+			}
+			header, err := tar.FileInfoHeader(info, "")
+			if err != nil {
+				return err
+			}
+			header.Name = slashRel
+			header.Size = int64(len(slimmed))
+			if err := tarWriter.WriteHeader(header); err != nil {
+				return err
+			}
+			originalSize += int64(len(slimmed))
+			if _, err := tarWriter.Write(slimmed); err != nil {
+				return err
+			}
+			log.Printf("[task-archive] 裁剪超大日志文件：%s（%d -> %d bytes）", slashRel, info.Size(), len(slimmed))
+			return nil
+		}
 		header, err := tar.FileInfoHeader(info, "")
 		if err != nil {
 			return err
 		}
-		header.Name = filepath.ToSlash(relative)
+		header.Name = slashRel
 		if err := tarWriter.WriteHeader(header); err != nil {
 			return err
 		}
