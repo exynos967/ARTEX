@@ -405,6 +405,20 @@ func (s *Session) notifications() tool.NotificationSource {
 // Messages returns the conversation history.
 func (s *Session) Messages() []llm.Message { return s.messages }
 
+// AppendMessages appends msgs to the session history and persists them to the
+// transcript writer (when configured), keeping memory and disk aligned.
+func (s *Session) AppendMessages(msgs ...llm.Message) {
+	for _, m := range msgs {
+		if len(m.Content) == 0 {
+			continue
+		}
+		s.messages = append(s.messages, m)
+		if s.writer != nil {
+			s.writer.RecordMessage(m, llm.Usage{})
+		}
+	}
+}
+
 // Usage returns cumulative token usage.
 func (s *Session) Usage() llm.Usage { return s.usage }
 
@@ -485,13 +499,24 @@ func firstRecordDate(recs []transcript.Record) string {
 	return ""
 }
 
-// cleanResumed drops trailing assistant tool calls whose results were never
+// cleanResumed strips trailing assistant tool calls whose results were never
 // persisted — a crash mid-tool would otherwise leave a dangling tool_use that
-// the API rejects.
+// the API rejects — while preserving any preceding assistant text blocks.
 func cleanResumed(msgs []llm.Message) []llm.Message {
 	for len(msgs) > 0 {
 		last := msgs[len(msgs)-1]
 		if last.Role == llm.RoleAssistant && len(last.ToolUses()) > 0 {
+			kept := make([]llm.ContentBlock, 0, len(last.Content))
+			for _, b := range last.Content {
+				if b.Type == llm.BlockToolUse {
+					continue
+				}
+				kept = append(kept, b)
+			}
+			if len(kept) > 0 {
+				msgs[len(msgs)-1] = llm.Message{Role: llm.RoleAssistant, Content: kept}
+				break
+			}
 			msgs = msgs[:len(msgs)-1]
 			continue
 		}

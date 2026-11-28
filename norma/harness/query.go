@@ -1206,10 +1206,17 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 	}
 	l.usage.Add(acc.Usage)
 	asst = acc.Message()
-	if len(interruptedIDs) > 0 {
+	dropUnsignedThinking := err != nil && l.ctx.Err() != nil
+	if len(interruptedIDs) > 0 || dropUnsignedThinking {
 		content := asst.Content[:0:0]
 		for _, b := range asst.Content {
 			if b.Type == llm.BlockToolUse && interruptedIDs[b.ID] {
+				continue
+			}
+			// An interrupted stream's thinking block never received its closing
+			// signature_delta; persisting it would make Anthropic reject every
+			// subsequent turn in this session with HTTP 400.
+			if dropUnsignedThinking && b.Type == llm.BlockThinking && b.Signature == "" {
 				continue
 			}
 			content = append(content, b)

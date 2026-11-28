@@ -159,3 +159,42 @@ func TestSuccessfulEmptyArgumentToolStillRuns(t *testing.T) {
 		t.Fatalf("valid tool broken: %+v", term)
 	}
 }
+
+func TestStreamCancelDropsUnsignedThinkingKeepsPartialText(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	model := func(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+		return func(yield func(llm.StreamEvent, error) bool) {
+			for _, ev := range []llm.StreamEvent{
+				{Type: llm.SEThinkingDelta, Text: "incomplete thinking without signature"},
+				{Type: llm.SETextDelta, Text: "partial answer"},
+			} {
+				if !yield(ev, nil) {
+					return
+				}
+			}
+			cancel()
+			yield(llm.StreamEvent{}, ctx.Err())
+		}
+	}
+
+	term := drainWithCtx(t, ctx, QueryInput{
+		Messages:       []llm.Message{llm.UserText("question")},
+		PermissionMode: permission.ModeBypass,
+	}, QueryDeps{CallModel: model})
+	if term.Reason != ReasonAbortedStreaming {
+		t.Fatalf("reason=%v, want ReasonAbortedStreaming", term.Reason)
+	}
+	if len(term.Messages) != 2 {
+		t.Fatalf("messages=%d, want 2 (user + partial text assistant)", len(term.Messages))
+	}
+	for _, b := range term.Messages[1].Content {
+		if b.Type == llm.BlockThinking && b.Signature == "" {
+			t.Fatalf("unsigned thinking block leaked on cancel: %+v", term.Messages[1].Content)
+		}
+	}
+	if got := term.Messages[1].Text(); got != "partial answer" {
+		t.Fatalf("assistant text=%q, want partial answer", got)
+	}
+}

@@ -3,10 +3,12 @@ package agent
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/RC-CHN/ARTEX/db"
 	"github.com/RC-CHN/ARTEX/intercept"
 	"github.com/RC-CHN/ARTEX/norma/agentcore"
+	"github.com/RC-CHN/ARTEX/norma/harness"
 	"github.com/RC-CHN/ARTEX/norma/llm"
 	"github.com/RC-CHN/ARTEX/norma/permission"
 	actool "github.com/RC-CHN/ARTEX/norma/tool"
@@ -161,15 +163,24 @@ func (m *MainAgent) chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.MainAgentTools()), actool.DefaultTools()...)
+	startedAt := time.Now()
+	sessionID := mainSessionTranscriptID(explorationID(ts), mainSeg, request)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx, runtime, releaseExecution, err := prepareExecution(ctx, "mainagent", mainDir)
 	if err != nil {
+		if !automatic && ctx.Err() != nil {
+			recordAbortedBeforePrompt(m.tx, sessionID, message, ctx, startedAt, "mainagent", emit)
+		}
 		return "", err
 	}
 	defer releaseExecution()
 	tools, def, cleanup := AugmentTools(ctx, "mainagent", base)
 	defer cleanup()
+	if !automatic && ctx.Err() != nil {
+		recordAbortedBeforePrompt(m.tx, sessionID, message, ctx, startedAt, "mainagent", emit)
+		return "", ctx.Err()
+	}
 	if automatic {
 		filtered := tools[:0:0]
 		for _, t := range tools {
@@ -229,7 +240,6 @@ func (m *MainAgent) chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	if automatic && (opts.MaxTurns == 0 || opts.MaxTurns > 24) {
 		opts.MaxTurns = 24
 	}
-	sessionID := mainSessionTranscriptID(ts.ID(), mainSeg, request)
 	if m.tx != nil { // persist raw conversation; isolated per human segment or consultation request
 		opts.Transcript = m.tx
 		opts.SessionID = sessionID
@@ -250,16 +260,24 @@ func (m *MainAgent) chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// across turns (each Chat is a fresh session; without this it can't see earlier
 	// messages). First turn: no file yet → Resume loads nothing and proceeds.
 	if m.tx != nil {
-		_ = s.Resume(opts.SessionID)
+		_ = resumeTranscriptSession(s, m.tx, opts.SessionID)
+	}
+	// Fallback: if the transcript was missing/corrupted or earlier turns ran
+	// outside LLM persistence, recover visible history for this segment from DB.
+	if !automatic && len(s.Messages()) == 0 {
+		seedMainHistoryFromActivities(s, ts, mainSeg, message)
 	}
 	// C2: this session is fresh each turn; re-unlock skill-gated MCPs from prior
 	// Skill() calls in the reloaded history so revealed tools stay callable.
 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-	text, _, err := captureFinalSession(ctx, s, message, func(r db.Activity) {
+	text, reason, err := captureFinalSession(ctx, s, message, func(r db.Activity) {
 		if emit != nil {
 			r.Worker = "mainagent"
 			emit(r)
 		}
 	})
+	if !automatic && (ctx.Err() != nil || reason == harness.ReasonAbortedStreaming || reason == harness.ReasonAbortedTools) {
+		ensureAbortedTurnClosed(s, ctx, reason)
+	}
 	return text, err
 }

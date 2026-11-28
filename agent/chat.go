@@ -10,6 +10,7 @@ import (
 	"github.com/RC-CHN/ARTEX/guard"
 	"github.com/RC-CHN/ARTEX/intercept"
 	"github.com/RC-CHN/ARTEX/norma/agentcore"
+	"github.com/RC-CHN/ARTEX/norma/harness"
 	"github.com/RC-CHN/ARTEX/norma/llm"
 	"github.com/RC-CHN/ARTEX/norma/permission"
 	actool "github.com/RC-CHN/ARTEX/norma/tool"
@@ -123,15 +124,23 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// Pure assistant: DefaultTools as the base; AugmentTools layers in the key's
 	// visible skills/MCP and lets the DB tools table filter/override. DefaultTools
 	// have no tools-table rows, so they always pass through.
+	startedAt := time.Now()
 	base := actool.DefaultTools()
 	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID})
 	ctx, runtime, releaseExecution, err := prepareExecution(ctx, agentKey, sessionWorkDir)
 	if err != nil {
+		if ctx.Err() != nil {
+			recordAbortedBeforePrompt(c.tx, sessionID, message, ctx, startedAt, agentKey, emit)
+		}
 		return "", err
 	}
 	defer releaseExecution()
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()
+	if ctx.Err() != nil {
+		recordAbortedBeforePrompt(c.tx, sessionID, message, ctx, startedAt, agentKey, emit)
+		return "", ctx.Err()
+	}
 
 	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir), def)
 	opts := agentcore.Options{
@@ -190,16 +199,19 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// reload prior conversation so the agent has context across turns (each Chat is
 	// a fresh session). First turn: no file yet → Resume loads nothing and proceeds.
 	if c.tx != nil {
-		_ = s.Resume(sessionID)
+		_ = resumeTranscriptSession(s, c.tx, sessionID)
 	}
 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
 	// revealed tools stay callable across the fresh session.
 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-	text, _, err := captureFinalSession(ctx, s, message, func(r db.Activity) {
+	text, reason, err := captureFinalSession(ctx, s, message, func(r db.Activity) {
 		if emit != nil {
 			r.Worker = agentKey
 			emit(r)
 		}
 	})
+	if ctx.Err() != nil || reason == harness.ReasonAbortedStreaming || reason == harness.ReasonAbortedTools {
+		ensureAbortedTurnClosed(s, ctx, reason)
+	}
 	return text, err
 }
