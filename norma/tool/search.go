@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 var skipDirs = map[string]bool{".git": true, "node_modules": true, "vendor": true}
@@ -25,7 +27,46 @@ const (
 	maxGrepLineBytes = 256 << 10 // 256 KiB
 	// maxGlobMatches caps collected files in Glob before returning a truncation notice.
 	maxGlobMatches = 10000
+	// defaultSearchTimeout bounds a single Grep or Glob call so searching a
+	// huge directory tree never hangs indefinitely.
+	defaultSearchTimeout = 30 * time.Second
+	// maxGrepScannedFiles caps regular files inspected by the pure-Go fallback.
+	maxGrepScannedFiles = 50000
+	// maxGrepEarlyStopExtra is how many extra matching entries the pure-Go walk
+	// collects past offset+head_limit before stopping early.
+	maxGrepEarlyStopExtra = 1000
 )
+
+func searchTimeout() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("NORMA_GREP_TIMEOUT_MS")); raw != "" {
+		if ms, err := strconv.Atoi(raw); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return defaultSearchTimeout
+}
+
+func withSearchTimeout(ctx context.Context) (context.Context, context.CancelFunc, time.Duration) {
+	d := searchTimeout()
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem > 0 && rem < d {
+			d = rem
+		}
+	}
+	sctx, cancel := context.WithTimeout(ctx, d)
+	return sctx, cancel, d
+}
+
+// isVirtualSystemDir reports Linux/Unix pseudo-filesystems that must never be
+// recursively walked when searching a broad parent such as "/".
+func isVirtualSystemDir(path string) bool {
+	switch filepath.Clean(path) {
+	case "/proc", "/sys", "/dev":
+		return true
+	default:
+		return false
+	}
+}
 
 // NewGlob builds the Glob tool: find files by pattern, newest first.
 func NewGlob() CoreTool {
@@ -70,22 +111,29 @@ func runGlobWithCap(ctx context.Context, input json.RawMessage, tc *ToolContext,
 	if root == "" {
 		root = "."
 	}
+	searchCtx, cancelSearch, timeout := withSearchTimeout(ctx)
+	defer cancelSearch()
+
 	type match struct {
 		path string
 		mod  int64
 	}
 	var matches []match
 	truncated := false
+	timedOut := false
 	matchPath := compileGlob(in.Pattern)
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if searchCtx.Err() != nil {
+			if ctx.Err() == nil {
+				timedOut = true
+			}
+			return searchCtx.Err()
 		}
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			if skipDirs[d.Name()] {
+			if skipDirs[d.Name()] || (p != root && isVirtualSystemDir(p)) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -110,8 +158,14 @@ func runGlobWithCap(ctx context.Context, input json.RawMessage, tc *ToolContext,
 	if walkErr != nil && ctx.Err() != nil {
 		return Result{}, ctx.Err()
 	}
+	if searchCtx.Err() != nil && ctx.Err() == nil {
+		timedOut = true
+	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].mod > matches[j].mod })
 	if len(matches) == 0 {
+		if timedOut {
+			return Errorf(fmt.Sprintf("Error: glob timed out after %s while scanning %s — narrow pattern or path", timeout, root)), nil
+		}
 		return Text("No files found"), nil
 	}
 	var b strings.Builder
@@ -121,6 +175,9 @@ func runGlobWithCap(ctx context.Context, input json.RawMessage, tc *ToolContext,
 	}
 	if truncated {
 		fmt.Fprintf(&b, "... [results truncated at %d matches — narrow pattern or path] ...\n", capMatches)
+	}
+	if timedOut {
+		fmt.Fprintf(&b, "... [search timed out after %s — partial results shown; narrow pattern or path] ...\n", timeout)
 	}
 	return Text(Capture(tc, b.String())), nil
 }
@@ -266,9 +323,12 @@ func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 		showLines = *in.LineNums
 	}
 
+	searchCtx, cancelSearch, timeout := withSearchTimeout(ctx)
+	defer cancelSearch()
+
 	// Prefer the ripgrep binary when available; fall back to the Go walk below.
 	if rg := RipgrepPath(); rg != "" {
-		if res, ok := runWithRipgrep(ctx, rg, ripgrepReq{
+		if res, ok := runWithRipgrep(ctx, searchCtx, timeout, rg, ripgrepReq{
 			pattern: in.Pattern, glob: in.Glob, typ: in.Type, mode: mode,
 			ignoreCase: in.IgnoreCase, multiline: in.Multiline, showLines: showLines,
 			before: before, after: after, root: root, headLimit: in.HeadLimit, offset: in.Offset,
@@ -280,12 +340,32 @@ func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 		}
 	}
 
+	headLimit := 250
+	if in.HeadLimit != nil {
+		headLimit = *in.HeadLimit
+	}
+	earlyStopTarget := 0
+	if headLimit > 0 {
+		earlyStopTarget = max(in.Offset, 0) + headLimit + maxGrepEarlyStopExtra
+	}
+
 	typeGlobs := rgTypeGlobs(in.Type)
 	var results []grepHit
+	collectedEntries := 0
+	scannedFiles := 0
+	stoppedEarly := false
+	cappedFiles := false
+	timedOut := false
+
 	scan := func(p, base string) {
-		fh := scanFileContext(ctx, p, base, re, mode, showLines, in.Multiline, before, after)
+		fh := scanFileContext(searchCtx, p, base, re, mode, showLines, in.Multiline, before, after)
 		if fh != nil {
 			results = append(results, *fh)
+			if mode == "content" {
+				collectedEntries += len(fh.lines)
+			} else {
+				collectedEntries++
+			}
 		}
 	}
 	info, statErr := os.Stat(root)
@@ -294,16 +374,24 @@ func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 	}
 	if info.IsDir() {
 		walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if searchCtx.Err() != nil {
+				if ctx.Err() == nil {
+					timedOut = true
+				}
+				return searchCtx.Err()
 			}
 			if err != nil {
 				return nil
 			}
 			if d.IsDir() {
-				if skipDirs[d.Name()] {
+				if skipDirs[d.Name()] || (p != root && isVirtualSystemDir(p)) {
 					return filepath.SkipDir
 				}
+				return nil
+			}
+			// Skip FIFOs, sockets, device nodes, and symlinks so os.Open/ReadFile
+			// can never block indefinitely on special files.
+			if !d.Type().IsRegular() {
 				return nil
 			}
 			base := filepath.Base(p)
@@ -315,19 +403,40 @@ func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 			if len(typeGlobs) > 0 && !matchAnyGlob(typeGlobs, base) {
 				return nil
 			}
+			if scannedFiles >= maxGrepScannedFiles {
+				cappedFiles = true
+				return fs.SkipAll
+			}
+			scannedFiles++
 			scan(p, root)
+			if earlyStopTarget > 0 && collectedEntries >= earlyStopTarget {
+				stoppedEarly = true
+				return fs.SkipAll
+			}
 			return nil
 		})
 		if walkErr != nil && ctx.Err() != nil {
 			return Result{}, ctx.Err()
+		}
+		if searchCtx.Err() != nil && ctx.Err() == nil {
+			timedOut = true
 		}
 	} else {
 		if ctx.Err() != nil {
 			return Result{}, ctx.Err()
 		}
 		scan(root, filepath.Dir(root))
+		if searchCtx.Err() != nil && ctx.Err() == nil {
+			timedOut = true
+		}
 	}
 	if len(results) == 0 {
+		if timedOut {
+			return Errorf(fmt.Sprintf("Error: grep timed out after %s while searching %s — narrow path, glob, or type", timeout, root)), nil
+		}
+		if cappedFiles {
+			return Text(fmt.Sprintf("No matches found (stopped after scanning %d files — narrow path, glob, or type)", maxGrepScannedFiles)), nil
+		}
 		return Text("No matches found"), nil
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].path < results[j].path })
@@ -348,17 +457,22 @@ func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 			lines = append(lines, r.path)
 		}
 	}
-	headLimit := 250
-	if in.HeadLimit != nil {
-		headLimit = *in.HeadLimit
-	}
 	kept, more := applyHeadOffset(lines, headLimit, in.Offset)
 	out := strings.Join(kept, "\n")
 	if len(kept) > 0 {
 		out += "\n"
 	}
 	if more > 0 {
-		out += fmt.Sprintf("... [%d more result(s) — page with offset=%d, or head_limit=0 for all] ...\n", more, in.Offset+len(kept))
+		if stoppedEarly {
+			out += fmt.Sprintf("... [at least %d more result(s), search stopped early — page with offset=%d or narrow pattern/path] ...\n", more, max(in.Offset, 0)+len(kept))
+		} else {
+			out += fmt.Sprintf("... [%d more result(s) — page with offset=%d, or head_limit=0 for all] ...\n", more, max(in.Offset, 0)+len(kept))
+		}
+	}
+	if timedOut {
+		out += fmt.Sprintf("... [search timed out after %s — partial results shown; narrow path, glob, or type] ...\n", timeout)
+	} else if cappedFiles {
+		out += fmt.Sprintf("... [stopped after scanning %d files — partial results shown; narrow path, glob, or type] ...\n", maxGrepScannedFiles)
 	}
 	return Text(Capture(tc, out)), nil
 }
@@ -445,7 +559,7 @@ func scanFileContext(ctx context.Context, path, base string, re *regexp.Regexp, 
 		return nil
 	}
 	fi, err := os.Stat(path)
-	if err != nil || fi.IsDir() || fi.Size() > maxGrepFileBytes {
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxGrepFileBytes {
 		return nil
 	}
 	rel := path
