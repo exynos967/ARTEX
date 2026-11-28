@@ -505,7 +505,7 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Badge variant="outline" className="max-w-60 shrink-0 font-normal" title={firstRawLabel}>
+        <Badge variant="outline" className="max-w-40 shrink-0 font-normal sm:max-w-60" title={firstRawLabel}>
           <span className="truncate">当前资产：{firstLabel}</span>
           {displayAssets.length > 1 && <span className="shrink-0 tabular-nums">+{displayAssets.length - 1}</span>}
         </Badge>
@@ -1711,19 +1711,21 @@ export function SessionsTab({ taskId }: { taskId: string }) {
 
   return (
     <TooltipProvider delayDuration={300}>
-      {/* 高度预留：页面头部（标题行 + 目标 + Tabs ≈ 7.5rem）+ 内容内边距。手机端 p-4、
-        桌面端 lg:p-6，且桌面还要留出滚动余量，所以两档分别预留 10rem / 13rem —— 手机端
-        沿用 13rem 会白白吃掉 3rem 的记录高度。 */}
+      {/* 高度预留：页面头部（手机端隐藏 goal 仅标题+Tabs ≈ 5.5rem，平板/桌面 ≈ 7.5rem）+ 内边距。
+        手机端用 dvh + 最小高度，保证地址栏或软键盘弹出时对话框仍有充裕高度，同时保持内部
+        ScrollArea min-h-0 避免底部输入框被裁切。 */}
       <div
         className={cn(
-          "grid h-[calc(100svh-10rem)] min-h-0 grid-cols-1 gap-4",
-          listOpen ? "grid-rows-[minmax(0,40svh)_minmax(0,1fr)]" : "grid-rows-[auto_minmax(0,1fr)]",
-          "lg:h-[calc(100svh-13rem)] lg:grid-cols-[18rem_1fr] lg:grid-rows-[minmax(0,1fr)]",
+          "grid h-[calc(100dvh-6.5rem)] grid-cols-1 gap-2 sm:h-[calc(100dvh-9.5rem)] sm:gap-3",
+          listOpen
+            ? "min-h-[34rem] grid-rows-[minmax(0,32dvh)_minmax(0,1fr)]"
+            : "min-h-[30rem] grid-rows-[auto_minmax(0,1fr)]",
+          "lg:h-[calc(100svh-13rem)] lg:min-h-0 lg:grid-cols-[18rem_1fr] lg:grid-rows-[minmax(0,1fr)] lg:gap-4",
         )}
       >
         {/* Left: session list */}
         <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border bg-card">
-          <div className="border-b px-3 py-2">
+          <div className="border-b px-2.5 py-1.5 sm:px-3 sm:py-2">
             <div className="flex items-center justify-between gap-2">
               <button
                 type="button"
@@ -1774,7 +1776,12 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             {taskTokens && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1 text-xs text-muted-foreground">
+                  <div
+                    className={cn(
+                      "mt-2 flex min-w-0 flex-wrap items-center gap-1 text-xs text-muted-foreground",
+                      !listOpen && "max-lg:hidden",
+                    )}
+                  >
                     <span>任务总计</span>
                     <span>·</span>
                     <TokenMetrics
@@ -1884,7 +1891,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           label={active.role === "worker" ? `Worker #${active.intent_id} · ${activeDisplayTitle}` : activeDisplayTitle}
         >
           <div className="flex min-h-0 flex-1 min-w-0 flex-col overflow-hidden rounded-lg border bg-card">
-            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-2 sm:px-4 sm:py-2.5">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 border-b px-2.5 py-1.5 sm:gap-x-2 sm:px-4 sm:py-2.5">
               {(() => {
                 const isWorker = active.role === "worker";
                 const meta = isWorker ? sessionMeta.get(active.id) : undefined;
@@ -1939,17 +1946,17 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               {activeState?.hasMore &&
                 (activeState.items.length >= SCROLLED_KEEP ? (
                   <span
-                    className="text-[10px] text-muted-foreground"
+                    className="text-[10px] text-muted-foreground max-sm:hidden"
                     title={`已达到单会话前端显示上限（${SCROLLED_KEEP} 条）`}
                   >
                     已达到单会话前端显示上限（{SCROLLED_KEEP} 条）
                   </span>
                 ) : (
-                  <span className="text-[10px] text-muted-foreground" title="向上滚动加载更早历史">
+                  <span className="text-[10px] text-muted-foreground max-sm:hidden" title="向上滚动加载更早历史">
                     ↑ 更早历史
                   </span>
                 ))}
-              <div className="ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground max-sm:w-full max-sm:flex-wrap">
+              <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground sm:gap-x-3 sm:text-xs">
                 {tokenTotal.any && (
                   <Tooltip>
                     {/* 手机端用短标签（入/缓/出）：长标签会把这一行撑成两行，进一步压缩记录区。 */}
@@ -1986,7 +1993,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     live={active.live}
                   />
                 )}
-                {isConsultation ? <span>自动协作</span> : isMain ? <span>可交互</span> : null}
+                {isConsultation ? (
+                  <span className="max-sm:hidden">自动协作</span>
+                ) : isMain ? (
+                  <span className="max-sm:hidden">可交互</span>
+                ) : null}
               </div>
             </div>
             {(() => {
@@ -2043,8 +2054,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             to block so wide/unbreakable steps (long commands, code, URLs) can't blow
             out the width and defeat the truncation below — the transcript wraps to
             the panel instead of overflowing horizontally. */}
-            <ScrollArea type="auto" className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
-              <div className="min-w-0 max-w-full p-4" ref={contentRef}>
+            <ScrollArea
+              type="auto"
+              className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!"
+            >
+              <div className="min-w-0 max-w-full p-2.5 sm:p-4" ref={contentRef}>
                 {activeState?.loadingMore && (
                   <div className="flex items-center justify-center gap-2 pb-2 text-xs text-muted-foreground">
                     <Loader2Icon className="size-3.5 animate-spin" />
@@ -2096,7 +2110,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               </div>
             </ScrollArea>
             {isInteractiveMain ? (
-              <div className="border-t p-3">
+              <div className="border-t p-2 sm:p-3">
                 {attachments.length > 0 && (
                   <div className="mb-2 flex flex-wrap gap-1.5">
                     {attachments.map((a) => (
@@ -2143,7 +2157,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                       e.preventDefault();
                       send();
                     }}
-                    className="max-h-36 min-h-9 overflow-y-auto"
+                    className="max-h-28 min-h-9 overflow-y-auto sm:max-h-36"
                   />
                   <InputGroupAddon align="block-end">
                     <InputGroupButton
@@ -2223,7 +2237,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             ) : active.role === "worker" &&
               !active.inherited &&
               (active.status === "running" || active.status === "paused") ? (
-              <div className="border-t p-3">
+              <div className="border-t p-2 sm:p-3">
                 <InputGroup className="min-h-9 has-disabled:opacity-100">
                   <MentionTextarea
                     inputGroup
@@ -2242,7 +2256,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     }}
                     disabled={workerMessageSending}
                     aria-invalid={workerMessageCharCount(workerMessage) > MAX_WORKER_MESSAGE_CHARS}
-                    className="max-h-36 min-h-9 overflow-y-auto"
+                    className="max-h-28 min-h-9 overflow-y-auto sm:max-h-36"
                   />
                   <InputGroupAddon align="block-end">
                     <span

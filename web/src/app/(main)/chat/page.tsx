@@ -190,7 +190,7 @@ function Composer({
     onSend();
   }
   return (
-    <div className="border-t p-3">
+    <div className="border-t p-2 sm:p-3">
       {atts.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-1.5">
           {atts.map((a) => (
@@ -245,7 +245,7 @@ function Composer({
           </>
         )}
         <MentionTextarea
-          className="max-h-40 min-h-10 min-w-0 flex-1 resize-none"
+          className="max-h-28 min-h-9 min-w-0 flex-1 resize-none sm:max-h-40 sm:min-h-10"
           rows={1}
           placeholder={placeholder}
           value={value}
@@ -798,7 +798,7 @@ function ChatView({
   return (
     <SideQuestionWorkspace side={side} label={agent?.name ?? conv.agent_key} composerLayout="inline">
       {/* header: which agent + live + token meta */}
-      <div className="flex min-w-0 flex-wrap items-center gap-2 border-b px-4 py-2.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 border-b px-2.5 py-1.5 sm:gap-2 sm:px-4 sm:py-2.5">
         <Bot className="text-muted-foreground size-4 shrink-0" />
         <span className="min-w-0 max-w-48 truncate text-sm font-medium">{agent?.name ?? conv.agent_key}</span>
         <span className="text-muted-foreground hidden shrink-0 font-mono text-xs sm:inline">{conv.agent_key}</span>
@@ -808,11 +808,11 @@ function ChatView({
           </Badge>
         )}
         {agent?.description && (
-          <span className="text-muted-foreground min-w-0 truncate text-xs">{agent.description}</span>
+          <span className="text-muted-foreground hidden min-w-0 truncate text-xs sm:inline">{agent.description}</span>
         )}
         {running && <LiveBadge />}
         <SideQuestionButton side={side} />
-        <div className="text-muted-foreground ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-xs max-sm:w-full max-sm:flex-wrap">
+        <div className="text-muted-foreground ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-x-2 gap-y-0.5 text-[11px] sm:gap-x-3 sm:text-xs">
           {tokenTotal.turns > 0 && (
             <span title="agent 循环轮次（模型调用次数）" className="tabular-nums">
               {tokenTotal.turns} 轮
@@ -829,8 +829,11 @@ function ChatView({
       <ApprovalExecutionFocus focus={approvalFocus} history={focusHistory} />
 
       {/* messages */}
-      <ScrollArea type="auto" className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
-        <div className="min-w-0 max-w-full px-4 py-3" ref={contentRef}>
+      <ScrollArea
+        type="auto"
+        className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!"
+      >
+        <div className="min-w-0 max-w-full px-2.5 py-2 sm:px-4 sm:py-3" ref={contentRef}>
           {messages.length === 0 && !running ? (
             <div className="text-muted-foreground py-10 text-center text-sm">
               开始和「{agent?.name ?? conv.agent_key}」对话
@@ -1096,6 +1099,7 @@ export default function ChatPage() {
   const [convs, setConvs] = React.useState<Conversation[]>([]);
   const [agentFilter, setAgentFilter] = React.useState<string | null>(null);
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
+  const [listOpen, setListOpen] = React.useState(false);
   const [sourceRequested, setSourceRequested] = React.useState(false);
   const [convsLoaded, setConvsLoaded] = React.useState(false);
   const selectConversation = React.useCallback(
@@ -1107,6 +1111,7 @@ export default function ChatPage() {
         window.history.replaceState(null, "", url);
       }
       setSelectedId(id);
+      setListOpen(false);
     },
     [selectedId],
   );
@@ -1395,12 +1400,45 @@ export default function ChatPage() {
   return (
     <div
       data-content-padding="false"
-      className="flex h-[calc(100svh-3rem)] min-w-0 flex-col overflow-hidden p-3 sm:p-4 md:h-[calc(100svh-4rem)] md:p-6"
+      className={cn(
+        "flex h-[calc(100dvh-3rem)] min-w-0 flex-col overflow-hidden p-2 sm:p-4 md:h-[calc(100svh-4rem)] md:min-h-0 md:p-6",
+        listOpen ? "min-h-[34rem]" : "min-h-[30rem]",
+      )}
     >
-      <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[minmax(10rem,15rem)_minmax(0,1fr)] gap-3 md:grid-cols-[18rem_minmax(0,1fr)] md:grid-rows-[minmax(0,1fr)] md:gap-4">
+      <div
+        className={cn(
+          "grid min-h-0 min-w-0 flex-1 grid-cols-1 gap-2 sm:gap-3 md:grid-cols-[18rem_minmax(0,1fr)] md:grid-rows-[minmax(0,1fr)] md:gap-4",
+          listOpen ? "grid-rows-[minmax(0,34dvh)_minmax(0,1fr)]" : "grid-rows-[auto_minmax(0,1fr)]",
+        )}
+      >
         {/* left: conversation list */}
-        <div className="bg-card flex flex-col overflow-hidden rounded-lg border">
-          <div className="flex flex-col gap-2 border-b p-2">
+        <div className="bg-card flex min-h-0 flex-col overflow-hidden rounded-lg border">
+          <div className={cn("flex items-center justify-between gap-2 px-2.5 py-1.5 md:hidden", listOpen && "border-b")}>
+            <button
+              type="button"
+              onClick={() => setListOpen((open) => !open)}
+              aria-expanded={listOpen}
+              aria-controls="chat-conversation-list"
+              className="flex min-w-0 flex-1 items-center gap-1 text-left text-xs font-medium text-muted-foreground"
+            >
+              <ChevronDownIcon className={cn("size-3.5 shrink-0 transition-transform", !listOpen && "-rotate-90")} />
+              <span className="shrink-0">对话列表</span>
+              {!listOpen && (
+                <span className="min-w-0 truncate text-foreground">· {selected?.title || "新对话"}</span>
+              )}
+            </button>
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              className="h-6 shrink-0 px-1.5 text-xs"
+              onClick={() => selectConversation(null)}
+            >
+              <PlusIcon className="size-3.5" />
+              新建
+            </Button>
+          </div>
+          <div className={cn("flex flex-col gap-2 border-b p-2", !listOpen && "max-md:hidden")}>
             <Button size="sm" className="w-full" onClick={() => selectConversation(null)}>
               <PlusIcon /> 新建对话
             </Button>
@@ -1470,9 +1508,13 @@ export default function ChatPage() {
               ))}
           </div>
           <ScrollArea
+            id="chat-conversation-list"
             key={agentFilter === null ? "all" : `agent:${agentFilter}`}
             type="auto"
-            className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!"
+            className={cn(
+              "min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!",
+              !listOpen && "max-md:hidden",
+            )}
           >
             <div className="flex min-w-0 flex-col gap-0.5 p-2">
               {filteredConversations.length === 0 && (
@@ -1551,7 +1593,7 @@ export default function ChatPage() {
         </div>
 
         {/* right: chat view */}
-        <div className="bg-card flex min-w-0 flex-col overflow-hidden rounded-lg border">
+        <div className="bg-card flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border">
           {selected ? (
             <ChatView
               key={selected.id}

@@ -126,13 +126,13 @@ export function MainRequests({
     <>
       <button
         type="button"
-        className="flex w-full shrink-0 items-center gap-2.5 border-b bg-primary/5 px-4 py-2.5 text-left transition-colors hover:bg-primary/10"
+        className="flex w-full shrink-0 items-center gap-2 border-b bg-primary/5 px-3 py-1.5 text-left transition-colors hover:bg-primary/10 sm:gap-2.5 sm:px-4 sm:py-2.5"
         onClick={() => {
           setOpen(true);
           setHistory(pending.length === 0);
         }}
       >
-        <div className="rounded-md border border-primary/15 bg-background p-1.5 text-primary">
+        <div className="rounded-md border border-primary/15 bg-background p-1 text-primary sm:p-1.5">
           <MessageSquare className="size-3.5" />
         </div>
         <div className="min-w-0 flex-1">
@@ -144,7 +144,7 @@ export function MainRequests({
               </Badge>
             )}
           </div>
-          <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+          <div className="mt-0.5 hidden truncate text-[11px] text-muted-foreground sm:block">
             {processing
               ? "主 Agent 正在处理 · Worker 继续执行"
               : queued

@@ -354,8 +354,8 @@ function TaskDetailInner() {
   return (
     <Tabs value={tab} onValueChange={setTab} className="flex flex-1 flex-col gap-0">
       {/* Top fixed area */}
-      <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
-        <div className="flex items-center gap-2">
+      <header className="sticky top-0 z-10 flex flex-col gap-1.5 border-b bg-background/95 px-2.5 py-1.5 backdrop-blur sm:gap-2 sm:px-4 sm:py-2.5 lg:px-6">
+        <div className="flex items-center gap-1.5 sm:gap-2">
           <SidebarTrigger className="-ml-1" />
           <Button asChild variant="ghost" size="icon" className="size-7">
             <Link href="/function/tasks">
@@ -401,7 +401,7 @@ function TaskDetailInner() {
             {controlLabel}
           </Button>
         </div>
-        <p className="truncate text-xs text-muted-foreground">{task.goal}</p>
+        <p className="hidden truncate text-xs text-muted-foreground sm:block">{task.goal}</p>
         {/* Tabs */}
         <div className="no-scrollbar min-w-0 overflow-x-auto">
           <TabsList variant="default" className="min-w-max">
@@ -420,8 +420,8 @@ function TaskDetailInner() {
       </header>
 
       {/* Tab content */}
-      <div className="flex-1 p-4 lg:p-6">
-        <TabsContent value="sessions" className="mt-0">
+      <div className="flex min-h-0 flex-1 flex-col p-2 sm:p-4 lg:p-6">
+        <TabsContent value="sessions" className="mt-0 flex min-h-0 flex-1 flex-col data-[state=inactive]:hidden">
           <SessionsTab taskId={id} />
         </TabsContent>
         <TabsContent value="overview" className="mt-0">

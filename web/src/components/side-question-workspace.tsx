@@ -40,9 +40,16 @@ const preparationLabels = {
 export function SideQuestionButton({ side }: { side: SideQuestions }) {
   if (!side.enabled) return null;
   return (
-    <Button variant="outline" size="sm" onClick={() => side.setOpen(true)} title="/btw 旁路提问">
+    <Button
+      variant="outline"
+      size="sm"
+      className="max-sm:h-7 max-sm:px-2 max-sm:text-xs"
+      onClick={() => side.setOpen(true)}
+      title="/btw 旁路提问"
+    >
       <MessageCircleQuestionIcon data-icon="inline-start" />
-      旁路提问
+      <span className="max-sm:hidden">旁路提问</span>
+      <span className="sm:hidden">旁路</span>
     </Button>
   );
 }
@@ -238,21 +245,25 @@ export function SideQuestionWorkspace({
   const mobile = useIsMobile();
   return (
     <>
-      <ResizablePanelGroup orientation="horizontal" className="min-h-0 min-w-0 flex-1">
-        <ResizablePanel id="main-conversation" minSize="35%" className="flex min-h-0 min-w-0 flex-col">
-          {children}
-        </ResizablePanel>
-        {side.open && side.enabled && !mobile && (
-          <>
-            <ResizableHandle withHandle />
-            <ResizablePanel id="side-question" defaultSize="38%" minSize="280px" maxSize="65%">
-              <SidePanel side={side} label={label} composerLayout={composerLayout} />
-            </ResizablePanel>
-          </>
-        )}
-      </ResizablePanelGroup>
+      {mobile ? (
+        <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">{children}</div>
+      ) : (
+        <ResizablePanelGroup orientation="horizontal" className="min-h-0 min-w-0 flex-1">
+          <ResizablePanel id="main-conversation" minSize="35%" className="flex min-h-0 min-w-0 flex-col">
+            {children}
+          </ResizablePanel>
+          {side.open && side.enabled && (
+            <>
+              <ResizableHandle withHandle />
+              <ResizablePanel id="side-question" defaultSize="38%" minSize="280px" maxSize="65%">
+                <SidePanel side={side} label={label} composerLayout={composerLayout} />
+              </ResizablePanel>
+            </>
+          )}
+        </ResizablePanelGroup>
+      )}
       <Drawer open={mobile && side.open && side.enabled} onOpenChange={side.setOpen}>
-        <DrawerContent className="h-[85svh]">
+        <DrawerContent className="h-[85dvh]">
           <DrawerHeader className="sr-only">
             <DrawerTitle>旁路提问</DrawerTitle>
             <DrawerDescription>{label} 的独立问答</DrawerDescription>
