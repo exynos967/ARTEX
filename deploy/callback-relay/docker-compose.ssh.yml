@@ -1,0 +1,108 @@
+# 可选 SSH 反向隧道反连中转覆盖编排（无特权 Sidecar，无需主 VPS 开放公网入站端口）。
+#
+# 用法（在仓库根目录执行，可单独使用，也可与 deploy/egress-proxy/docker-compose.socks5.yml 自由叠加）：
+#   1) 仅主服务反连中转：
+#      docker compose -f docker-compose.yml -f deploy/callback-relay/docker-compose.ssh.yml up -d --build
+#   2) 全局 SOCKS5 透明网关 + SSH 反连中转 + 动态 Runner：
+#      docker compose -f docker-compose.yml \
+#        -f deploy/egress-proxy/docker-compose.socks5.yml \
+#        -f deploy/callback-relay/docker-compose.ssh.yml \
+#        --profile runners up -d --build
+#   3) 如还需把独立端口段直接反连到 Runner 网关（需同时叠加 docker-compose.socks5.yml）：
+#      再追加 --profile runner-callback 并在 .env 配置 ARTEX_RUNNER_CALLBACK_PORTS。
+#
+# 安全隔离：
+#   - SSH 私钥仅以只读方式挂入独立 Sidecar，artex 主容器与 Runner 沙箱均无法接触私钥。
+#   - artex-callback-relay 仅挂载 default 网络，把边缘机端口转至 artex:<port>（兼容透明网关 Kill Switch）。
+#   - runner-callback-relay 仅挂载 runners 网络（绝不接触 postgres 所在的 default 网络）。
+
+x-callback-logging: &callback-logging
+  driver: json-file
+  options:
+    max-size: "8m"
+    max-file: "3"
+
+services:
+  artex-callback-relay:
+    build:
+      context: ./deploy/callback-relay
+      dockerfile: Dockerfile
+      args:
+        ALPINE_IMAGE: ${CALLBACK_ALPINE_IMAGE:-alpine:3.21}
+        ALPINE_MIRROR: ${CALLBACK_ALPINE_MIRROR:-${EGRESS_ALPINE_MIRROR:-}}
+    image: ${CALLBACK_RELAY_IMAGE:-artex-callback-relay:local}
+    mem_limit: 64m
+    memswap_limit: 64m
+    pids_limit: 32
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=16m,mode=1777]
+    logging: *callback-logging
+    depends_on:
+      artex:
+        condition: service_started
+    environment:
+      CALLBACK_SSH_HOST: ${CALLBACK_SSH_HOST:?请在 .env 或环境变量设置 CALLBACK_SSH_HOST}
+      CALLBACK_SSH_PORT: ${CALLBACK_SSH_PORT:-22}
+      CALLBACK_SSH_USER: ${CALLBACK_SSH_USER:-artex-relay}
+      CALLBACK_BIND_ADDRESS: ${CALLBACK_BIND_ADDRESS:-0.0.0.0}
+      CALLBACK_TARGET_HOST: artex
+      CALLBACK_PORTS: ${ARTEX_CALLBACK_PORTS:-${CALLBACK_PORTS:-20001-20005}}
+      CALLBACK_SSH_KNOWN_HOSTS: ${CALLBACK_SSH_KNOWN_HOSTS:-}
+      CALLBACK_SSH_STRICT_HOST_KEY: ${CALLBACK_SSH_STRICT_HOST_KEY:-}
+      CALLBACK_SERVER_ALIVE_INTERVAL: ${CALLBACK_SERVER_ALIVE_INTERVAL:-15}
+      CALLBACK_SERVER_ALIVE_COUNT_MAX: ${CALLBACK_SERVER_ALIVE_COUNT_MAX:-3}
+    volumes:
+      - ${CALLBACK_SSH_KEY_FILE:-./deploy/private/callback_id_ed25519}:/run/secrets/callback_ssh_key:ro
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "ssh -O check -S /tmp/ssh-relay.ctl relay 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  runner-callback-relay:
+    build:
+      context: ./deploy/callback-relay
+      dockerfile: Dockerfile
+      args:
+        ALPINE_IMAGE: ${CALLBACK_ALPINE_IMAGE:-alpine:3.21}
+        ALPINE_MIRROR: ${CALLBACK_ALPINE_MIRROR:-${EGRESS_ALPINE_MIRROR:-}}
+    image: ${CALLBACK_RELAY_IMAGE:-artex-callback-relay:local}
+    profiles: [runner-callback]
+    mem_limit: 64m
+    memswap_limit: 64m
+    pids_limit: 32
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=16m,mode=1777]
+    logging: *callback-logging
+    environment:
+      CALLBACK_SSH_HOST: ${RUNNER_CALLBACK_SSH_HOST:-${CALLBACK_SSH_HOST:-}}
+      CALLBACK_SSH_PORT: ${RUNNER_CALLBACK_SSH_PORT:-${CALLBACK_SSH_PORT:-22}}
+      CALLBACK_SSH_USER: ${RUNNER_CALLBACK_SSH_USER:-${CALLBACK_SSH_USER:-artex-relay}}
+      CALLBACK_BIND_ADDRESS: ${RUNNER_CALLBACK_BIND_ADDRESS:-${CALLBACK_BIND_ADDRESS:-0.0.0.0}}
+      CALLBACK_TARGET_HOST: ${ARTEX_RUNNER_EGRESS_CONTAINER:-artex-runner-egress-gw}
+      CALLBACK_PORTS: ${ARTEX_RUNNER_CALLBACK_PORTS:-}
+      CALLBACK_SSH_KNOWN_HOSTS: ${RUNNER_CALLBACK_SSH_KNOWN_HOSTS:-${CALLBACK_SSH_KNOWN_HOSTS:-}}
+      CALLBACK_SSH_STRICT_HOST_KEY: ${CALLBACK_SSH_STRICT_HOST_KEY:-}
+      CALLBACK_SERVER_ALIVE_INTERVAL: ${CALLBACK_SERVER_ALIVE_INTERVAL:-15}
+      CALLBACK_SERVER_ALIVE_COUNT_MAX: ${CALLBACK_SERVER_ALIVE_COUNT_MAX:-3}
+    volumes:
+      - ${RUNNER_CALLBACK_SSH_KEY_FILE:-${CALLBACK_SSH_KEY_FILE:-./deploy/private/callback_id_ed25519}}:/run/secrets/callback_ssh_key:ro
+    networks:
+      - runners
+    healthcheck:
+      test: ["CMD-SHELL", "ssh -O check -S /tmp/ssh-relay.ctl relay 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped

@@ -350,6 +350,61 @@ server {
 
 > 仅当 SSE 需要走与页面不同的来源（如独立子域）时，才在**构建期**设置 `NEXT_PUBLIC_SSE_BASE`（该变量在 `next build` 时固化进静态包，容器运行时再设无效）。
 
+### 出口代理、OOB 回调与 SSH 反连中转（可选）
+
+所有配置项均已内置在根目录 [.env.example](.env.example) 中且**默认关闭**，按需启用即可，互不冲突，可自由叠加组合：
+
+#### 1. 透明 SOCKS5 出口网关（覆盖主服务与动态 Runner）
+
+网页端「系统设置 → 全局代理」工作在应用层（`WebFetch`、`:8788` 录制代理、浏览器 MCP、自定义工具与读取 `HTTP_PROXY`/`ALL_PROXY` 的子进程）；若需要让**所有容器进程**（含静态 Go/C 工具、`nmap -sT`、`naabu`、`dnsx`、原始 socket 及动态 Runner）强制经由 SOCKS5 出网并堵死宿主机 DNS/直连泄漏，使用可选透明网关覆盖编排（详参 [deploy/egress-proxy/README.md](deploy/egress-proxy/README.md)）：
+
+- 在 `.env` 填写 `EGRESS_SOCKS5_URL`（如 `socks5://user:pass@203.0.113.10:1080`；若代理运行在 Docker 宿主机请改用 `socks5://host.docker.internal:1080`，勿写 `127.0.0.1`）。
+- 网关自动为 `artex`（`artex-egress-gw`）与动态 Runner（`runner-egress-gw`，**仅接入 `runners` 网络，保持与 `postgres` 隔离**）启用 `sing-box` TUN、TCP-over-SOCKS5 DNS 劫持及 Fail-Closed `iptables` Kill Switch。
+- 可选：`ARTEX_EGRESS_BYPASS_DOMAINS=api.openai.com,api.anthropic.com` 可仅让主服务的 LLM API 直连，Runner 仍全量走代理；启用透明网关时网页端「全局代理」请保持**留空**（二者二选一，避免冲突）。
+
+```bash
+# 仅主服务走透明 SOCKS5
+docker compose -f docker-compose.yml -f deploy/egress-proxy/docker-compose.socks5.yml up -d --build
+
+# 主服务 + 动态 Runner 池均走透明 SOCKS5
+docker compose -f docker-compose.yml -f deploy/egress-proxy/docker-compose.socks5.yml --profile runners up -d --build
+```
+
+#### 2. 私有 OOB 带外验证（Interactsh / `nuclei` 自动接管）
+
+无需额外 Compose 文件，在 `.env` 配置以下环境变量后，`artex` 主容器及所有动态 Runner 沙箱运行 `nuclei` 时会自动注入 `-iserver` / `-itoken`（审计日志对 token 自动脱敏；调用方显式传 `-iserver` 或 `-ni` 时优先尊重手传参数）：
+
+```dotenv
+ARTEX_OOB_SERVER=https://oob.example.com
+ARTEX_OOB_TOKEN=replace-with-strong-random-token
+# 未配置自建 OOB 且希望禁止 nuclei 访问公共 oast.* 时可设为 1
+ARTEX_OOB_DISABLE_PUBLIC=0
+```
+
+#### 3. SSH 反向隧道反连中转（TCP / HTTP 回调）
+
+需要接收带外 TCP/HTTP 反连且不暴露主 VPS 公网 IP 时，使用可选无特权 SSH 反向隧道 Sidecar（详参 [deploy/callback-relay/README.md](deploy/callback-relay/README.md)）：
+
+- 边缘跳板机仅需系统自带 `sshd`（创建 `/usr/sbin/nologin` 专用账号并开启 `GatewayPorts clientspecified`），SSH 私钥只读挂载于独立 Sidecar（默认 `./deploy/private/callback_id_ed25519`），`artex` 与 Runner 无法接触私钥，主 VPS **无需开放任何公网入站端口**。
+- 在 `.env` 填写 `CALLBACK_SSH_HOST`、`CALLBACK_SSH_USER`、`ARTEX_CALLBACK_PUBLIC_HOST` 与 `ARTEX_CALLBACK_PORTS`（支持 `20001-20005` 或 `8080:18080` 异端口映射，推荐通过 `CALLBACK_SSH_KNOWN_HOSTS` 锁定边缘机指纹）。配置后 ARTEX 会自动向 Worker 系统提示词注入脱敏后的 OOB 与反连端口指引（绝不暴露 token/私钥），避免 Agent 误用出口 IP 或内网 IP 作为回调地址。
+- 与全局透明 SOCKS5 网关天然兼容（走 Docker 内网桥转发至 `artex:<port>`，不放宽 Kill Switch）：
+
+```bash
+# 透明 SOCKS5 + SSH 反连中转 + 动态 Runner 组合启动
+docker compose \
+  -f docker-compose.yml \
+  -f deploy/egress-proxy/docker-compose.socks5.yml \
+  -f deploy/callback-relay/docker-compose.ssh.yml \
+  --profile runners up -d --build
+
+# 若还需把独立端口段直接反连到 Runner 网关（须在 .env 配置 ARTEX_RUNNER_CALLBACK_PORTS）
+docker compose \
+  -f docker-compose.yml \
+  -f deploy/egress-proxy/docker-compose.socks5.yml \
+  -f deploy/callback-relay/docker-compose.ssh.yml \
+  --profile runners --profile runner-callback up -d --build
+```
+
 ---
 
 

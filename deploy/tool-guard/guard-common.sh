@@ -371,8 +371,25 @@ guard_audit_log() {
   {
     _gal_ts=$(date -u +%FT%TZ 2>/dev/null || printf 'unknown-time')
     printf '%s  [%s]' "$_gal_ts" "$_gal_tool"
+    _gal_redact_next=0
     for _gal_a in "$@"; do
-      printf ' %s' "$_gal_a"
+      if [ "$_gal_redact_next" = 1 ]; then
+        printf ' [REDACTED]'
+        _gal_redact_next=0
+        continue
+      fi
+      case "$_gal_a" in
+        -itoken|--itoken|-interactsh-token|--interactsh-token)
+          printf ' %s' "$_gal_a"
+          _gal_redact_next=1
+          ;;
+        -itoken=*|--itoken=*|-interactsh-token=*|--interactsh-token=*)
+          printf ' %s=[REDACTED]' "${_gal_a%%=*}"
+          ;;
+        *)
+          printf ' %s' "$_gal_a"
+          ;;
+      esac
     done
     printf '\n'
   } >> "$_gal_log" 2>/dev/null || true

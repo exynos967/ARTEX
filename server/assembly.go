@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -331,8 +333,54 @@ func assembleAgentAugment(
 		if json.Unmarshal(rt.spec.Files, &plan) == nil {
 			def.ExecutionGuidance += runnerFileGuidance(plan, rt.spec.WorkingDir)
 		}
+		def.ExecutionGuidance += oobCallbackGuidance(func(k string) string { return rt.spec.Env[k] })
+	} else {
+		def.ExecutionGuidance += oobCallbackGuidance(os.Getenv)
 	}
 	return extra, def, cleanup
+}
+
+// oobCallbackGuidance builds an optional, secret-free system-prompt block so
+// workers know about configured private OOB (Interactsh) and SSH reverse
+// callback ports without ever exposing ARTEX_OOB_TOKEN or SSH credentials.
+func oobCallbackGuidance(lookup func(string) string) string {
+	if lookup == nil {
+		return ""
+	}
+	var lines []string
+	if rawOOB := strings.TrimSpace(lookup("ARTEX_OOB_SERVER")); rawOOB != "" {
+		safeOOB := stripURLUserinfo(rawOOB)
+		lines = append(lines, fmt.Sprintf("- 私有 OOB 服务已配置：%s。运行 nuclei 时护栏会自动注入 -iserver/-itoken（勿手传公共 oast.* 覆盖，也不要在命令中回显 token）。", safeOOB))
+	} else if isTruthyEnv(lookup("ARTEX_OOB_DISABLE_PUBLIC")) {
+		lines = append(lines, "- 已禁用公共 OAST（nuclei 会自动注入 -ni）；未配置私有 OOB 服务，请勿依赖公共 interact.sh/oast.*。")
+	}
+	cbHost := strings.TrimSpace(lookup("ARTEX_CALLBACK_PUBLIC_HOST"))
+	cbPorts := strings.TrimSpace(lookup("ARTEX_CALLBACK_PORTS"))
+	if cbHost != "" && cbPorts != "" {
+		lines = append(lines, fmt.Sprintf("- 已启用 SSH 反向反连隧道：对外回调地址为 %s，可用端口映射为 %s（格式为 端口/起止范围 或 远端端口:本地端口）。需要接收 TCP/HTTP 反连时，在本容器监听 0.0.0.0:<本地端口>，并在发往目标的 payload 中使用 %s:<远端端口>；严禁使用 ifconfig.me 等查到的出口 IP 或容器内网 IP 作为反连地址。", cbHost, cbPorts, cbHost))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "\n\n【带外验证与反连隧道】\n" + strings.Join(lines, "\n")
+}
+
+func stripURLUserinfo(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	u.User = nil
+	return u.String()
+}
+
+func isTruthyEnv(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func idSet(ids []int64) map[int64]bool {
